@@ -74,6 +74,32 @@ CREATE TABLE IF NOT EXISTS daily_creds_log (
 
 CREATE INDEX IF NOT EXISTS idx_daily_creds_log_utc_date
     ON daily_creds_log(utc_date);
+
+-- Cross-cycle label/score preservation per PoC LESSONS §29 + the
+-- 2026-05-21 live-find: pycti's UPSERT silently overwrites scalar
+-- fields on Indicators/SCOs across cycles. A high-signal Cowrie
+-- indicator (score 100, labels [cowrie, honeypot, ssh-telnet]) could
+-- be overwritten by a lower-signal emission for the same IP (e.g.
+-- a P0f fallback at score 50) in a later cycle.
+--
+-- This table is the connector-side "what's the highest-signal version
+-- of this object we've ever shipped" memory. Publisher reads from it
+-- before sending; merges labels (union), keeps max score, and
+-- preserves the higher-score emission's name/description.
+--
+-- One row per STIX id. Same UUID5 = same row → idempotent across
+-- cycles. The labels_json column is a JSON-encoded sorted list.
+CREATE TABLE IF NOT EXISTS object_max_state (
+    stix_id       TEXT PRIMARY KEY,
+    max_score     INTEGER,
+    labels_json   TEXT,
+    name          TEXT,
+    description   TEXT,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_object_max_state_score
+    ON object_max_state(max_score);
 """
 
 
@@ -304,6 +330,79 @@ class CycleState:
                 (keep_last,),
             )
             return cur.rowcount
+
+    # ----------------------------------------------------------------------
+    # Cross-cycle label/score preservation (PoC LESSONS §29 + the
+    # 2026-05-21 live-find: pycti UPSERT silently overwrites scalar fields
+    # across cycles; need connector-side memory of the highest-signal
+    # emission to preserve it through low-signal re-emissions).
+    # ----------------------------------------------------------------------
+
+    def get_max_state_bulk(
+        self,
+        stix_ids: list[str],
+    ) -> dict[str, dict]:
+        """Look up the persisted max-signal state for a batch of STIX ids.
+
+        Returns ``{stix_id: {max_score, labels, name, description}}`` for
+        every id that has an existing row. Missing ids are absent from
+        the result dict (caller treats as "no previous state").
+
+        Bulk-fetches with a single ``WHERE stix_id IN (...)`` to avoid
+        N+1 roundtrips per cycle (cycles emit ~700 objects).
+        """
+        import json
+        if not stix_ids:
+            return {}
+        placeholders = ",".join("?" for _ in stix_ids)
+        out: dict[str, dict] = {}
+        with self._conn() as c:
+            cur = c.execute(
+                f"SELECT stix_id, max_score, labels_json, name, description "
+                f"FROM object_max_state WHERE stix_id IN ({placeholders})",
+                stix_ids,
+            )
+            for row in cur:
+                stix_id, max_score, labels_json, name, description = row
+                try:
+                    labels = json.loads(labels_json) if labels_json else []
+                except Exception:
+                    labels = []
+                out[stix_id] = {
+                    "max_score": max_score,
+                    "labels": labels,
+                    "name": name,
+                    "description": description,
+                }
+        return out
+
+    def upsert_max_state_bulk(
+        self,
+        updates: list[tuple[str, Optional[int], list[str], Optional[str], Optional[str]]],
+    ) -> None:
+        """Persist post-merge state for a batch of STIX ids.
+
+        Each update tuple is
+        ``(stix_id, max_score, labels_list, name, description)``.
+        Uses a single transaction + ``INSERT OR REPLACE`` so the whole
+        cycle's worth of updates lands or none of it does.
+        """
+        import json
+        if not updates:
+            return
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (stix_id, max_score, json.dumps(sorted(set(labels))), name, description, now)
+            for (stix_id, max_score, labels, name, description) in updates
+        ]
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO object_max_state "
+                "(stix_id, max_score, labels_json, name, description, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
 
 
 if __name__ == "__main__":

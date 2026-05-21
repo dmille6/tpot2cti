@@ -210,6 +210,64 @@ class Publisher:
         bundle_id = f"bundle--{uuid.uuid4()}"
         errors: list[str] = []
 
+        # --- Step 0: cross-cycle state merge ----------------------------
+        # Per PoC LESSONS §29 + the 2026-05-21 live-find: pycti's UPSERT
+        # overwrites scalar fields on Indicators/SCOs across cycles. To
+        # preserve the highest-signal observation of each id, we merge
+        # this cycle's emission against `object_max_state` in our DB:
+        # union the labels, take max(x_opencti_score), and (when the
+        # persisted score wins) preserve the prior name/description too.
+        # See state.py:get_max_state_bulk / upsert_max_state_bulk.
+        merged_state_updates: list[tuple[str, Optional[int], list[str],
+                                          Optional[str], Optional[str]]] = []
+        if self.state is not None and objects:
+            stix_ids = [o.get("id") for o in objects if o.get("id")]
+            persisted = self.state.get_max_state_bulk(stix_ids)
+            n_promoted = 0
+            for obj in objects:
+                oid = obj.get("id")
+                if not oid:
+                    continue
+                cur_score = obj.get("x_opencti_score")
+                cur_labels = list(obj.get("labels") or []) + \
+                             list(obj.get("x_opencti_labels") or [])
+                p = persisted.get(oid)
+                if p is not None:
+                    # Union labels (always)
+                    merged_labels = sorted(set(cur_labels) | set(p["labels"] or []))
+                    p_score = p.get("max_score")
+                    if isinstance(p_score, int) and (
+                        cur_score is None or p_score > cur_score
+                    ):
+                        # Persisted is the higher-signal version — restore it.
+                        obj["x_opencti_score"] = p_score
+                        if p.get("name"):
+                            obj["name"] = p["name"]
+                        if p.get("description"):
+                            obj["description"] = p["description"]
+                        n_promoted += 1
+                    # Write labels back to whichever slot the obj uses
+                    if "labels" in obj:
+                        obj["labels"] = merged_labels
+                    if "x_opencti_labels" in obj:
+                        obj["x_opencti_labels"] = merged_labels
+                # Stage the new persisted state with the merged values.
+                # The score we record is the max(current, persisted).
+                final_score = obj.get("x_opencti_score")
+                merged_state_updates.append((
+                    oid,
+                    final_score if isinstance(final_score, int) else None,
+                    list(obj.get("labels") or obj.get("x_opencti_labels") or []),
+                    obj.get("name"),
+                    obj.get("description"),
+                ))
+            if n_promoted:
+                logger.info(
+                    f"[{cycle_id}] Cross-cycle merge: restored {n_promoted} "
+                    f"object(s) to their previously-higher-signal version "
+                    f"(per LESSONS §29 + 2026-05-21 P0f-overwrite bug)"
+                )
+
         # --- Step 1: label-union dedup (LESSONS §6) ----------------------
         before = len(objects)
         deduped = self._dedup_label_union(objects)
@@ -296,6 +354,18 @@ class Publisher:
         # --- Step 5: persist into state ----------------------------------
         if self.state is not None:
             self._record_result(result)
+            # Cross-cycle merge state — write back AFTER successful publish
+            # so a failed publish doesn't poison future cycles' baselines.
+            # We persist regardless of partial errors (some passes ok, some
+            # not) because the in-bundle state was at-least-attempted; this
+            # matches V1_SPEC §7 "partial publish > no publish" semantics.
+            try:
+                self.state.upsert_max_state_bulk(merged_state_updates)
+            except Exception as e:
+                logger.warning(
+                    f"[{cycle_id}] object_max_state upsert failed "
+                    f"(non-fatal): {e}"
+                )
 
         logger.info(
             f"[{cycle_id}] Publish complete: "
