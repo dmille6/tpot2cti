@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+ssh-keys/
+!ssh-keys/.gitkeep
+
+# Data (per V1_SPEC §2.4 — gitignored)
+data/
+!data/.gitkeep
+
+# Logs (per V1_SPEC §2.4 — gitignored)
+logs/
+!logs/.gitkeep
+
+# OpenCTI clone (created by setup.sh next to us)
+opencti/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local override files
+docker-compose.override.yml
