@@ -192,7 +192,15 @@ class TpotESClient:
         if ignore_types:
             # `type` is a keyword field in T-Pot's logstash mapping, so a
             # `terms` filter is the right primitive.
-            must_not.append({"terms": {"type": list(ignore_types)}})
+            # Use `type.keyword` for exact-match: T-Pot's logstash maps
+            # `type` as analyzed text (lowercased + tokenized), so
+            # `terms: {"type": ["P0f"]}` doesn't match the indexed value
+            # "p0f". Confirmed against the live ES on 2026-05-21: the
+            # `type` filter let 5,132 P0f docs through per 15-min window
+            # despite TPOT2CTI_IGNORE_TYPES=P0f; switching to type.keyword
+            # filters them correctly. See LESSONS_LEARNED §8.5 (added in
+            # this commit) for the broader pattern.
+            must_not.append({"terms": {"type.keyword": list(ignore_types)}})
 
         bool_block: dict[str, Any] = {"must": must}
         if must_not:
