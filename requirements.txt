@@ -1,1 +1,26 @@
+# tpot2cti runtime dependencies.
+#
+# Lower bounds pinned for known-good behavior; upper bounds capped at
+# the next major to catch breaking changes during dependency upgrades.
+
+# OpenCTI Python client.  Used by tpot2cti/opencti_client.py and
+# tpot2cti/publisher.py (Phase 5).
 pycti>=6.4,<8
+
+# Elasticsearch client.  Used by tpot2cti/es_client.py to query T-Pot's
+# logstash-* indices over the SSH tunnel.
+elasticsearch>=8.0,<9
+
+# HTTP — used directly by pycti and indirectly by tpot2cti where we
+# fall back to raw HTTP.  Per LESSONS_LEARNED §1: sync HTTP only,
+# never asyncio.
+requests>=2.31,<3
+
+# YAML — referenced for the optional config/tpot2cti.yaml override
+# file (V1_SPEC §10 "Optional config/tpot2cti.yaml").
+PyYAML>=6,<7
+
+# python-dateutil — used transitively by pycti and convenient for
+# robust @timestamp parsing in parsers.  Pinning so pip resolves
+# deterministically.
+python-dateutil>=2.8,<3

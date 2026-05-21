@@ -1,0 +1,63 @@
+# tpot2cti — Docker build context exclusions.
+#
+# Per LESSONS_LEARNED §9.1: minimize the build context so layer-cache
+# invalidations only happen when source actually changes.  Without this
+# file, every `git status` artifact and stray log/db invalidates COPY.
+
+# --- VCS ---
+.git/
+.gitignore
+.gitattributes
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Runtime data (gitignored too; never bake into an image) ---
+data/
+logs/
+ssh-keys/
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+
+# --- Docs (large, not needed at runtime) ---
+docs/
+V1_SPEC.md
+README.md
+*.md
+!LICENSE
+
+# --- Sibling compose projects (sidecars have their own contexts) ---
+tpot2cti-credentials/
+tpot2cti-vault/
+tpot-tunnel/
+opencti/
+
+# --- Compose / scripts / tooling not needed inside the core image ---
+docker-compose*.yml
+setup.sh
+teardown.sh
+update.sh
+Makefile
+
+# --- Editor / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
