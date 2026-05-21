@@ -1032,3 +1032,92 @@ Important to remember when the first companion connector lands — do NOT
 design a "merged classification Note" pattern. One Note per source.
 
 — end of appendix A —
+
+
+---
+
+## Appendix B — Live API-check findings (2026-05-21)
+
+After running for 18 cycles end-to-end against a single T-Pot, we
+verified the actual STIX output via OpenCTI's GraphQL API (via pycti).
+Three findings worth recording.
+
+### B.1 ES `must_not` on `type` requires `type.keyword`
+
+T-Pot's logstash maps the top-level `type` field as analyzed text.
+A bool query with `{"terms": {"type": ["P0f"]}}` does NOT match the
+indexed value "p0f" (lowercased/tokenized). The PoC's `tsec-tpot-
+hp-connector/src/es_client/client.py` and our `tpot2cti/es_client.py`
+both got this initially: `TPOT2CTI_IGNORE_TYPES=P0f` was correctly
+parsed into the config, plumbed into `stream_events`, baked into the
+`must_not` block — and silently ignored by ES.
+
+Symptom on the live install: API check confirmed every one of the
+last 100 Indicators emitted was a P0f drive-by from the fallback
+parser, despite `events_dropped=4780` and explicit `P0f` in the env.
+The cycle log truthfully reported `ignore_types=['P0f']` but the
+query was building a no-op filter against an analyzed field.
+
+**Fix:** switch to `type.keyword` for exact match. Confirmed against
+the live ES: with `.keyword`, the same query that returned 7,765
+docs (5,132 P0f) returns 2,633 (zero P0f).
+
+**Generalization:** anywhere we run `terms` / `term` against a
+T-Pot logstash field, use `.keyword`. Same applies to `sort` on
+`@timestamp` plus `_doc` (we already do this since the first-install
+postmortem — see Appendix B was previously titled differently
+elsewhere; canonical fix is in `tpot2cti/es_client.py`).
+
+### B.2 pycti UPSERT does not refresh `x_opencti_*` fields on SCOs
+
+When a deterministic STIX ID re-emerges in a cycle, pycti's
+`import_bundle_from_json` correctly UPSERTs the platform-level
+fields (`updated_at`, marking, etc.) — but the `x_opencti_*` custom
+properties on Stix Cyber Observables appear to be set-once on
+first creation. Specifically: a `Process` SDO created in cycle 4
+with just `command_line` does not gain a `x_opencti_description`
+or `x_opencti_labels` when cycle 18 re-emits it with the new
+fields. (Cross-confirmed via the live GraphQL API.)
+
+**Where we stand:** new Process emissions land with the new fields
+correctly. Existing bare Processes from cycles 3-16 stay bare unless
+the operator manually re-enriches them via the OpenCTI UI's
+"Re-enrich" action. Cosmetic at single-sensor scale — new sessions
+overwrite the visible inventory within a day or two.
+
+**Generalization for future builder changes:** if you change the
+shape of an SCO's `x_opencti_*` fields, plan for "old objects look
+bare until they age out." Force-re-emission would require deleting
+the affected SCOs from OpenCTI, which is destructive. The
+deterministic-UUID5 design that helps re-emission idempotency works
+*against* us here.
+
+### B.3 Free-floating fallback Notes survive their source's removal
+
+When P0f events were going through the fallback parser (pre-§B.1
+fix), they emitted "Unrecognized T-Pot event: P0f" Notes with
+`object_refs` pointing at the corresponding IP indicator. If the
+same IP later attacks via Cowrie (and produces a real Cowrie
+indicator with the same UUID5 — because the indicator id is derived
+from the IP, not the parser), the old P0f Notes remain attached to
+that indicator forever.
+
+Symptom: a perfectly good Cowrie indicator has 5 stray Notes that
+all read "Unrecognized T-Pot event: P0f" attached to it. Confusing
+in the OpenCTI UI but not wrong: the same attacker DID emit P0f
+events earlier, and we DID record them at the time.
+
+**Where we stand:** cosmetic; the Note flow only emits free-floating
+Notes when src_ip is missing (fallback's edge case), so this won't
+keep happening at hive scale. Operators who want a clean slate can
+delete the stray P0f notes via the OpenCTI UI; they're identifiable
+by abstract `"Unrecognized T-Pot event: P0f"`.
+
+**Generalization:** Notes whose abstract names a now-ignored event
+type are detectable. A future cleanup connector could query for
+Notes with `abstract LIKE 'Unrecognized T-Pot event: %'` AND
+`object_refs` pointing at indicators that have a CURRENT label of
+"honeypot" (i.e. they're real attackers, the P0f note is stale)
+and revoke them.
+
+— end of appendix B —
