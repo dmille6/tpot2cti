@@ -248,8 +248,10 @@ def run_cycle(
     events_read = 0
     events_parsed = 0
     events_dropped = 0
+    events_self_filtered = 0  # src_ip matched our own honeypot's IP set
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
     sensors_seen: set[str] = set()
+    honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
 
     try:
         for doc in es.stream_events(
@@ -268,6 +270,16 @@ def run_cycle(
             if event is None:
                 events_dropped += 1
                 continue
+            # Self-filter: drop events whose src_ip is one of our own
+            # honeypot's public IPs. Suricata observes both directions of
+            # traffic; when our honeypot is the source (e.g. it's serving
+            # a deceptive `Host: www.google.com` response), the resulting
+            # event carries OUR ip as `src_ip` and pollutes the bundle.
+            # See the first-live-install postmortem for the exact case
+            # that motivated this filter.
+            if honeypot_ips and event.src_ip in honeypot_ips:
+                events_self_filtered += 1
+                continue
             events_parsed += 1
             parsed_by_type[event.event_type].append(event)
             if event.sensor_hostname:
@@ -284,7 +296,8 @@ def run_cycle(
 
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
-        f"events_dropped={events_dropped} types={sorted(parsed_by_type.keys())}"
+        f"events_dropped={events_dropped} events_self_filtered={events_self_filtered} "
+        f"types={sorted(parsed_by_type.keys())}"
     )
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
