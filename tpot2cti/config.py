@@ -42,6 +42,13 @@ class TPotConfig:
     host: str
     ssh_user: str = "tpot"
     ssh_port: int = 64295
+    #: Self-filter: every ParsedEvent whose `src_ip` is in this set gets
+    #: dropped before correlation. Catches the case where Suricata
+    #: logs an event from the honeypot's own outbound side (e.g. our
+    #: H0neytr4p replying with `Host: www.google.com` deceptive HTML —
+    #: src_ip is OUR public IP, not an attacker). Populate via
+    #: `TPOT_HONEYPOT_IPS` env var (comma-separated).
+    honeypot_ips: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -188,10 +195,16 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     env = dict(env_dict if env_dict is not None else os.environ)
 
     # --- T-Pot connection ---
+    # honeypot_ips: comma-separated. Strip whitespace, skip empties.
+    raw_honeypot_ips = _env_str(env, "TPOT_HONEYPOT_IPS", default="") or ""
+    honeypot_ips = frozenset(
+        ip.strip() for ip in raw_honeypot_ips.split(",") if ip.strip()
+    )
     tpot = TPotConfig(
         host=_env_str(env, "TPOT_HOST", required=True),
         ssh_user=_env_str(env, "TPOT_SSH_USER", default="tpot") or "tpot",
         ssh_port=_env_int(env, "TPOT_SSH_PORT", default=64295),
+        honeypot_ips=honeypot_ips,
     )
 
     # --- T-Pot Elasticsearch ---
