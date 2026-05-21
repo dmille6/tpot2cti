@@ -486,7 +486,10 @@ setup_ssh_key() {
     if (( DRY_RUN )); then
         dry "mkdir -p $key_dir && chmod 700 $key_dir"
         dry "ssh-keygen -t ed25519 -f $key_path -N '' -C 'tpot2cti@$(hostname)'"
-        dry "Pause for user to add the public key to T-Pot's authorized_keys"
+        dry "Test pubkey auth to ${TPOT_SSH_USER}@${TPOT_HOST}:${TPOT_SSH_PORT}"
+        dry "If pubkey auth fails: prompt 'install via ssh-copy-id now? [Y/n]'"
+        dry "If user says yes: ssh-copy-id -i ${key_path}.pub -p ${TPOT_SSH_PORT} ${TPOT_SSH_USER}@${TPOT_HOST}"
+        dry "Otherwise fall back to manual paste + Enter prompt"
         return 0
     fi
 
@@ -505,15 +508,100 @@ setup_ssh_key() {
         ok "Generated ed25519 key at $key_path"
     fi
 
+    local known_hosts="${key_dir}/known_hosts"
+
+    # ── Auto-install path ─────────────────────────────────────────────
+    # First check if the key is ALREADY authorized on T-Pot (idempotent
+    # re-run of setup.sh). If so, nothing to do.
+    info "Checking whether pubkey auth already works against T-Pot…"
+    if ssh -o BatchMode=yes \
+           -o PreferredAuthentications=publickey \
+           -o StrictHostKeyChecking=accept-new \
+           -o UserKnownHostsFile="${known_hosts}" \
+           -o ConnectTimeout=5 \
+           -i "$key_path" \
+           -p "$TPOT_SSH_PORT" \
+           "${TPOT_SSH_USER}@${TPOT_HOST}" \
+           'true' >/dev/null 2>&1; then
+        ok "Pubkey is already installed on T-Pot — skipping ssh-copy-id"
+        return 0
+    fi
+
+    # Show the key + offer to install it automatically.
     echo "" >&2
     echo "--------------------------------------------------------------------" >&2
-    echo "  COPY THE FOLLOWING PUBLIC KEY INTO T-POT'S authorized_keys" >&2
-    echo "  (typically /home/${TPOT_SSH_USER}/.ssh/authorized_keys on port ${TPOT_SSH_PORT})" >&2
+    echo "  PUBLIC KEY (must end up in T-Pot's authorized_keys):" >&2
     echo "--------------------------------------------------------------------" >&2
     cat "${key_path}.pub" >&2
     echo "--------------------------------------------------------------------" >&2
     echo "" >&2
-    read -r -p "Press Enter once the key is installed on T-Pot..." _
+
+    local default_choice="Y"
+    if ! command -v ssh-copy-id >/dev/null 2>&1; then
+        warn "ssh-copy-id not found on this host; manual install required."
+        default_choice=""
+    fi
+
+    if [[ "$default_choice" == "Y" ]]; then
+        local answer
+        read -r -p \
+"Would you like me to install the key on T-Pot now via ssh-copy-id?
+This will prompt you for your T-Pot password ONCE. [Y/n] " answer
+        # Default to Y on empty input.
+        if [[ -z "$answer" ]] || [[ "$answer" =~ ^[Yy] ]]; then
+            echo "" >&2
+            info "Running: ssh-copy-id -i ${key_path}.pub -p ${TPOT_SSH_PORT} ${TPOT_SSH_USER}@${TPOT_HOST}"
+            info "(if you've never logged into this T-Pot from here, you'll see"
+            info " a host-key fingerprint prompt — answer 'yes' to accept.)"
+            echo "" >&2
+
+            # `accept-new` auto-trusts the T-Pot host key on first use
+            # (we don't have a baked-in fingerprint to verify against).
+            # ssh-copy-id passes -o options through via -o … on the cmd line.
+            if ssh-copy-id \
+                -i "${key_path}.pub" \
+                -p "$TPOT_SSH_PORT" \
+                -o "StrictHostKeyChecking=accept-new" \
+                -o "UserKnownHostsFile=${known_hosts}" \
+                "${TPOT_SSH_USER}@${TPOT_HOST}" >&2; then
+
+                # Verify pubkey auth actually works now.
+                if ssh -o BatchMode=yes \
+                       -o PreferredAuthentications=publickey \
+                       -o StrictHostKeyChecking=accept-new \
+                       -o UserKnownHostsFile="${known_hosts}" \
+                       -o ConnectTimeout=5 \
+                       -i "$key_path" \
+                       -p "$TPOT_SSH_PORT" \
+                       "${TPOT_SSH_USER}@${TPOT_HOST}" \
+                       'true' >/dev/null 2>&1; then
+                    ok "Key installed and pubkey auth verified."
+                    return 0
+                else
+                    warn "ssh-copy-id reported success but pubkey auth still fails."
+                    warn "Falling back to manual-install path…"
+                fi
+            else
+                warn "ssh-copy-id failed (wrong password, network, or T-Pot's"
+                warn "sshd config). Falling back to manual-install path…"
+            fi
+        else
+            info "Skipping automated install (per your choice)."
+        fi
+    fi
+
+    # ── Manual fallback ──────────────────────────────────────────────
+    echo "" >&2
+    echo "To install the key manually:" >&2
+    echo "" >&2
+    echo "  1. Open a NEW terminal on this host and run either:" >&2
+    echo "       ssh-copy-id -i ${key_path}.pub -p ${TPOT_SSH_PORT} ${TPOT_SSH_USER}@${TPOT_HOST}" >&2
+    echo "     (or, if ssh-copy-id is unavailable, log into T-Pot and append the" >&2
+    echo "      key above to ~/.ssh/authorized_keys yourself)" >&2
+    echo "" >&2
+    echo "  2. Come back here when done." >&2
+    echo "" >&2
+    read -r -p "Press Enter once the key is installed on T-Pot…" _
 }
 
 # -----------------------------------------------------------------------------
