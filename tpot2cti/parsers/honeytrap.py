@@ -176,12 +176,12 @@ class HoneytrapParser(BaseParser):
 
         # Foundation: sensor + attacker context (IPv4 + GeoIP + AS)
         out.extend(builder.build_sensor_context(session.sensor_hostname))
-        out.extend(builder.build_attacker_context(event))
+        out.extend(builder.build_attacker_context(event, session=session))
 
         ipv4_id = generate_ipv4_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4 observable
-        ip_ind = builder.build_ip_indicator(session.src_ip)
+        ip_ind = builder.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
             out.append(ip_ind)
             if rel := builder.build_relationship(
