@@ -7,6 +7,12 @@ multi-event "session" to correlate: each alert is the discrete unit
 of substance.  We map one ES doc → one ParsedEvent → one AttackSession,
 and every session is substantive (the alert itself is the signal).
 
+Per PoC LESSONS §32, this parser stays pure (model-only):
+parse() + correlate() + has_substance() only.  The per-protocol STIX
+shape — AttackPattern selection, Vulnerability emission, Domain-Name
+resolves-to relationships — lives in
+``STIXBuilder.build_suricata_alert``.
+
 Per V1_SPEC.md §5.2:
 
   T-Pot doc fields used:
@@ -18,19 +24,13 @@ Per V1_SPEC.md §5.2:
     each alert is a discrete event — we do NOT group by flow_id.
     Multiple alerts on the same flow each become their own Sighting.
 
-  STIX emitted per alert:
+  STIX emitted per alert (by the builder):
     IPv4-Addr, Location, AutonomousSystem (via build_attacker_context)
     Indicator (IP-based), Sighting,
     Domain-Name (if TLS SNI or HTTP host present),
     URL (if http.url present),
     AttackPattern (from alert.metadata.mitre_technique_id),
     Vulnerability (if a CVE id appears in the signature name).
-
-  Relationships:
-    Indicator → indicates → AttackPattern
-    Indicator → indicates → Vulnerability
-    Domain-Name → resolves-to → IPv4-Addr (when SNI matches alert IP)
-    IPv4-Addr → located-at → Location (handled by attacker context)
 """
 
 from __future__ import annotations
@@ -41,12 +41,6 @@ from typing import Optional
 
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
-from tpot2cti.stix.builder import STIXBuilder
-from tpot2cti.stix_ids import (
-    generate_domain_id,
-    generate_ipv4_id,
-    generate_sensor_id,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -60,40 +54,6 @@ _CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 
 # ATT&CK technique id format: T1190, T1059.001, etc.
 _MITRE_TID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
-
-# A conservative, expandable catalogue of MITRE technique ids we recognize.
-# Anything outside this set is logged at DEBUG and skipped rather than
-# emitted as a noisy / unverified AttackPattern.  Extend as we observe
-# new ids in the wild.
-_KNOWN_MITRE_TECHNIQUES: dict[str, str] = {
-    "T1021": "Remote Services",
-    "T1021.001": "Remote Desktop Protocol",
-    "T1021.002": "SMB/Windows Admin Shares",
-    "T1021.004": "SSH",
-    "T1046": "Network Service Discovery",
-    "T1059": "Command and Scripting Interpreter",
-    "T1059.004": "Unix Shell",
-    "T1068": "Exploitation for Privilege Escalation",
-    "T1071": "Application Layer Protocol",
-    "T1071.001": "Web Protocols",
-    "T1078": "Valid Accounts",
-    "T1090": "Proxy",
-    "T1095": "Non-Application Layer Protocol",
-    "T1110": "Brute Force",
-    "T1110.001": "Password Guessing",
-    "T1110.003": "Password Spraying",
-    "T1133": "External Remote Services",
-    "T1190": "Exploit Public-Facing Application",
-    "T1203": "Exploitation for Client Execution",
-    "T1210": "Exploitation of Remote Services",
-    "T1505": "Server Software Component",
-    "T1505.003": "Web Shell",
-    "T1566": "Phishing",
-    "T1572": "Protocol Tunneling",
-    "T1595": "Active Scanning",
-    "T1595.001": "Scanning IP Blocks",
-    "T1595.002": "Vulnerability Scanning",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -194,148 +154,6 @@ class SuricataParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
     # All Suricata alerts are substantive: the rule firing IS the signal.
     # We inherit BaseParser.has_substance which returns True.
-
-    # ──────────────────────────────────────────────────────────────────
-    # build() — produces STIX objects for one alert
-    # ──────────────────────────────────────────────────────────────────
-
-    def build(self, session: AttackSession, builder: STIXBuilder) -> list[dict]:
-        """Build the STIX graph for one Suricata alert.
-
-        Because each session wraps a single alert (one_event_per_session),
-        we pull metadata directly from the lone event rather than from
-        any pre-aggregated session fields.
-        """
-        out: list[dict] = []
-        if not session.events:
-            return out
-        event = session.events[0]
-        meta = event.meta
-
-        # Mirror the alert metadata onto session.meta so downstream
-        # consumers can introspect without reaching into events[0].
-        for k, v in meta.items():
-            session.meta.setdefault(k, v)
-
-        # Foundation: sensor + attacker context (IPv4 + geo + AS)
-        out.extend(builder.build_sensor_context(session.sensor_hostname))
-        out.extend(builder.build_attacker_context(event, session=session))
-
-        ipv4_id = generate_ipv4_id(session.src_ip)
-
-        # IP Indicator + based-on → IPv4
-        ip_ind = builder.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
-            if rel := builder.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
-                description=f"IP indicator for {session.src_ip}",
-            ):
-                out.append(rel)
-
-        # ── AttackPattern(s) from MITRE technique metadata ────────────
-        attack_pattern_ids: list[str] = []
-        techniques: list[str] = meta.get("mitre_techniques") or []
-        for tid in techniques:
-            name = _KNOWN_MITRE_TECHNIQUES.get(tid)
-            if not name:
-                logger.debug(
-                    f"suricata: unknown MITRE technique id {tid!r} in signature "
-                    f"{meta.get('signature')!r}; skipping AttackPattern emission"
-                )
-                continue
-            ap = builder.build_attack_pattern(name=name, mitre_id=tid)
-            if ap:
-                out.append(ap)
-                attack_pattern_ids.append(ap["id"])
-
-        # Fallback: if no recognized MITRE technique attached, emit a
-        # generic "Network Attack" AttackPattern so we always have an
-        # indicates-target per V1_SPEC §5.2.
-        if ip_ind and not attack_pattern_ids:
-            generic = builder.build_attack_pattern(name="Network Attack")
-            if generic:
-                out.append(generic)
-                attack_pattern_ids.append(generic["id"])
-
-        # Indicator → indicates → AttackPattern(s)
-        if ip_ind:
-            for ap_id in attack_pattern_ids:
-                if rel := builder.build_relationship(
-                    ip_ind["id"], "indicates", ap_id,
-                    description=(
-                        f"Suricata rule {meta.get('signature_id') or '?'}: "
-                        f"{meta.get('signature') or 'alert'}"
-                    ),
-                ):
-                    out.append(rel)
-
-        # ── Vulnerabilities (CVE refs from signature name) ────────────
-        for cve in meta.get("cves") or []:
-            vuln = builder.build_vulnerability(
-                cve,
-                description=f"Referenced by Suricata signature: {meta.get('signature')!r}",
-            )
-            if vuln:
-                out.append(vuln)
-                if ip_ind:
-                    if rel := builder.build_relationship(
-                        ip_ind["id"], "indicates", vuln["id"],
-                        description=(
-                            f"{session.src_ip} attempted exploit of {cve} "
-                            f"(Suricata SID {meta.get('signature_id') or '?'})"
-                        ),
-                    ):
-                        out.append(rel)
-
-        # ── Domain-Name (TLS SNI or HTTP host) ────────────────────────
-        # Collect candidate domains, dedup, build Domain-Name observables.
-        domain_candidates: list[str] = []
-        if sni := meta.get("tls_sni"):
-            domain_candidates.append(sni)
-        if host := meta.get("http_host"):
-            if host not in domain_candidates:
-                domain_candidates.append(host)
-
-        for fqdn in domain_candidates:
-            d = builder.build_domain(fqdn, session=session)
-            if d:
-                out.append(d)
-                # Domain-Name → resolves-to → IPv4-Addr (dst_ip preferred,
-                # since the SNI/host refers to the destination the
-                # attacker is trying to reach; if no dst_ip, fall back to
-                # the alert's src_ip per V1_SPEC §5.2 phrasing).
-                target_ip = event.dst_ip or session.src_ip
-                if target_ip:
-                    target_ipv4_id = generate_ipv4_id(target_ip)
-                    if rel := builder.build_relationship(
-                        d["id"], "resolves-to", target_ipv4_id,
-                        description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
-                    ):
-                        out.append(rel)
-
-        # ── URL observable (if HTTP request URL captured) ─────────────
-        if (url := meta.get("http_url")) and (host := meta.get("http_host")):
-            full_url = url if url.startswith("http") else f"http://{host}{url}"
-            url_obj = builder.build_url(full_url, session=session)
-            if url_obj:
-                out.append(url_obj)
-                if rel := builder.build_relationship(
-                    url_obj["id"], "related-to", ipv4_id,
-                    description=f"URL requested by {session.src_ip}",
-                ):
-                    out.append(rel)
-
-        # ── Sighting (on the IP Indicator) ────────────────────────────
-        if ip_ind:
-            sighting = builder.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session,
-                count=1,
-            )
-            if sighting:
-                out.append(sighting)
-
-        return out
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers
@@ -472,16 +290,17 @@ if __name__ == "__main__":
     assert parser.has_substance(session) is True
     print(f"  has_substance:    {parser.has_substance(session)}")
 
-    # 4. build STIX
+    # 4. build STIX via the builder (parser no longer owns build()).
     import os
     os.environ.setdefault("TPOT_HOST", "test")
     os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
     os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
     from tpot2cti.config import load_config
+    from tpot2cti.stix.builder import STIXBuilder
 
     cfg = load_config()
     builder = STIXBuilder(cfg)
-    objects = parser.build(session, builder)
+    objects = builder.build_suricata_alert(session)
     print(f"\nbuilt {len(objects)} STIX objects:")
     by_type: dict[str, int] = {}
     for o in objects:

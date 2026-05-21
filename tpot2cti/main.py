@@ -62,6 +62,24 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Parser → builder-method dispatch (PoC LESSONS §32)
+# ---------------------------------------------------------------------------
+# Parsers stay pure (parse + correlate + has_substance). The per-parser
+# STIX shape lives in STIXBuilder.build_<x>_session methods. The
+# orchestrator dispatches via session.event_type. Anything not listed
+# here flows through builder.build_driveby_session() (the minimal
+# IP+Sighting graph used for one-shot probes).
+#
+# Add a row when a parser gains a dedicated builder method.
+_PARSER_DISPATCH: dict[str, str] = {
+    "Cowrie":       "build_cowrie_session",
+    "Suricata":     "build_suricata_alert",
+    "Honeytrap":    "build_honeytrap_probe",
+    "__fallback__": "build_fallback_event",
+}
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 imports — defensive stubs so this module is importable even when
 # Phase 5 hasn't landed yet (sibling agent is writing it in parallel).
 # The stubs are NEVER used in production — `main()` will fail loudly at
@@ -363,17 +381,28 @@ def run_cycle(
 
         for session in sessions:
             try:
-                # Parsers expose `.build(session, builder) -> list[dict]`
-                # which internally chooses between full and drive-by
-                # treatment via `parser.has_substance(session)`.
-                # See parsers/cowrie.py for the canonical implementation.
-                build_fn = getattr(parser, "build", None)
-                if build_fn is None:
-                    # Fallback: use the substance gate directly + the
-                    # generic drive-by builder so we always emit *something*.
+                # Per PoC LESSONS §32: parsers are pure data; STIX-shape
+                # decisions live on the builder. We dispatch by the
+                # PARSER's type_name (not session.event_type — which
+                # carries the raw T-Pot type even when the fallback
+                # parser handled it). Parsers without a dedicated builder
+                # method route through build_driveby_session (the ~20
+                # parsers that produce the minimal IP + Sighting graph).
+                method_name = _PARSER_DISPATCH.get(parser.type_name)
+                if method_name and hasattr(builder, method_name):
+                    objs = getattr(builder, method_name)(session)
+                elif method_name:
+                    # Listed in dispatch table but the builder doesn't
+                    # have the method — programmer error, not data error.
+                    logger.error(
+                        f"_PARSER_DISPATCH names {method_name!r} for "
+                        f"parser type_name={parser.type_name!r} but "
+                        f"builder has no such method; falling back to "
+                        f"build_driveby_session"
+                    )
                     objs = builder.build_driveby_session(session)
                 else:
-                    objs = build_fn(session, builder)
+                    objs = builder.build_driveby_session(session)
                 all_objects.extend(objs)
             except Exception as e:
                 # Per V1_SPEC §7: caught + logged; cycle continues.
