@@ -43,6 +43,13 @@ from typing import Optional
 
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
+from tpot2cti.stix.rendering import (
+    render_cowrie_session_note_body,
+    render_cowrie_sighting_description,
+    render_fallback_no_ip_note_body,
+    render_fallback_sighting_description,
+    render_honeytrap_sighting_description,
+)
 from tpot2cti.stix.external_refs import (
     for_autonomous_system as _refs_for_as,
     for_domain as _refs_for_domain,
@@ -93,6 +100,44 @@ MAX_COMMANDS_PER_PROCESS = 50
 # Simple IPv4 / IPv6 sanity regexes (we accept what logstash gave us,
 # but reject obviously malformed strings before building observables).
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+# ---------------------------------------------------------------------------
+# Suricata MITRE technique allowlist
+# ---------------------------------------------------------------------------
+# A conservative, expandable catalogue of MITRE technique ids we recognize.
+# Anything outside this set is logged at DEBUG and skipped rather than
+# emitted as a noisy / unverified AttackPattern in build_suricata_alert.
+# Extend as we observe new ids in the wild.
+_KNOWN_MITRE_TECHNIQUES: dict[str, str] = {
+    "T1021": "Remote Services",
+    "T1021.001": "Remote Desktop Protocol",
+    "T1021.002": "SMB/Windows Admin Shares",
+    "T1021.004": "SSH",
+    "T1046": "Network Service Discovery",
+    "T1059": "Command and Scripting Interpreter",
+    "T1059.004": "Unix Shell",
+    "T1068": "Exploitation for Privilege Escalation",
+    "T1071": "Application Layer Protocol",
+    "T1071.001": "Web Protocols",
+    "T1078": "Valid Accounts",
+    "T1090": "Proxy",
+    "T1095": "Non-Application Layer Protocol",
+    "T1110": "Brute Force",
+    "T1110.001": "Password Guessing",
+    "T1110.003": "Password Spraying",
+    "T1133": "External Remote Services",
+    "T1190": "Exploit Public-Facing Application",
+    "T1203": "Exploitation for Client Execution",
+    "T1210": "Exploitation of Remote Services",
+    "T1505": "Server Software Component",
+    "T1505.003": "Web Shell",
+    "T1566": "Phishing",
+    "T1572": "Protocol Tunneling",
+    "T1595": "Active Scanning",
+    "T1595.001": "Scanning IP Blocks",
+    "T1595.002": "Vulnerability Scanning",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +932,403 @@ class STIXBuilder:
     # session, regardless of substance.  Parsers can then layer their
     # protocol-specific extras on top.
     # ──────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────
+    # Per-parser session builders (PoC LESSONS §32 — STIX-shape decisions
+    # live here, not in parsers).  Each method consumes one AttackSession
+    # and returns the full per-protocol STIX object list.  The orchestrator
+    # (main.run_cycle) dispatches to the right method via _PARSER_DISPATCH.
+    # ──────────────────────────────────────────────────────────────────
+
+    def build_cowrie_session(self, session: AttackSession) -> list[dict]:
+        """Build the full Cowrie session STIX graph.
+
+        Caller is expected to have already determined has_substance() is
+        True.  For drive-by sessions the caller invokes
+        `self.build_driveby_session(session)` instead.
+
+        Emits: sensor + attacker context + IP Indicator + (HASSH key) +
+        (Process) + (File + File Indicator) + URLs + Domains + Sighting +
+        per-session transcript Note.
+        """
+        out: list[dict] = []
+        if not session.events:
+            return out
+
+        # Foundation: sensor + attacker context (IPv4 + geo + AS)
+        out.extend(self.build_sensor_context(session.sensor_hostname))
+        out.extend(self.build_attacker_context(session.events[0], session=session))
+
+        ipv4_id = generate_ipv4_id(session.src_ip)
+
+        # IP Indicator + based-on → IPv4
+        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
+        if ip_ind:
+            out.append(ip_ind)
+            if rel := self.build_relationship(
+                ip_ind["id"], "based-on", ipv4_id,
+                description=f"IP indicator for {session.src_ip}",
+            ):
+                out.append(rel)
+
+        # HASSH fingerprint → Cryptographic-Key
+        if session.hassh:
+            ck = self.build_cryptographic_key(session.hassh)
+            if ck:
+                out.append(ck)
+                if rel := self.build_relationship(
+                    ck["id"], "related-to", ipv4_id,
+                    description=f"HASSH fingerprint observed from {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        # Process (commands)
+        if session.commands:
+            proc = self.build_process(session, session.commands)
+            if proc:
+                out.append(proc)
+                if rel := self.build_relationship(
+                    proc["id"], "related-to", ipv4_id,
+                    description=f"Commands run by {session.src_ip} in Cowrie session",
+                ):
+                    out.append(rel)
+
+        # File downloads → StixFile + Indicator + URL/Domain
+        for sha256 in session.malware_hashes:
+            f = self.build_file(sha256, session=session)
+            if f:
+                out.append(f)
+                if rel := self.build_relationship(
+                    f["id"], "related-to", ipv4_id,
+                    description=f"File {sha256[:16]}… downloaded by {session.src_ip}",
+                ):
+                    out.append(rel)
+                # File Indicator + based-on
+                f_ind = self.build_file_indicator(sha256, session=session)
+                if f_ind:
+                    out.append(f_ind)
+                    if rel := self.build_relationship(
+                        f_ind["id"], "based-on", f["id"],
+                        description=f"Honeypot-captured file {sha256[:16]}…",
+                    ):
+                        out.append(rel)
+
+        # URLs (download sources + URLs in commands)
+        for url in session.urls:
+            url_obj = self.build_url(url, session=session)
+            if url_obj:
+                out.append(url_obj)
+                if rel := self.build_relationship(
+                    url_obj["id"], "related-to", ipv4_id,
+                    description=f"URL referenced by {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        # Domains derived from URLs
+        for fqdn in session.domains:
+            d = self.build_domain(fqdn, session=session)
+            if d:
+                out.append(d)
+
+        # Sighting (on the IP Indicator)
+        if ip_ind:
+            sighting = self.build_sighting(
+                ip_ind["id"], session.sensor_hostname, session,
+                count=session.event_count,
+                description=render_cowrie_sighting_description(session),
+            )
+            if sighting:
+                out.append(sighting)
+
+        # Session-transcript Note — ONE per Cowrie SSH session, containing
+        # the full command transcript + auth + credentials + HASSH + SSH
+        # version + malware hashes + URLs. This is the carve-out from
+        # LESSONS_LEARNED §7.1: per-session Notes are an anti-pattern in
+        # general, but a Cowrie SSH login session is genuinely-per-session
+        # content (commands the attacker actually ran) and is what an
+        # analyst expects to find on the indicator's page.
+        note_body = render_cowrie_session_note_body(session)
+        if note_body:
+            note_object_refs: list[str] = [ipv4_id]
+            if ip_ind:
+                note_object_refs.append(ip_ind["id"])
+            note = self.build_session_note(
+                session,
+                body_md=note_body,
+                abstract=(
+                    f"Cowrie SSH session from {session.src_ip} "
+                    f"({len(session.commands)} command(s)"
+                    + (", auth success" if session.auth_success else "")
+                    + ")"
+                ),
+                object_refs=note_object_refs,
+            )
+            if note:
+                out.append(note)
+                if ip_ind:
+                    if rel := self.build_relationship(
+                        note["id"], "related-to", ip_ind["id"],
+                        description=f"Cowrie session transcript for {session.src_ip}",
+                    ):
+                        out.append(rel)
+
+        return out
+
+    def build_suricata_alert(self, session: AttackSession) -> list[dict]:
+        """Build the STIX graph for one Suricata alert.
+
+        Because each session wraps a single alert (one_event_per_session),
+        we pull metadata directly from the lone event rather than from
+        any pre-aggregated session fields.
+        """
+        out: list[dict] = []
+        if not session.events:
+            return out
+        event = session.events[0]
+        meta = event.meta
+
+        # Mirror the alert metadata onto session.meta so downstream
+        # consumers can introspect without reaching into events[0].
+        for k, v in meta.items():
+            session.meta.setdefault(k, v)
+
+        # Foundation: sensor + attacker context (IPv4 + geo + AS)
+        out.extend(self.build_sensor_context(session.sensor_hostname))
+        out.extend(self.build_attacker_context(event, session=session))
+
+        ipv4_id = generate_ipv4_id(session.src_ip)
+
+        # IP Indicator + based-on → IPv4
+        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
+        if ip_ind:
+            out.append(ip_ind)
+            if rel := self.build_relationship(
+                ip_ind["id"], "based-on", ipv4_id,
+                description=f"IP indicator for {session.src_ip}",
+            ):
+                out.append(rel)
+
+        # ── AttackPattern(s) from MITRE technique metadata ────────────
+        attack_pattern_ids: list[str] = []
+        techniques: list[str] = meta.get("mitre_techniques") or []
+        for tid in techniques:
+            name = _KNOWN_MITRE_TECHNIQUES.get(tid)
+            if not name:
+                logger.debug(
+                    f"suricata: unknown MITRE technique id {tid!r} in signature "
+                    f"{meta.get('signature')!r}; skipping AttackPattern emission"
+                )
+                continue
+            ap = self.build_attack_pattern(name=name, mitre_id=tid)
+            if ap:
+                out.append(ap)
+                attack_pattern_ids.append(ap["id"])
+
+        # Fallback: if no recognized MITRE technique attached, emit a
+        # generic "Network Attack" AttackPattern so we always have an
+        # indicates-target per V1_SPEC §5.2.
+        if ip_ind and not attack_pattern_ids:
+            generic = self.build_attack_pattern(name="Network Attack")
+            if generic:
+                out.append(generic)
+                attack_pattern_ids.append(generic["id"])
+
+        # Indicator → indicates → AttackPattern(s)
+        if ip_ind:
+            for ap_id in attack_pattern_ids:
+                if rel := self.build_relationship(
+                    ip_ind["id"], "indicates", ap_id,
+                    description=(
+                        f"Suricata rule {meta.get('signature_id') or '?'}: "
+                        f"{meta.get('signature') or 'alert'}"
+                    ),
+                ):
+                    out.append(rel)
+
+        # ── Vulnerabilities (CVE refs from signature name) ────────────
+        for cve in meta.get("cves") or []:
+            vuln = self.build_vulnerability(
+                cve,
+                description=f"Referenced by Suricata signature: {meta.get('signature')!r}",
+            )
+            if vuln:
+                out.append(vuln)
+                if ip_ind:
+                    if rel := self.build_relationship(
+                        ip_ind["id"], "indicates", vuln["id"],
+                        description=(
+                            f"{session.src_ip} attempted exploit of {cve} "
+                            f"(Suricata SID {meta.get('signature_id') or '?'})"
+                        ),
+                    ):
+                        out.append(rel)
+
+        # ── Domain-Name (TLS SNI or HTTP host) ────────────────────────
+        # Collect candidate domains, dedup, build Domain-Name observables.
+        domain_candidates: list[str] = []
+        if sni := meta.get("tls_sni"):
+            domain_candidates.append(sni)
+        if host := meta.get("http_host"):
+            if host not in domain_candidates:
+                domain_candidates.append(host)
+
+        for fqdn in domain_candidates:
+            d = self.build_domain(fqdn, session=session)
+            if d:
+                out.append(d)
+                # Domain-Name → resolves-to → IPv4-Addr (dst_ip preferred,
+                # since the SNI/host refers to the destination the
+                # attacker is trying to reach; if no dst_ip, fall back to
+                # the alert's src_ip per V1_SPEC §5.2 phrasing).
+                target_ip = event.dst_ip or session.src_ip
+                if target_ip:
+                    target_ipv4_id = generate_ipv4_id(target_ip)
+                    if rel := self.build_relationship(
+                        d["id"], "resolves-to", target_ipv4_id,
+                        description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
+                    ):
+                        out.append(rel)
+
+        # ── URL observable (if HTTP request URL captured) ─────────────
+        if (url := meta.get("http_url")) and (host := meta.get("http_host")):
+            full_url = url if url.startswith("http") else f"http://{host}{url}"
+            url_obj = self.build_url(full_url, session=session)
+            if url_obj:
+                out.append(url_obj)
+                if rel := self.build_relationship(
+                    url_obj["id"], "related-to", ipv4_id,
+                    description=f"URL requested by {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        # ── Sighting (on the IP Indicator) ────────────────────────────
+        if ip_ind:
+            sighting = self.build_sighting(
+                ip_ind["id"], session.sensor_hostname, session,
+                count=1,
+            )
+            if sighting:
+                out.append(sighting)
+
+        return out
+
+    def build_honeytrap_probe(self, session: AttackSession) -> list[dict]:
+        """Build the STIX graph for a substantive Honeytrap session.
+
+        The caller (orchestrator) is expected to have already checked
+        `has_substance()` and routed drive-by sessions to
+        `self.build_driveby_session()` instead.  This method assumes
+        substance and always emits a Sighting with the captured payload
+        summary in its `description`.
+        """
+        out: list[dict] = []
+        if not session.events:
+            return out
+
+        event = session.events[0]
+
+        # Foundation: sensor + attacker context (IPv4 + GeoIP + AS)
+        out.extend(self.build_sensor_context(session.sensor_hostname))
+        out.extend(self.build_attacker_context(event, session=session))
+
+        ipv4_id = generate_ipv4_id(session.src_ip)
+
+        # IP Indicator + based-on → IPv4 observable
+        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
+        if ip_ind:
+            out.append(ip_ind)
+            if rel := self.build_relationship(
+                ip_ind["id"], "based-on", ipv4_id,
+                description=f"IP indicator for {session.src_ip}",
+            ):
+                out.append(rel)
+
+            # Sighting on the IP Indicator — per-probe summary now lives in
+            # the Sighting's `description` field instead of a separate Note
+            # (LESSONS_LEARNED §7.1: per-session Notes at hive scale produce
+            # 50k+ Notes/day that nobody reads; condense into the Sighting).
+            sighting = self.build_sighting(
+                ip_ind["id"], session.sensor_hostname, session,
+                count=session.event_count,
+                description=render_honeytrap_sighting_description(session, event),
+            )
+            if sighting:
+                out.append(sighting)
+
+        return out
+
+    def build_fallback_event(self, session: AttackSession) -> list[dict]:
+        """Build STIX for one unknown-type (fallback) session.
+
+        Always emits a Note describing the unknown event when src_ip is
+        missing.  When ``src_ip`` is present, emits IPv4-Addr +
+        IP-Indicator + Sighting + sensor context with the per-event
+        summary on the Sighting.description (no Note — per
+        LESSONS_LEARNED §7.1).
+        """
+        out: list[dict] = []
+        if not session.events:
+            return out
+
+        first = session.events[0]
+        unknown_type = first.event_type
+
+        # Sensor identity is foundation — emit even when there's no IP
+        # so the Note can hang off the sensor.
+        out.extend(self.build_sensor_context(session.sensor_hostname))
+
+        ipv4_id: Optional[str] = None
+
+        if first.src_ip:
+            # Attacker context (IPv4 + GeoIP + AS + located-at / belongs-to)
+            attacker_objs = self.build_attacker_context(first, session=session)
+            out.extend(attacker_objs)
+            if attacker_objs:
+                ipv4_id = generate_ipv4_id(first.src_ip)
+
+            # IP Indicator + based-on → IPv4
+            ip_ind = self.build_ip_indicator(first.src_ip, session=session)
+            if ip_ind:
+                out.append(ip_ind)
+                if ipv4_id:
+                    if rel := self.build_relationship(
+                        ip_ind["id"], "based-on", ipv4_id,
+                        description=f"IP indicator for {first.src_ip}",
+                    ):
+                        out.append(rel)
+
+                # Sighting on the IP Indicator — the per-event summary
+                # (unknown_type + dst_port) now lives in the Sighting's
+                # `description` field. Per LESSONS_LEARNED §7.1 we do NOT
+                # emit a separate Note per event for high-volume / low-
+                # signal protocols. If a maintainer wants per-event
+                # forensics, the raw doc is preserved on T-Pot's ES.
+                sighting = self.build_sighting(
+                    ip_ind["id"], session.sensor_hostname, session,
+                    count=session.event_count,
+                    description=render_fallback_sighting_description(first, unknown_type),
+                )
+                if sighting:
+                    out.append(sighting)
+        else:
+            # Edge case: unknown-type event has no src_ip.  Without an IP
+            # there is no Sighting to attach a description to — emit a
+            # single free-floating Note so the event isn't silently lost.
+            # This is the ONE remaining Note-emission path in the fallback
+            # builder (LESSONS_LEARNED §7.1 carve-out: per-event Notes for
+            # the IP-bearing common case are dropped; the rare no-IP case
+            # keeps a Note as the only signal we can surface).
+            body = render_fallback_no_ip_note_body(first, unknown_type)
+            note = self.build_session_note(
+                session,
+                body_md=body,
+                abstract=f"Unrecognized T-Pot event: {unknown_type} (no src_ip)",
+                object_refs=[generate_sensor_id(session.sensor_hostname)],
+            )
+            if note:
+                out.append(note)
+
+        return out
 
     def build_attacker_context(
         self,

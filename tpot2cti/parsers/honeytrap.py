@@ -7,6 +7,10 @@ a banner grab, an empty UDP packet — but occasionally an attacker
 actually sends an exploit payload to a non-honeypotted port and that
 payload is worth preserving.
 
+Per PoC LESSONS §32, this parser stays pure (model-only):
+parse() + has_substance() only.  The per-protocol STIX shape lives in
+``STIXBuilder.build_honeytrap_probe``.
+
 Per V1_SPEC.md §5.4:
 
   T-Pot doc fields used:
@@ -16,14 +20,13 @@ Per V1_SPEC.md §5.4:
   Event correlation: each TCP connection or UDP datagram is one event.
   We use the default one-event-per-session correlator.
 
-  STIX emitted:
+  STIX emitted (by the builder):
     - IPv4-Addr (via builder.build_attacker_context)
-    - Sighting (probe of port N)
-    - Note if payload is non-trivial (more than 8 bytes printable)
+    - Sighting (probe of port N) with payload summary in description
 
   Substance filter: empty-payload probes get a minimal Sighting only.
   Sessions with > 8 bytes of printable payload get the full graph with
-  a Note that preserves the captured bytes.
+  a Sighting description that preserves the captured bytes.
 """
 
 from __future__ import annotations
@@ -33,8 +36,6 @@ from typing import Optional
 
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
-from tpot2cti.stix.builder import STIXBuilder
-from tpot2cti.stix_ids import generate_ipv4_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,8 @@ logger = logging.getLogger(__name__)
 
 #: Threshold (in printable-payload bytes) above which a Honeytrap session
 #: is treated as "substantive" and gets the full STIX graph including a
-#: Note SDO.  Per V1_SPEC §5.4.
+#: Sighting with payload preview in its description.  Per V1_SPEC §5.4.
 SUBSTANCE_PAYLOAD_THRESHOLD = 8
-
-#: Cap on payload_printable bytes preserved in the Sighting.description.
-#: Per LESSONS_LEARNED §7.1 we no longer emit a separate Note per probe.
-#: Keep this short — the description is a one-line summary, not a hex dump.
-SIGHTING_DESC_PREVIEW_CAP = 160
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +106,7 @@ class HoneytrapParser(BaseParser):
         self._populate_geoip(doc, event)
 
         # Payload bytes — store both representations in meta so the
-        # builder can preserve them verbatim in the Note.
+        # builder can preserve them verbatim in the Sighting description.
         payload_printable = (
             doc.get("payload_printable")
             or ac.get("payload_printable")
@@ -148,7 +144,7 @@ class HoneytrapParser(BaseParser):
         Empty-payload probes (SYN scans, single-packet UDP touches,
         banner-grab opens with no follow-up) fall through to the
         drive-by code path: IPv4-Addr + GeoIP + AS + IP Indicator +
-        Sighting, no Note.
+        Sighting, no payload preview.
         """
         if not session.events:
             return False
@@ -156,88 +152,8 @@ class HoneytrapParser(BaseParser):
         return len(payload) > SUBSTANCE_PAYLOAD_THRESHOLD
 
     # ──────────────────────────────────────────────────────────────────
-    # build() — full STIX graph for a substantive session
-    # ──────────────────────────────────────────────────────────────────
-
-    def build(self, session: AttackSession, builder: STIXBuilder) -> list[dict]:
-        """Build the STIX graph for a substantive Honeytrap session.
-
-        The caller (orchestrator) is expected to have already checked
-        `has_substance()` and routed drive-by sessions to
-        `builder.build_driveby_session()` instead.  This method assumes
-        substance and always emits a Note SDO with the captured
-        payload.
-        """
-        out: list[dict] = []
-        if not session.events:
-            return out
-
-        event = session.events[0]
-
-        # Foundation: sensor + attacker context (IPv4 + GeoIP + AS)
-        out.extend(builder.build_sensor_context(session.sensor_hostname))
-        out.extend(builder.build_attacker_context(event, session=session))
-
-        ipv4_id = generate_ipv4_id(session.src_ip)
-
-        # IP Indicator + based-on → IPv4 observable
-        ip_ind = builder.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
-            if rel := builder.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
-                description=f"IP indicator for {session.src_ip}",
-            ):
-                out.append(rel)
-
-            # Sighting on the IP Indicator — per-probe summary now lives in
-            # the Sighting's `description` field instead of a separate Note
-            # (LESSONS_LEARNED §7.1: per-session Notes at hive scale produce
-            # 50k+ Notes/day that nobody reads; condense into the Sighting).
-            sighting = builder.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session,
-                count=session.event_count,
-                description=self._render_sighting_description(session, event),
-            )
-            if sighting:
-                out.append(sighting)
-
-        return out
-
-    # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _render_sighting_description(session: AttackSession, event: ParsedEvent) -> str:
-        """One-line summary baked into the Sighting's `description` field.
-
-        Replaces the per-probe Note that V0 emitted (and the bare port-scan
-        approach the PoC used). Per LESSONS_LEARNED §7.1: this is the
-        right place for low-signal-per-event protocol summaries — the
-        analyst sees it in OpenCTI's Sighting context without flooding
-        the Notes tab.
-
-        Example output:
-          "Honeytrap probe tcp/22 — payload 187B printable, leads
-          'GET / HTTP/1.1\\r\\nHost: ...' (hex 8 bytes shown)"
-        """
-        payload_printable = str(event.meta.get("payload_printable") or "")
-        payload_hex = str(event.meta.get("payload_hex") or "")
-        proto = (event.protocol or "tcp").lower()
-        dst_port = event.dst_port if event.dst_port is not None else "?"
-
-        bits: list[str] = [f"Honeytrap probe {proto}/{dst_port}"]
-        if payload_printable:
-            preview = payload_printable[:SIGHTING_DESC_PREVIEW_CAP]
-            preview = preview.replace("\n", "\\n").replace("\r", "\\r")
-            suffix = " [truncated]" if len(payload_printable) > SIGHTING_DESC_PREVIEW_CAP else ""
-            bits.append(
-                f"payload {len(payload_printable)}B printable, leads {preview!r}{suffix}"
-            )
-        elif payload_hex:
-            bits.append(f"payload hex {len(payload_hex) // 2}B")
-        return " — ".join(bits)
 
     @staticmethod
     def _safe_int(value) -> Optional[int]:
@@ -325,11 +241,13 @@ if __name__ == "__main__":
     assert drive_has is False
     assert subs_has is True
 
-    # Need a Config to build STIX
+    # Need a Config to build STIX. Per refactor, the orchestrator dispatches
+    # substantive Honeytrap sessions to builder.build_honeytrap_probe(s).
     os.environ.setdefault("TPOT_HOST", "test")
     os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
     os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
     from tpot2cti.config import load_config
+    from tpot2cti.stix.builder import STIXBuilder
 
     cfg = load_config()
 
@@ -343,9 +261,9 @@ if __name__ == "__main__":
     for t, n in sorted(drive_counts.items(), key=lambda x: -x[1]):
         print(f"  {t:25s} {n}")
 
-    # Substantive: orchestrator would call parser.build()
+    # Substantive: orchestrator would call builder.build_honeytrap_probe()
     builder2 = STIXBuilder(cfg)
-    subs_objs = parser.build(subs_session, builder2)
+    subs_objs = builder2.build_honeytrap_probe(subs_session)
     subs_counts: dict[str, int] = {}
     for o in subs_objs:
         subs_counts[o["type"]] = subs_counts.get(o["type"], 0) + 1
