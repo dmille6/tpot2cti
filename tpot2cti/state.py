@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS cycle_log (
 
 CREATE INDEX IF NOT EXISTS idx_cycle_log_started_at
     ON cycle_log(started_at);
+
+-- Per V1_SPEC.md §6 (daily top-100 credentials Note): track which
+-- (sensor, utc_date) pairs we've already emitted a Note for, so the
+-- "missed midnight" catch-up scan in main.py can find missing days
+-- in the configured lookback window without re-emitting (the Note id
+-- is idempotent via UUID5, but skipping the ES aggregation when we
+-- already published the day is a cheap win).
+CREATE TABLE IF NOT EXISTS daily_creds_log (
+    sensor      TEXT NOT NULL,
+    utc_date    TEXT NOT NULL,
+    emitted_at  TEXT NOT NULL,
+    PRIMARY KEY (sensor, utc_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_creds_log_utc_date
+    ON daily_creds_log(utc_date);
 """
 
 
@@ -183,6 +199,89 @@ class CycleState:
                  cycle_id),
             )
 
+    def record_cycle_failure(
+        self, cycle_id: int, error_msg: str, duration_seconds: float = 0.0
+    ) -> None:
+        """Mark a cycle row as failed.  Convenience wrapper around
+        `record_cycle()` for the exception path in `main.run_cycle`.
+
+        Per V1_SPEC.md §7 (error handling): we never let a single bad
+        cycle crash the loop — we log + record + continue.  The error
+        message is truncated to 4 KB for the cycle_log row.
+        """
+        msg = (error_msg or "")[:4096]
+        # Store error in the generic state table under a rolling key so
+        # /health can surface "last failure" without a schema change.
+        self.set("last_cycle_error", msg)
+        ended_at = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE cycle_log SET "
+                "ended_at = ?, success = 0, errors_count = 1, "
+                "duration_seconds = ? "
+                "WHERE cycle_id = ?",
+                (ended_at, duration_seconds, cycle_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Daily top-100 credentials Note tracking (V1_SPEC.md §6)
+    # ------------------------------------------------------------------
+
+    def record_daily_creds_emitted(self, sensor: str, utc_date: date) -> None:
+        """Mark a (sensor, utc_date) pair as having had its daily Note emitted.
+
+        Called by `main.run_cycle` AFTER a successful publisher round, so
+        a failed publish doesn't poison the log (the Note id is idempotent
+        in OpenCTI, but we want the catch-up scan to retry next cycle).
+        """
+        d = utc_date.isoformat() if isinstance(utc_date, date) else str(utc_date)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO daily_creds_log (sensor, utc_date, emitted_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(sensor, utc_date) DO UPDATE SET "
+                "emitted_at = excluded.emitted_at",
+                (sensor, d, now),
+            )
+        logger.debug(
+            f"daily_creds_log: recorded sensor={sensor!r} utc_date={d}"
+        )
+
+    def get_missing_daily_creds_dates(
+        self, sensor: str, lookback_days: int
+    ) -> list[date]:
+        """Return UTC dates in [today - lookback_days, yesterday] for `sensor`
+        that don't yet have a row in `daily_creds_log`.
+
+        We DELIBERATELY exclude today (the day isn't over yet — emitting a
+        partial-day Note would be wrong and would not get re-emitted, since
+        the (sensor, today) row would mark it done).
+
+        Per V1_SPEC.md §6: "Once per UTC day (computed during the cycle
+        that crosses midnight)".  This catches the case where the
+        importer was down across midnight — on next start we walk back
+        `lookback_days` (default 7) and fill in any gaps.
+        """
+        if lookback_days <= 0:
+            return []
+        today = datetime.now(timezone.utc).date()
+        # Half-open window: yesterday inclusive, looking back lookback_days.
+        # e.g. lookback_days=7 → yesterday + 6 prior days = 7 candidate dates.
+        candidates: list[date] = [
+            today - timedelta(days=n) for n in range(1, lookback_days + 1)
+        ]
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT utc_date FROM daily_creds_log WHERE sensor = ?",
+                (sensor,),
+            ).fetchall()
+        emitted = {r[0] for r in rows}
+        missing = [d for d in candidates if d.isoformat() not in emitted]
+        # Return in ascending date order for stable / predictable processing.
+        missing.sort()
+        return missing
+
     def recent_cycles(self, limit: int = 10) -> list[dict]:
         """Return the last N cycle rows, newest first."""
         with self._conn() as c:
@@ -240,6 +339,51 @@ if __name__ == "__main__":
         s.set("custom_key", "custom_value")
         assert s.get("custom_key") == "custom_value"
         print("OK: generic key/value get/set works")
+
+        # ── daily_creds_log smoke (V1_SPEC §6) ──
+        from datetime import date as _date, timedelta as _td
+        sensor = "tpot01"
+        today = datetime.now(timezone.utc).date()
+        yesterday = today - _td(days=1)
+        two_days_ago = today - _td(days=2)
+
+        # Fresh DB → every day in lookback window is missing.
+        missing = s.get_missing_daily_creds_dates(sensor, lookback_days=7)
+        assert len(missing) == 7, f"expected 7 missing dates, got {len(missing)}"
+        assert today not in missing, "today should NOT be in the missing set"
+        assert yesterday in missing, "yesterday should be missing on fresh DB"
+        print(f"OK: get_missing_daily_creds_dates → {len(missing)} dates, "
+              f"first={missing[0].isoformat()} last={missing[-1].isoformat()}")
+
+        # Record yesterday + two_days_ago as emitted.
+        s.record_daily_creds_emitted(sensor, yesterday)
+        s.record_daily_creds_emitted(sensor, two_days_ago)
+        missing2 = s.get_missing_daily_creds_dates(sensor, lookback_days=7)
+        assert yesterday not in missing2
+        assert two_days_ago not in missing2
+        assert len(missing2) == 5, f"expected 5 after recording 2, got {len(missing2)}"
+        print(f"OK: after recording 2 days, missing count = {len(missing2)}")
+
+        # Idempotent re-record (ON CONFLICT update).
+        s.record_daily_creds_emitted(sensor, yesterday)
+        missing3 = s.get_missing_daily_creds_dates(sensor, lookback_days=7)
+        assert len(missing3) == 5
+        print("OK: record_daily_creds_emitted is idempotent")
+
+        # Other sensor isolated.
+        missing_other = s.get_missing_daily_creds_dates("tpot02", lookback_days=7)
+        assert len(missing_other) == 7, "other sensor should be untouched"
+        print("OK: daily_creds_log is per-sensor isolated")
+
+        # record_cycle_failure stamps last_cycle_error and the row.
+        cid2 = s.start_cycle()
+        s.record_cycle_failure(cid2, "kaboom: test failure", duration_seconds=0.5)
+        assert s.get("last_cycle_error") == "kaboom: test failure"
+        rows = s.recent_cycles(2)
+        # newest first — should include the failed row
+        assert any(r["success"] == 0 for r in rows), "failure row not recorded"
+        print("OK: record_cycle_failure stamps state + cycle_log row")
+
         print("\nSmoke test passed.")
     finally:
         Path(tmp).unlink(missing_ok=True)
