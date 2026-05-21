@@ -609,6 +609,18 @@ class STIXBuilder:
         return self._dedup(self._stamp(obj))
 
     def build_process(self, session: AttackSession, commands: list[str]) -> Optional[dict]:
+        """Process SDO carrying the attacker's command transcript.
+
+        Enriched per the same pattern as build_ipv4 / build_url / etc.
+        (port of PoC's observable enrichment): x_opencti_description
+        names the attacker + sensor + parser context, x_opencti_labels
+        carries the parser-source tags, x_opencti_created_at is the
+        actual session timestamp so OpenCTI's "Original Creation Date"
+        column reflects when the attack ran (not when the connector
+        ingested it). Per the live cycle 16 review — a bare Process
+        with just command_line and TLP marking is hard to use; the
+        analyst can't tell which sensor/parser the commands came from.
+        """
         if not commands:
             return None
         # Cap commands to MAX_COMMANDS_PER_PROCESS for bundle-size sanity
@@ -622,6 +634,17 @@ class STIXBuilder:
             "type": "process",
             "id": generate_process_id(session.sensor_hostname, session.session_id),
             "command_line": cmd_line,
+            "x_opencti_description": (
+                f"Command sequence executed by attacker {session.src_ip} "
+                f"in a {session.event_type} session on sensor "
+                f"{session.sensor_hostname!r} "
+                f"({len(commands)} command(s), "
+                f"first seen {session.first_seen.isoformat()})."
+            ),
+            "x_opencti_labels": sorted(set(
+                parser_labels_for(session.event_type) + ["command-transcript"]
+            )),
+            "x_opencti_created_at": session.first_seen.isoformat(),
         }
         return self._dedup(self._stamp(obj))
 
@@ -983,10 +1006,12 @@ class STIXBuilder:
                     out.append(rel)
 
         # Process (commands)
+        process_id: Optional[str] = None
         if session.commands:
             proc = self.build_process(session, session.commands)
             if proc:
                 out.append(proc)
+                process_id = proc["id"]
                 if rel := self.build_relationship(
                     proc["id"], "related-to", ipv4_id,
                     description=f"Commands run by {session.src_ip} in Cowrie session",
@@ -1052,6 +1077,13 @@ class STIXBuilder:
             note_object_refs: list[str] = [ipv4_id]
             if ip_ind:
                 note_object_refs.append(ip_ind["id"])
+            # Include the Process so OpenCTI's "Notes about this entity"
+            # surfaces the transcript on the Process detail page too —
+            # per the live cycle-16 review (Process pages were showing
+            # zero Notes because the Note's object_refs didn't include
+            # them).
+            if process_id:
+                note_object_refs.append(process_id)
             note = self.build_session_note(
                 session,
                 body_md=note_body,
@@ -1069,6 +1101,15 @@ class STIXBuilder:
                     if rel := self.build_relationship(
                         note["id"], "related-to", ip_ind["id"],
                         description=f"Cowrie session transcript for {session.src_ip}",
+                    ):
+                        out.append(rel)
+                # Also link Note → Process so OpenCTI's graph view draws
+                # the edge from the Process side (object_refs alone
+                # doesn't surface in the relationship browser).
+                if process_id:
+                    if rel := self.build_relationship(
+                        note["id"], "related-to", process_id,
+                        description=f"Cowrie session transcript for process {process_id[:24]}…",
                     ):
                         out.append(rel)
 
