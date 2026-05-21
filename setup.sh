@@ -436,6 +436,12 @@ TPOT_HOST=${TPOT_HOST}
 TPOT_SSH_USER=${TPOT_SSH_USER}
 TPOT_SSH_PORT=${TPOT_SSH_PORT}
 
+# Self-filter: src_ip values to drop before parsing. Auto-seeded with
+# the T-Pot host (so Suricata events from our own deceptive HTTP
+# responses don't get attributed as attacker activity). Add hive +
+# bastion IPs here too — see .env.example for full guidance.
+TPOT_HONEYPOT_IPS=${TPOT_HOST}
+
 # === Operator identity ===
 OPERATOR_ORG_NAME=${OPERATOR_ORG_NAME}
 TPOT2CTI_DEFAULT_TLP=${TPOT2CTI_DEFAULT_TLP}
@@ -444,7 +450,19 @@ TPOT2CTI_DEFAULT_CONFIDENCE=75
 # === Cycle behavior ===
 TPOT2CTI_INTERVAL=PT15M
 TPOT2CTI_INITIAL_LOOKBACK_HOURS=0
-TPOT2CTI_IGNORE_TYPES=
+# P0f default-ignored per PoC LESSONS §31 (the "two-question rule"):
+# P0f is enrichment-shaped passive fingerprint data, not actionable
+# attack-event data. ~2.3M events/day fleet-wide if ingested.
+TPOT2CTI_IGNORE_TYPES=P0f
+# Per PoC HP_CONNECTOR_HANDOFF §4: indexing delay between the three
+# publisher passes. 60s is safe for single-sensor; hive operators
+# should raise to 120-300s. Watch the cycle log for "cycle overrun"
+# warnings — that's the signal to increase this.
+TPOT2CTI_INDEXING_DELAY_SECONDS=60
+# FATT events are slowly-evolving passive fingerprints; running them
+# every cycle is wasteful. Multiplier=4 with PT15M base interval =
+# FATT processed every ~60 min. Set 1 to process every cycle.
+TPOT2CTI_FATT_CYCLE_MULTIPLIER=4
 
 # === OpenCTI connection (mirrors opencti/.env) ===
 OPENCTI_URL=http://opencti:8080
@@ -751,10 +769,24 @@ start_tpot2cti() {
     step "Step 9/10: Starting tpot2cti stack"
 
     if (( DRY_RUN )); then
+        dry "Pre-create ${SCRIPT_DIR}/data/{tpot2cti,credentials,malware-vault} and logs/ as the invoking user"
         dry "(cd $SCRIPT_DIR && docker compose --env-file ./.env -p $TPOT2CTI_PROJECT up -d --build)"
         dry "Poll tpot2cti-core healthy"
         return 0
     fi
+
+    # Pre-create the bind-mount target dirs as the invoking user, BEFORE
+    # docker compose up. If we don't, the docker daemon (running as root)
+    # auto-creates the missing dirs as root, and our containers (which
+    # run as uid 1000 — tpot2cti, tunnel, credentials, vault) can't
+    # write into them. Symptom: sidecars enter a restart loop with
+    # "Permission denied" on /data/credentials.duckdb and /data/samples/.
+    # This bit us twice during 2026-05-21 installs before we baked the
+    # fix in here.
+    for d in data/tpot2cti data/credentials data/malware-vault logs; do
+        mkdir -p "${SCRIPT_DIR}/${d}"
+    done
+    ok "Pre-created bind-mount dirs as $(id -un) (uid $(id -u))"
 
     (
         cd "$SCRIPT_DIR"
