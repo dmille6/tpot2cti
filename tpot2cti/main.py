@@ -47,7 +47,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from tpot2cti import daily_creds
+from tpot2cti import attacker_profile, daily_creds
 from tpot2cti.config import Config, load_config
 from tpot2cti.es_client import TpotESClient
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
@@ -355,6 +355,10 @@ def run_cycle(
     builder = builder_factory()
     all_objects: list[dict] = []
     sessions_by_type: dict[str, int] = {}
+    # Per-cycle set of attacker IPs that contributed at least one session
+    # to a profile-emitting parser. Drives emit_live_profile_notes() at
+    # the end of the cycle (see tpot2cti/attacker_profile.py).
+    profile_active_ips: set[str] = set()
 
     # Foundation objects — emitted once per bundle.  Per V1_SPEC §4
     # the operator Identity + TLP marking are always-present.
@@ -380,6 +384,21 @@ def run_cycle(
         sessions_by_type[type_name] = len(sessions)
 
         for session in sessions:
+            # Feed the attacker-profile aggregator BEFORE STIX build so
+            # even a build-time exception doesn't cost us the activity
+            # signal (the per-cycle live-profile emitter runs after the
+            # main build pass and reads the SQLite state independently).
+            try:
+                attacker_profile.update_activity_from_session(state, session)
+                if session.src_ip and session.event_type in (
+                    attacker_profile._PROFILE_PARSERS
+                ):
+                    profile_active_ips.add(session.src_ip)
+            except Exception as e:  # pragma: no cover — defensive
+                logger.debug(
+                    f"cycle {cycle_id}: attacker_profile.update_activity_from_session "
+                    f"raised (ignored): {e}"
+                )
             try:
                 # Per PoC LESSONS §32: parsers are pure data; STIX-shape
                 # decisions live on the builder. We dispatch by the
@@ -437,6 +456,43 @@ def run_cycle(
     except Exception as e:
         logger.exception(
             f"cycle {cycle_id}: daily_creds.maybe_emit_pending failed: {e}"
+        )
+
+    # ── Step 5b: attacker-profile Notes (live + daily + weekly) ───────
+    # Replaces the per-session Cowrie Notes formerly emitted by
+    # STIXBuilder.build_cowrie_session. See tpot2cti/attacker_profile.py
+    # and the 2026-05-21 user decision (PoC LESSONS §7.1).
+    try:
+        live_objs = attacker_profile.emit_live_profile_notes(
+            state, builder, profile_active_ips,
+        )
+        if live_objs:
+            all_objects.extend(live_objs)
+            logger.info(
+                f"cycle {cycle_id}: attacker_profile live emit added "
+                f"{len(live_objs)} object(s) for "
+                f"{len(profile_active_ips)} active IP(s)"
+            )
+    except Exception as e:
+        logger.exception(
+            f"cycle {cycle_id}: attacker_profile.emit_live_profile_notes "
+            f"failed: {e}"
+        )
+
+    try:
+        boundary_objs = attacker_profile.maybe_emit_daily_and_weekly(
+            state, builder, now=now,
+        )
+        if boundary_objs:
+            all_objects.extend(boundary_objs)
+            logger.info(
+                f"cycle {cycle_id}: attacker_profile daily/weekly emit "
+                f"added {len(boundary_objs)} object(s)"
+            )
+    except Exception as e:
+        logger.exception(
+            f"cycle {cycle_id}: attacker_profile.maybe_emit_daily_and_weekly "
+            f"failed: {e}"
         )
 
     # ── Step 6: publish ───────────────────────────────────────────────

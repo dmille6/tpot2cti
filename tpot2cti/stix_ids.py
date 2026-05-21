@@ -174,6 +174,46 @@ def generate_daily_creds_note_id(sensor: str, utc_date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Attacker-profile Note ids (per-IP rolling profile + daily/weekly snapshots).
+# See ``tpot2cti/attacker_profile.py`` for the consumer and PoC LESSONS §7.1
+# for the rationale (one rolling Note per attacker IP rather than 50 per-
+# session Notes that nobody reads).
+# ---------------------------------------------------------------------------
+
+def generate_attacker_profile_note_id(ip: str) -> str:
+    """Live attacker-profile Note id.
+
+    Seed: ``note:attacker-profile:<ip>``. One Note per attacker IP,
+    updated every cycle that sees activity from this IP. Idempotent
+    via UUID5 so OpenCTI upserts in place rather than creating a new
+    Note per cycle.
+    """
+    return sdo_id("note", "note", "attacker-profile", ip)
+
+
+def generate_attacker_daily_note_id(ip: str, utc_date: str) -> str:
+    """Daily attacker-profile snapshot Note id.
+
+    Seed: ``note:attacker-daily:<ip>:<utc-date>``. One Note per
+    (attacker IP, UTC calendar day). ``utc_date`` is ISO-8601
+    ``YYYY-MM-DD``. Emitted once the cycle crosses UTC midnight.
+    """
+    return sdo_id("note", "note", "attacker-daily", ip, utc_date)
+
+
+def generate_attacker_weekly_note_id(ip: str, iso_year: int, iso_week: int) -> str:
+    """Weekly attacker-profile snapshot Note id.
+
+    Seed: ``note:attacker-weekly:<ip>:<iso-year>:<iso-week>``. One Note
+    per (attacker IP, ISO calendar week). ``iso_year`` is the ISO-8601
+    week-numbering year (NOT the calendar year — they differ at year
+    boundaries). ``iso_week`` is 1-53. Emitted once per cycle that
+    crosses an ISO-week boundary (Monday 00:00 UTC).
+    """
+    return sdo_id("note", "note", "attacker-weekly", ip, str(iso_year), str(iso_week))
+
+
+# ---------------------------------------------------------------------------
 # TTPs / indicators / sightings.
 # ---------------------------------------------------------------------------
 def generate_attack_pattern_id(name: str) -> str:
