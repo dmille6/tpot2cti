@@ -190,13 +190,13 @@ class FallbackParser(BaseParser):
 
         if first.src_ip:
             # Attacker context (IPv4 + GeoIP + AS + located-at / belongs-to)
-            attacker_objs = builder.build_attacker_context(first)
+            attacker_objs = builder.build_attacker_context(first, session=session)
             out.extend(attacker_objs)
             if attacker_objs:
                 ipv4_id = generate_ipv4_id(first.src_ip)
 
             # IP Indicator + based-on → IPv4
-            ip_ind = builder.build_ip_indicator(first.src_ip)
+            ip_ind = builder.build_ip_indicator(first.src_ip, session=session)
             if ip_ind:
                 out.append(ip_ind)
                 ip_ind_id = ip_ind["id"]

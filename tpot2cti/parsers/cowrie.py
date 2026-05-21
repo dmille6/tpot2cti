@@ -226,13 +226,13 @@ class CowrieParser(BaseParser):
 
         # Foundation: sensor + attacker context (IPv4 + geo + AS)
         out.extend(builder.build_sensor_context(session.sensor_hostname))
-        out.extend(builder.build_attacker_context(session.events[0]))
+        out.extend(builder.build_attacker_context(session.events[0], session=session))
 
         ipv4_id = generate_ipv4_id(session.src_ip)
         sensor_id = generate_sensor_id(session.sensor_hostname)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = builder.build_ip_indicator(session.src_ip)
+        ip_ind = builder.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
             out.append(ip_ind)
             if rel := builder.build_relationship(
@@ -265,7 +265,7 @@ class CowrieParser(BaseParser):
 
         # File downloads → StixFile + Indicator + URL/Domain
         for sha256 in session.malware_hashes:
-            f = builder.build_file(sha256)
+            f = builder.build_file(sha256, session=session)
             if f:
                 out.append(f)
                 if rel := builder.build_relationship(
@@ -274,7 +274,7 @@ class CowrieParser(BaseParser):
                 ):
                     out.append(rel)
                 # File Indicator + based-on
-                f_ind = builder.build_file_indicator(sha256)
+                f_ind = builder.build_file_indicator(sha256, session=session)
                 if f_ind:
                     out.append(f_ind)
                     if rel := builder.build_relationship(
@@ -285,7 +285,7 @@ class CowrieParser(BaseParser):
 
         # URLs (download sources + URLs in commands)
         for url in session.urls:
-            url_obj = builder.build_url(url)
+            url_obj = builder.build_url(url, session=session)
             if url_obj:
                 out.append(url_obj)
                 if rel := builder.build_relationship(
@@ -296,7 +296,7 @@ class CowrieParser(BaseParser):
 
         # Domains derived from URLs
         for fqdn in session.domains:
-            d = builder.build_domain(fqdn)
+            d = builder.build_domain(fqdn, session=session)
             if d:
                 out.append(d)
 

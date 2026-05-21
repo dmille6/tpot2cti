@@ -219,12 +219,12 @@ class SuricataParser(BaseParser):
 
         # Foundation: sensor + attacker context (IPv4 + geo + AS)
         out.extend(builder.build_sensor_context(session.sensor_hostname))
-        out.extend(builder.build_attacker_context(event))
+        out.extend(builder.build_attacker_context(event, session=session))
 
         ipv4_id = generate_ipv4_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = builder.build_ip_indicator(session.src_ip)
+        ip_ind = builder.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
             out.append(ip_ind)
             if rel := builder.build_relationship(
@@ -298,7 +298,7 @@ class SuricataParser(BaseParser):
                 domain_candidates.append(host)
 
         for fqdn in domain_candidates:
-            d = builder.build_domain(fqdn)
+            d = builder.build_domain(fqdn, session=session)
             if d:
                 out.append(d)
                 # Domain-Name → resolves-to → IPv4-Addr (dst_ip preferred,
@@ -317,7 +317,7 @@ class SuricataParser(BaseParser):
         # ── URL observable (if HTTP request URL captured) ─────────────
         if (url := meta.get("http_url")) and (host := meta.get("http_host")):
             full_url = url if url.startswith("http") else f"http://{host}{url}"
-            url_obj = builder.build_url(full_url)
+            url_obj = builder.build_url(full_url, session=session)
             if url_obj:
                 out.append(url_obj)
                 if rel := builder.build_relationship(
