@@ -1,0 +1,13 @@
+# tpot2cti — OUR services only (importer + tunnel + opt-in companions).
+# OpenCTI is deployed as a SEPARATE compose project — see V1_SPEC §2.
+# This file attaches to the network OpenCTI creates (opencti_default).
+#
+# Stub: full service definitions land per V1_SPEC §3 and §8 in
+# follow-up commits.
+
+services: {}
+
+networks:
+  opencti_default:
+    external: true
+    name: opencti_default
