@@ -708,6 +708,20 @@ final_verification() {
         ok "OpenCTI splash reachable (HTTP $code)"
     fi
 
+    # End-to-end smoke: emit a tiny foundation bundle via pycti and verify
+    # it lands cleanly. Catches pycti-version-vs-OpenCTI-version mismatches
+    # at install time rather than at the first scheduled cycle.
+    # The emission is idempotent (UUID5) so re-running setup.sh is a no-op.
+    info "Running install self-test (pycti emission to OpenCTI)..."
+    if docker exec tpot2cti-core python3 -m tpot2cti.selftest >&2; then
+        ok "Self-test passed — first ingestion cycle should succeed."
+    else
+        warn "Self-test FAILED. The pipeline may still recover on its first scheduled cycle,"
+        warn "but inspect the output above for the cause (likely pycti version drift,"
+        warn "OpenCTI not fully initialized, or a connector_id misconfiguration)."
+        warn "To re-run after fixing: docker exec tpot2cti-core python3 -m tpot2cti.selftest"
+    fi
+
     cat <<EOF
 
 ===========================================================================

@@ -241,9 +241,26 @@ def run_cycle(
     now = now or datetime.now(timezone.utc)
 
     window_start, window_end = _compute_window(state, cfg, now)
+
+    # FATT cadence split (PoC pattern): FATT fingerprints are slowly-
+    # evolving passive observations; processing them every cycle is
+    # wasteful. Skip them unless the cycle index is a multiple of
+    # cfg.cycle.fatt_cycle_multiplier. With default multiplier=4 and
+    # base interval PT15M, FATT is processed every ~60 min.
+    effective_ignore_types = list(cfg.cycle.ignore_types)
+    try:
+        cycle_n = int(cycle_id)
+    except (TypeError, ValueError):
+        cycle_n = 0  # str cycle ids: never skip
+    fatt_mult = max(1, cfg.cycle.fatt_cycle_multiplier)
+    fatt_this_cycle = fatt_mult == 1 or (cycle_n > 0 and cycle_n % fatt_mult == 0)
+    if not fatt_this_cycle and "Fatt" not in effective_ignore_types:
+        effective_ignore_types.append("Fatt")
+
     logger.info(
         f"cycle {cycle_id}: window=[{window_start.isoformat()}, "
-        f"{window_end.isoformat()}) ignore_types={cfg.cycle.ignore_types}"
+        f"{window_end.isoformat()}) ignore_types={effective_ignore_types} "
+        f"fatt_this_cycle={fatt_this_cycle}"
     )
 
     # ── Step 1: ES query ──────────────────────────────────────────────
@@ -261,7 +278,7 @@ def run_cycle(
             window_start, window_end,
             index_pattern=cfg.es.index_pattern,
             batch_size=cfg.cycle.batch_size,
-            ignore_types=cfg.cycle.ignore_types,
+            ignore_types=effective_ignore_types,
         ):
             events_read += 1
             try:
@@ -461,10 +478,20 @@ def run_cycle(
         duration_seconds=duration_s,
     )
 
+    # Surface bundle-dedup % per PoC LESSONS §6 + our LESSONS §6:
+    # the label-union pass should be cutting ~20-25% before send. If our
+    # ratio drops to ~0% it likely means parsers aren't emitting labels
+    # (each cycle starts clean — no dedup hits); if it spikes above ~40%
+    # it means we're re-emitting more than we should and the call sites
+    # need investigation.
+    dedup_pct = getattr(publish_result, "dedup_reduction_pct", 0.0)
+    dedup_before = getattr(publish_result, "total_objects_before_dedup", 0)
+    dedup_after = getattr(publish_result, "total_objects_after_dedup", 0)
     logger.info(
         f"cycle {cycle_id}: complete in {duration_s:.2f}s — "
         f"events_read={events_read} sdos_emitted={len(all_objects)} "
-        f"sdos_by_type={dict(sdos_by_type)} publish_ok={publish_ok}"
+        f"sdos_by_type={dict(sdos_by_type)} publish_ok={publish_ok} "
+        f"dedup={dedup_before}->{dedup_after} ({dedup_pct:.1f}%)"
     )
     return summary
 
@@ -523,7 +550,10 @@ def main() -> int:
     # connector UUID from setup.sh's generation.
     opencti = OpenCTIClient(cfg.opencti, connector_id=cfg.connector_ids.core)
     restore_logging()      # pycti's __init__ may have clobbered handlers
-    publisher = Publisher(opencti, state=state)
+    publisher = Publisher(
+        opencti, state=state,
+        indexing_delay_seconds=cfg.cycle.indexing_delay_seconds,
+    )
 
     # Benign-scanner allowlist — static yaml, loaded once at startup.
     # Filters events from Google / Censys / Shodan / Shadowserver /
@@ -571,12 +601,31 @@ def main() -> int:
 
             # Sleep until the next cycle boundary, but wake immediately
             # on shutdown signal.
+            #
+            # Cycle-overrun guard: if the cycle ran longer than the
+            # configured interval (e.g. a 27-min publish at hive scale
+            # against a PT15M interval), we log a WARNING and apply a
+            # minimum-breathing-room sleep so OpenCTI's worker has a
+            # chance to catch up before we slam it with the next bundle.
+            # Per PoC HP_CONNECTOR_HANDOFF §4: at hive scale,
+            # indexing_delay_seconds=300 + back-to-back cycles is how
+            # they avoid worker queue-depth blowups.
             elapsed = time.monotonic() - cycle_started
-            sleep_for = max(0.0, interval_s - elapsed)
-            logger.debug(
-                f"sleeping {sleep_for:.1f}s until next cycle "
-                f"(interval={interval_s:.0f}s, elapsed={elapsed:.1f}s)"
-            )
+            _MIN_INTER_CYCLE_BREATHING_S = 10.0
+            sleep_for = max(_MIN_INTER_CYCLE_BREATHING_S, interval_s - elapsed)
+            if elapsed > interval_s:
+                logger.warning(
+                    f"cycle overrun: ran {elapsed:.0f}s (interval={interval_s:.0f}s); "
+                    f"sleeping minimum {_MIN_INTER_CYCLE_BREATHING_S:.0f}s before next cycle. "
+                    f"Consider raising TPOT2CTI_INDEXING_DELAY_SECONDS (currently "
+                    f"{cfg.cycle.indexing_delay_seconds}s) or TPOT2CTI_INTERVAL "
+                    f"(currently {cfg.cycle.interval_iso}) per PoC HP_CONNECTOR_HANDOFF §4."
+                )
+            else:
+                logger.debug(
+                    f"sleeping {sleep_for:.1f}s until next cycle "
+                    f"(interval={interval_s:.0f}s, elapsed={elapsed:.1f}s)"
+                )
             if shutdown.wait(sleep_for):
                 break
     finally:

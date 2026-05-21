@@ -880,4 +880,155 @@ be referenced via commit hash.
 
 Good luck with V1.
 
-— end of document —
+— end of original document —
+
+
+---
+
+## Appendix A — Lessons ported from the production PoC (newer than V0)
+
+Added 2026-05-21 after the structural evaluation against the new PoC
+codebase at `/home/mike/poc/tsec-tpot-connectors/`. Each item below is a
+one-paragraph paraphrase of a lesson from PoC's `docs/LESSONS_LEARNED.md`;
+the section number references theirs. Read the originals for full
+context — they're the canonical source.
+
+### A.1 PoC §29 — pycti's bundle splitter silently drops duplicate-id labels
+
+When the SAME deterministic STIX ID (e.g. `ipv4-addr--<uuid5 from ip>`)
+appears multiple times in a bundle with different label sets, pycti's
+`OpenCTIStix2Splitter.split_bundle_with_expectations` builds an id→object
+dict where the **last** copy wins. Earlier copies' labels are lost. In
+one PoC production cycle, 306 of 1,678 objects (~18%) were silently
+collapsed, and every single CVE/exploit label was destroyed for the
+entire deployment lifetime — until they added label-union dedup BEFORE
+the splitter.
+
+**Where we stand:** Our `publisher.py:_dedup_label_union` does
+label-union dedup before pycti's send. We're protected against this
+specific failure mode. **Worth adding a unit test** that emits the same
+IP from two parsers with different labels and asserts the shipped bundle
+has the union (commit `0bc5261` is a partial test; a fuller one would
+mock pycti and check the final bundle dict).
+
+### A.2 PoC §31 — "Bulk-importer vs enrichment connector" two-question rule
+
+Before adding a new T-Pot data source to the bulk importer, ask:
+1. **Is each event independently actionable as an IoC?** (Heralding
+   credential capture: yes. P0f OS fingerprint: no.)
+2. **Does every event have a non-trivial probability of producing a
+   downstream observable?** (Cowrie session: yes. P0f-only IPs: ~99%
+   never engage substantively.)
+
+If either is **no** → it belongs in an on-demand enrichment connector
+that hooks OpenCTI's `INTERNAL_ENRICHMENT` mechanism, NOT in the bulk
+importer. P0f at fleet scale was 2.3M events/day producing almost no
+STIX after the substance filter — wasted ES bandwidth + parser cycles.
+
+**Where we stand:** As of 2026-05-21 we default `TPOT2CTI_IGNORE_TYPES=P0f`
+in `.env.example` per this lesson. The future P0f connector (when we add
+one) will look more like the PoC's `tsec-tpot-p0f-connector` (scope =
+IPv4-Addr, on-demand enrichment) than like a 25th parser.
+
+### A.3 PoC §32 — Parser-vs-builder strict separation
+
+Parsers should be PURE event categorizers: raw ES doc →
+`ParsedEvent`/`HoneypotEvent` dataclass with category/action/outcome +
+extended fields. **No STIX, no IoC extraction, no I/O.** STIX-shape
+decisions (does this become a URL observable vs a string in a
+description?) live in the STIX builder. URL/cookie/hash extraction from
+semi-structured fields (shell commands, HTTP bodies, etc.) also lives in
+the builder because:
+1. Parsers stay easy to test and shareable across consumers (the PoC's
+   report-generator imports from `parsers/` too).
+2. Cross-event extraction (URLs spanning the full command sequence in a
+   Cowrie session) only exists after the correlator builds the
+   AttackSession — the parser has no visibility into it.
+3. The "is this a URL observable or just text?" choice is a STIX-shape
+   choice.
+
+**Where we stand:** Our 4 parsers with `build()` methods (`cowrie`,
+`suricata`, `honeytrap`, `fallback`) currently violate this — they call
+`STIXBuilder` directly to produce IPv4 / IP-Indicator / URL / Note
+objects. The other 20 parsers route through `build_driveby_session()`
+and naturally follow the pattern. **Refactor planned** (task #48 P2) to
+move the STIX-shape logic from those 4 parser `build()` methods into
+builder methods (e.g. `builder.build_cowrie_session(session)`).
+
+### A.4 PoC §33 — Three OpenCTI/pycti silent-failure modes
+
+All three discovered while building audit infrastructure (we don't have
+audit infra in V1, so these are forward-looking):
+1. **`import_processed_number` doesn't count upserts.** A bundle that's
+   all dedup-collapses to existing objects returns 0, even though the
+   operation was correct.
+2. **`pycti.api.work.get_work()` returns None for known-complete works**
+   under certain timing conditions. Don't treat None as "failed"; verify
+   with the search API.
+3. **`status == 'complete'` is premature for batched bundles.** pycti
+   reports complete after enqueueing, not after the worker finishes
+   processing. If you rely on this to decide "now run pass 2 of the
+   three-pass send," you'll hit MISSING_REFERENCE.
+
+**Where we stand:** Not relevant today (we don't depend on these signals
+— our publisher uses simple `time.sleep` between passes per V1_SPEC §3).
+Will become relevant if/when we add audit infrastructure that checks
+per-bundle success.
+
+### A.5 PoC §36 — Don't pre-classify malware in the importer
+
+PoC hp-connector used to emit `Malware(name="Malware-<sha[:16]>",
+is_family=False)` for every captured file. Result: 54,023 entries with
+garbage names like `Malware-5237503dedd7e264` polluting OpenCTI's
+Malware index, all duplicating SHA256-keyed slots that real classifiers
+(GTI sandbox, CrowdStrike sandbox) needed to own later. They removed the
+emission; now only File observables emerge from the importer, and
+classifier connectors add `Malware` SDOs only when they have
+authoritative input (e.g., a VirusTotal `suggested_threat_label`).
+
+**Where we stand:** We don't emit `Malware` SDOs (V1_SPEC §4 doesn't
+list them). Correct outcome, partially by deliberate spec design and
+partially by absence-of-enrichment. Worth flagging in V1_SPEC §4 as an
+explicit "do not emit" so a future contributor doesn't add it back.
+Honeypot droppers go in the malware-vault sidecar; sandbox-class
+enrichment is post-v1.0.
+
+### A.6 PoC §38 — `docker --env-file` does NOT strip inline comments
+
+When spinning up additional containers from outside `docker compose`
+(e.g. ad-hoc sidecar workers for backfill scaling), the obvious move is
+`docker run --env-file .env ...`. **Don't.** Docker's `--env-file`
+parser does not strip inline `#` comments — every character after `=`
+and before newline becomes the variable's literal value. A line like
+`TPOT2CTI_DRY_RUN=true   # smoke test` becomes the literal value
+`"true   # smoke test"`, which fails any naive `.lower() == "true"`
+check. Code that does this very-common pattern then silently disables
+the feature.
+
+The right pattern when spawning sidecar containers from a script:
+
+```bash
+set -a && source .env && set +a    # shell strips comments
+docker run -d -e VAR_A="$VAR_A" -e VAR_B="$VAR_B" image
+```
+
+**Where we stand:** Our `setup.sh` writes `.env` files; we use
+`docker compose --env-file`. Compose strips comments correctly. We are
+NOT vulnerable today, BUT the moment someone follows a "scale up" guide
+that uses raw `docker run --env-file`, they're in the footgun. Mitigation
+added 2026-05-21: `tpot2cti/env.py` implements `truthy_env()` /
+`truthy_str()` with explicit inline-comment stripping (port of PoC's
+`shared/tsec_env.py`). `config.py:_env_bool` delegates to it.
+
+### A.7 PoC §39 — Separate Notes per enrichment source (post-v1.0)
+
+When multiple enrichers classify the same observable (GTI says "Mirai",
+CrowdStrike says "Outlaw"), do NOT merge into a single `Notes` Note.
+Emit one Note per source with the source name in the abstract. Analysts
+then see the classifier disagreement explicitly. Merging hides it.
+
+**Where we stand:** We have no enrichment yet, so this is moot.
+Important to remember when the first companion connector lands — do NOT
+design a "merged classification Note" pattern. One Note per source.
+
+— end of appendix A —
