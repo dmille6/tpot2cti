@@ -47,7 +47,7 @@ from typing import Optional
 from tpot2cti.parsers import FALLBACK_KEY, register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
 from tpot2cti.stix.builder import STIXBuilder
-from tpot2cti.stix_ids import generate_ipv4_id
+from tpot2cti.stix_ids import generate_ipv4_id, generate_sensor_id
 
 logger = logging.getLogger(__name__)
 
@@ -207,30 +207,36 @@ class FallbackParser(BaseParser):
                     ):
                         out.append(rel)
 
-                # Sighting on the IP Indicator
+                # Sighting on the IP Indicator — the per-event summary
+                # (unknown_type + dst_port) now lives in the Sighting's
+                # `description` field. Per LESSONS_LEARNED §7.1 we do NOT
+                # emit a separate Note per event for high-volume / low-
+                # signal protocols. If a maintainer wants per-event
+                # forensics, the raw doc is preserved on T-Pot's ES.
                 sighting = builder.build_sighting(
                     ip_ind["id"], session.sensor_hostname, session,
                     count=session.event_count,
+                    description=self._render_sighting_description(first, unknown_type),
                 )
                 if sighting:
                     out.append(sighting)
-
-        # Note — always emitted.  object_refs links to whatever entities
-        # we did manage to build, so the Note shows up on those pages
-        # in OpenCTI.
-        object_refs: list[str] = []
-        if ipv4_id:
-            object_refs.append(ipv4_id)
-        if ip_ind_id:
-            object_refs.append(ip_ind_id)
-
-        body = self._render_note_body(first, unknown_type)
-        abstract = f"Unrecognized T-Pot event: {unknown_type}"
-        note = builder.build_session_note(
-            session, body, abstract=abstract, object_refs=object_refs,
-        )
-        if note:
-            out.append(note)
+        else:
+            # Edge case: unknown-type event has no src_ip.  Without an IP
+            # there is no Sighting to attach a description to — emit a
+            # single free-floating Note so the event isn't silently lost.
+            # This is the ONE remaining Note-emission path in the fallback
+            # parser (LESSONS_LEARNED §7.1 carve-out: per-event Notes for
+            # the IP-bearing common case are dropped; the rare no-IP case
+            # keeps a Note as the only signal we can surface).
+            body = self._render_no_ip_note_body(first, unknown_type)
+            note = builder.build_session_note(
+                session,
+                body_md=body,
+                abstract=f"Unrecognized T-Pot event: {unknown_type} (no src_ip)",
+                object_refs=[generate_sensor_id(session.sensor_hostname)],
+            )
+            if note:
+                out.append(note)
 
         return out
 
@@ -239,13 +245,29 @@ class FallbackParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _render_note_body(event: ParsedEvent, unknown_type: str) -> str:
-        """Render the markdown body for the fallback Note.
+    def _render_sighting_description(event: ParsedEvent, unknown_type: str) -> str:
+        """One-line Sighting.description for unknown T-Pot types.
 
-        Includes the unknown type, sensor, timestamp, src_ip / dst_port
-        (with explicit ``missing`` markers when absent), and a
-        JSON-pretty-printed snapshot of the raw ``_source`` doc capped
-        to :data:`MAX_RAW_DOC_BYTES`.
+        Replaces the per-event Note we used to emit. Per LESSONS_LEARNED
+        §7.1 we keep low-signal-per-event protocols out of the Notes
+        tab. The analyst sees the unknown type in the Sighting context
+        and the maintainer's WARNING log triggers the "add a dedicated
+        parser" workflow per V1_SPEC §5.24.
+        """
+        proto = (event.protocol or "?").lower()
+        dst = event.dst_port if event.dst_port is not None else "?"
+        return (
+            f"Unrecognized T-Pot type {unknown_type!r} — "
+            f"{proto}/{dst} (consider opening an issue for a dedicated parser)"
+        )
+
+    @staticmethod
+    def _render_no_ip_note_body(event: ParsedEvent, unknown_type: str) -> str:
+        """Markdown body for the rare no-src_ip free-floating Note.
+
+        Called only when an unknown-type event lacks a src_ip — without
+        an IP there is no Sighting on which to hang a description, so
+        a Note is the only place to surface the event in OpenCTI.
         """
         try:
             raw_pretty = json.dumps(
@@ -374,26 +396,26 @@ if __name__ == "__main__":
     assert "ipv4-addr" in types1, "case 1: IPv4-Addr expected when src_ip present"
     assert "indicator" in types1, "case 1: IP Indicator expected"
     assert "sighting" in types1, "case 1: Sighting expected"
-    assert "note" in types1, "case 1: Note expected"
+    # Post-refactor (LESSONS_LEARNED §7.1): no Note when src_ip present —
+    # the per-event summary lives in the Sighting.description instead.
+    assert "note" not in types1, (
+        "case 1: Note should NOT be emitted when src_ip present "
+        "(summary goes in Sighting.description)"
+    )
+    sighting1 = next(o for o in objs1 if o["type"] == "sighting")
+    assert sighting1.get("description"), "case 1: Sighting missing description"
+    assert "BrandNewHoneypot" in sighting1["description"], \
+        f"case 1: sighting description should name the unknown type, got {sighting1['description']!r}"
 
-    # Case 3: Note only (no src_ip) — must still produce something
+    # Case 3: no src_ip — Note IS emitted as the only surface (Sighting
+    # can't exist without an IP indicator).
     s3 = parser.correlate([e3])[0]
-    builder3 = STIXBuilder(cfg)
-    objs3 = builder3.build_sensor_context(s3.sensor_hostname) + parser.build(s3, builder3)
-    # parser.build also emits sensor_context; dedup handles repeats
     objs3 = parser.build(s3, STIXBuilder(cfg))
     types3 = {o["type"] for o in objs3}
     print(f"case 3 built {len(objs3)} STIX objects: {sorted(types3)}")
-    assert "note" in types3, "case 3: Note expected even without src_ip"
     assert "ipv4-addr" not in types3, "case 3: no IPv4-Addr without src_ip"
     assert "sighting" not in types3, "case 3: no Sighting without src_ip"
-
-    # Inspect a Note body to confirm shape
-    note = next(o for o in objs1 if o["type"] == "note")
-    assert "Unrecognized T-Pot event type: BrandNewHoneypot" in note["content"]
-    assert "Source IP: 1.2.3.4" in note["content"]
-    assert "Destination port: 4242" in note["content"]
-    assert "```json" in note["content"]
+    assert "note" in types3, "case 3: free-floating Note expected without src_ip"
 
     note3 = next(o for o in objs3 if o["type"] == "note")
     assert "Source IP: missing" in note3["content"]

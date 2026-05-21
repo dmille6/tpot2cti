@@ -305,9 +305,42 @@ class CowrieParser(BaseParser):
             sighting = builder.build_sighting(
                 ip_ind["id"], session.sensor_hostname, session,
                 count=session.event_count,
+                description=self._render_sighting_description(session),
             )
             if sighting:
                 out.append(sighting)
+
+        # Session-transcript Note — ONE per Cowrie SSH session, containing
+        # the full command transcript + auth + credentials + HASSH + SSH
+        # version + malware hashes + URLs. This is the carve-out from
+        # LESSONS_LEARNED §7.1: per-session Notes are an anti-pattern in
+        # general, but a Cowrie SSH login session is genuinely-per-session
+        # content (commands the attacker actually ran) and is what an
+        # analyst expects to find on the indicator's page.
+        note_body = self._render_session_note_body(session)
+        if note_body:
+            note_object_refs: list[str] = [ipv4_id]
+            if ip_ind:
+                note_object_refs.append(ip_ind["id"])
+            note = builder.build_session_note(
+                session,
+                body_md=note_body,
+                abstract=(
+                    f"Cowrie SSH session from {session.src_ip} "
+                    f"({len(session.commands)} command(s)"
+                    + (", auth success" if session.auth_success else "")
+                    + ")"
+                ),
+                object_refs=note_object_refs,
+            )
+            if note:
+                out.append(note)
+                if ip_ind:
+                    if rel := builder.build_relationship(
+                        note["id"], "related-to", ip_ind["id"],
+                        description=f"Cowrie session transcript for {session.src_ip}",
+                    ):
+                        out.append(rel)
 
         return out
 
@@ -323,6 +356,149 @@ class CowrieParser(BaseParser):
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Note + Sighting renderers
+    # ──────────────────────────────────────────────────────────────────
+
+    #: Caps so the Note body stays well below MAX_NOTE_BODY_BYTES (32 KB).
+    #: Cowrie sessions with thousands of commands (rare but seen) shouldn't
+    #: blow the bundle; truncate gracefully.
+    _MAX_COMMANDS_RENDERED = 200
+    _MAX_COMMAND_BYTES = 8000
+
+    @staticmethod
+    def _render_sighting_description(session: AttackSession) -> str:
+        """One-line summary baked into the Sighting.description.
+
+        Complements the per-session Note (which carries the full
+        transcript) — this short form is what shows in the indicator's
+        Sightings table without clicking through.
+        """
+        bits: list[str] = [f"Cowrie SSH"]
+        if session.auth_success:
+            bits.append("auth: success")
+        elif session.credentials_tried:
+            bits.append(f"auth: failed ({len(session.credentials_tried)} tries)")
+        if session.commands:
+            bits.append(f"{len(session.commands)} cmd(s)")
+        if session.malware_hashes:
+            bits.append(f"{len(session.malware_hashes)} file(s) dropped")
+        if session.urls:
+            bits.append(f"{len(session.urls)} URL(s) referenced")
+        return " — ".join(bits)
+
+    @classmethod
+    def _render_session_note_body(cls, session: AttackSession) -> str:
+        """Render the markdown Note body for one Cowrie SSH session.
+
+        Sections (omitted if empty):
+          - Header with session id (short), source IP, sensor, timestamps
+          - Auth result + credentials tried
+          - SSH client fingerprint (HASSH + version)
+          - Command transcript (code-fenced, capped at _MAX_COMMANDS_RENDERED)
+          - Files downloaded (sha256)
+          - URLs / domains referenced
+
+        Returns empty string when the session has no rendering-worthy
+        content — caller skips Note emission in that case.
+        """
+        # Skip rendering entirely if there's nothing interesting.
+        # (substance filter already gates this, but a defensive check
+        # avoids empty Notes if a parser change weakens the filter.)
+        if not (
+            session.auth_success
+            or session.credentials_tried
+            or session.commands
+            or session.malware_hashes
+            or session.urls
+        ):
+            return ""
+
+        sid_short = session.session_id[:16] if session.session_id else "?"
+        lines: list[str] = [
+            f"# Cowrie SSH session `{sid_short}`",
+            "",
+            f"- **src_ip:** `{session.src_ip}`",
+            f"- **sensor:** `{session.sensor_hostname}`",
+            f"- **first_seen:** `{session.first_seen.isoformat()}`",
+            f"- **last_seen:**  `{session.last_seen.isoformat()}`",
+            f"- **events:** {session.event_count}",
+        ]
+        if session.dst_ports:
+            lines.append(f"- **dst_port(s):** {sorted(session.dst_ports)}")
+
+        # Auth
+        lines.append("")
+        lines.append("## Authentication")
+        lines.append("")
+        if session.auth_success:
+            lines.append("- **Result:** :white_check_mark: success")
+        else:
+            lines.append("- **Result:** failed (no successful login)")
+        if session.credentials_tried:
+            shown = session.credentials_tried[:25]
+            lines.append(f"- **Credentials tried** ({len(session.credentials_tried)} total"
+                         + (f", first {len(shown)} shown" if len(session.credentials_tried) > 25 else "")
+                         + "):")
+            for u, p in shown:
+                lines.append(f"  - `{u}` / `{p}`")
+
+        # SSH fingerprint
+        if session.hassh or session.ssh_version:
+            lines.append("")
+            lines.append("## SSH client fingerprint")
+            lines.append("")
+            if session.hassh:
+                lines.append(f"- **HASSH:** `{session.hassh}`")
+            if session.ssh_version:
+                lines.append(f"- **Version string:** `{session.ssh_version}`")
+
+        # Commands
+        if session.commands:
+            lines.append("")
+            lines.append(f"## Commands ({len(session.commands)} executed)")
+            lines.append("")
+            cmds = session.commands[:cls._MAX_COMMANDS_RENDERED]
+            truncated_count = len(session.commands) - len(cmds)
+            block_lines: list[str] = []
+            total_bytes = 0
+            for cmd in cmds:
+                line = cmd if isinstance(cmd, str) else repr(cmd)
+                total_bytes += len(line.encode("utf-8")) + 1
+                if total_bytes > cls._MAX_COMMAND_BYTES:
+                    block_lines.append("... [transcript truncated for size]")
+                    break
+                block_lines.append(line)
+            lines.append("```")
+            lines.extend(block_lines)
+            lines.append("```")
+            if truncated_count > 0:
+                lines.append(f"_({truncated_count} additional command(s) omitted)_")
+
+        # Files downloaded
+        if session.malware_hashes:
+            lines.append("")
+            lines.append(f"## Files downloaded ({len(session.malware_hashes)})")
+            lines.append("")
+            for h in session.malware_hashes:
+                lines.append(f"- `{h}`")
+
+        # URLs / domains
+        if session.urls:
+            lines.append("")
+            lines.append(f"## URLs referenced ({len(session.urls)})")
+            lines.append("")
+            for u in session.urls:
+                lines.append(f"- {u}")
+        if session.domains:
+            lines.append("")
+            lines.append(f"## Domains derived ({len(session.domains)})")
+            lines.append("")
+            for d in session.domains:
+                lines.append(f"- {d}")
+
+        return "\n".join(lines)
 
 
 # Register on import

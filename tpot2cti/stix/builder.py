@@ -483,9 +483,19 @@ class STIXBuilder:
         session: AttackSession,
         *,
         count: int = 1,
+        description: Optional[str] = None,
     ) -> Optional[dict]:
         """Sighting SDO — per V1_SPEC §4 'sighting target=Indicator,
-        where=sensor Identity'."""
+        where=sensor Identity'.
+
+        Per LESSONS_LEARNED §7.1: putting per-session activity summaries
+        in the Sighting `description` is the preferred place for
+        low-signal-per-event protocols (Honeytrap probe payload, Fallback
+        unknown-type blurb). Beats spewing 50k+ Notes/day that nobody
+        reads. Cowrie/SSH sessions still get their own Notes — those
+        are the genuinely-per-session content the lesson called out
+        as the carve-out.
+        """
         if not (indicator_id and sensor_hostname):
             return None
         sensor_id = generate_sensor_id(sensor_hostname)
@@ -498,6 +508,8 @@ class STIXBuilder:
             "last_seen": session.last_seen.isoformat(),
             "count": count,
         }
+        if description:
+            obj["description"] = description
         return self._dedup(self._stamp(obj))
 
     # ──────────────────────────────────────────────────────────────────
