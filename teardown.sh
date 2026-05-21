@@ -64,13 +64,22 @@ confirm_stop() {
 stop_stacks() {
     echo "" >&2
     echo "=== Stopping tpot2cti stack ===" >&2
+    # `down` alone preserves named volumes (data preserved unless --purge).
+    # When PURGE is set we add `-v` so docker compose removes the named
+    # volumes it knows about — that's the only way to clean
+    # compose-labeled volumes (docker volume prune -f does NOT touch them
+    # because compose marks them as "in use by this project").
+    local down_flags=""
+    if (( PURGE )); then
+        down_flags="-v"
+    fi
     if [[ -f "${SCRIPT_DIR}/docker-compose.yml" ]]; then
         local envfile=""
-        if [[ -f "${SCRIPT_DIR}/tpot2cti/.env" ]]; then
-            envfile="--env-file ${SCRIPT_DIR}/tpot2cti/.env"
+        if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+            envfile="--env-file ${SCRIPT_DIR}/.env"
         fi
         # shellcheck disable=SC2086
-        (cd "$SCRIPT_DIR" && docker compose $envfile -p "$TPOT2CTI_PROJECT" down) || true
+        (cd "$SCRIPT_DIR" && docker compose $envfile -p "$TPOT2CTI_PROJECT" down $down_flags) || true
     else
         echo "[info] no docker-compose.yml at $SCRIPT_DIR; skipping tpot2cti down" >&2
     fi
@@ -78,13 +87,18 @@ stop_stacks() {
     echo "" >&2
     echo "=== Stopping OpenCTI stack ===" >&2
     if [[ -d "${SCRIPT_DIR}/opencti" ]]; then
-        (cd "${SCRIPT_DIR}/opencti" && docker compose -p "$OPENCTI_PROJECT" down) || true
+        # shellcheck disable=SC2086
+        (cd "${SCRIPT_DIR}/opencti" && docker compose -p "$OPENCTI_PROJECT" down $down_flags) || true
     else
         echo "[info] no opencti/ directory; skipping opencti down" >&2
     fi
 
     echo "" >&2
-    echo "[ok] Both stacks stopped. Data preserved (unless --purge)." >&2
+    if (( PURGE )); then
+        echo "[ok] Both stacks stopped (with -v: named volumes removed)." >&2
+    else
+        echo "[ok] Both stacks stopped. Data preserved (unless --purge)." >&2
+    fi
 }
 
 confirm_purge() {
@@ -125,8 +139,34 @@ do_purge() {
     # setup.sh has a place to put things.
     mkdir -p "${SCRIPT_DIR}/data" "${SCRIPT_DIR}/logs" "${SCRIPT_DIR}/ssh-keys"
 
+    # Belt-and-braces: explicitly remove any named volumes that survived
+    # the `docker compose down -v` step above. `volume prune -f` does NOT
+    # touch compose-labeled volumes, so we have to enumerate by name.
+    # See task #54 / the 2026-05-21 live wipe-and-fresh investigation —
+    # before this fix, opencti_esdata + opencti_amqpdata + opencti_s3data
+    # + opencti_redisdata + opencti_rsakeys survived teardown --purge
+    # and the next setup.sh resurrected the previous (potentially
+    # corrupted) OpenCTI database.
     echo "" >&2
-    echo "=== Pruning unused Docker volumes ===" >&2
+    echo "=== Removing named Docker volumes (belt-and-braces) ===" >&2
+    local survivors
+    survivors="$(docker volume ls --format '{{.Name}}' \
+        | grep -E '^(opencti_|tpot2cti_|tpot-tunnel_)' || true)"
+    if [[ -n "$survivors" ]]; then
+        echo "$survivors" | while read -r v; do
+            [[ -z "$v" ]] && continue
+            if docker volume rm "$v" >/dev/null 2>&1; then
+                echo "[ok] removed volume $v" >&2
+            else
+                echo "[warn] could not remove volume $v (still in use?)" >&2
+            fi
+        done
+    else
+        echo "[ok] no surviving named volumes to remove" >&2
+    fi
+
+    echo "" >&2
+    echo "=== Pruning truly-orphaned Docker volumes ===" >&2
     docker volume prune -f || true
 
     echo "" >&2
