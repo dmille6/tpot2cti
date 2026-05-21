@@ -200,7 +200,7 @@ check_prereqs() {
 
     # Free disk on the current filesystem
     local disk_free_gb
-    disk_free_gb="$(df -BG . | awk 'NR==2 {sub("G",""); print $4}')"
+    disk_free_gb="$(df -BG . | awk 'NR==2 {sub("G","",$4); print $4}')"
     if (( disk_free_gb < 100 )); then
         warn "Only ${disk_free_gb}G free here; V1_SPEC §11 calls for >=100GB."
         ask_yes_no "Continue anyway?" "n" || fail "Aborted by user (insufficient disk)."
@@ -243,11 +243,11 @@ interactive_prompts() {
 
     # If tpot2cti/.env already populated with non-empty TPOT_HOST and no --force-regen,
     # offer to skip prompting.
-    if [[ -f "${SCRIPT_DIR}/tpot2cti/.env" ]] && ! (( FORCE_REGEN )); then
-        if grep -qE '^TPOT_HOST=.+' "${SCRIPT_DIR}/tpot2cti/.env"; then
+    if [[ -f "${SCRIPT_DIR}/.env" ]] && ! (( FORCE_REGEN )); then
+        if grep -qE '^TPOT_HOST=.+' "${SCRIPT_DIR}/.env"; then
             info "Existing tpot2cti/.env detected. Re-using its values (pass --force-regen to override)."
             # shellcheck disable=SC1091
-            set -a; source "${SCRIPT_DIR}/tpot2cti/.env"; set +a
+            set -a; source "${SCRIPT_DIR}/.env"; set +a
             ENABLE_CREDENTIALS=0
             ENABLE_VAULT=0
             [[ "${COMPOSE_PROFILES:-}" == *credentials* ]] && ENABLE_CREDENTIALS=1
@@ -382,7 +382,7 @@ populate_env_files() {
     fi
 
     local opencti_env="${SCRIPT_DIR}/opencti/.env"
-    local tpot2cti_env="${SCRIPT_DIR}/tpot2cti/.env"
+    local tpot2cti_env="${SCRIPT_DIR}/.env"
 
     if [[ -f "$opencti_env" ]] && [[ -f "$tpot2cti_env" ]] && ! (( FORCE_REGEN )); then
         info "Both .env files already exist — skipping (use --force-regen to overwrite)"
@@ -542,10 +542,16 @@ test_ssh_tunnel() {
     trap cleanup_tunnel RETURN
 
     info "Opening one-shot tunnel: localhost:19298 -> ${TPOT_HOST}:64298 (via :${TPOT_SSH_PORT})"
+    # BatchMode + PreferredAuthentications=publickey makes the test FAIL LOUDLY
+    # if the user hasn't actually installed the pubkey on T-Pot — the tunnel
+    # container has no way to type a password fallback at runtime, so a
+    # password-only success here would hide a problem that surfaces at step 9.
     ssh -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="${SCRIPT_DIR}/ssh-keys/known_hosts" \
         -o ExitOnForwardFailure=yes \
         -o ConnectTimeout=10 \
+        -o BatchMode=yes \
+        -o PreferredAuthentications=publickey \
         -i "$key_path" \
         -p "$TPOT_SSH_PORT" \
         -L "19298:127.0.0.1:64298" \
@@ -657,14 +663,14 @@ start_tpot2cti() {
     step "Step 9/10: Starting tpot2cti stack"
 
     if (( DRY_RUN )); then
-        dry "(cd $SCRIPT_DIR && docker compose --env-file ./tpot2cti/.env -p $TPOT2CTI_PROJECT up -d --build)"
+        dry "(cd $SCRIPT_DIR && docker compose --env-file ./.env -p $TPOT2CTI_PROJECT up -d --build)"
         dry "Poll tpot2cti-core healthy"
         return 0
     fi
 
     (
         cd "$SCRIPT_DIR"
-        docker compose --env-file ./tpot2cti/.env -p "$TPOT2CTI_PROJECT" up -d --build >&2
+        docker compose --env-file ./.env -p "$TPOT2CTI_PROJECT" up -d --build >&2
     )
 
     info "Polling for tpot2cti containers to come up (max 120s)"
