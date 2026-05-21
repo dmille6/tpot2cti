@@ -6,12 +6,13 @@
 
 FROM python:3.12-slim AS base
 
-# Non-root user (uid 1100, dedicated to this sidecar so files written into
-# the bind-mounted /data dir on the host are easy to chown). UID/GID chosen
-# distinct from the core importer's user so the two services don't fight
-# over file ownership in `data/`.
-ARG APP_UID=1100
-ARG APP_GID=1100
+# Non-root user. uid 1000 matches the host owner of the bind-mounted
+# ./data/credentials/ directory (created by setup.sh as the invoking user),
+# so DuckDB can write to /data/credentials.duckdb without a host-side chown
+# dance. Containers are isolated from each other so sharing a uid with the
+# core importer is fine — they only share read-only mounts.
+ARG APP_UID=1000
+ARG APP_GID=1000
 RUN groupadd -g ${APP_GID} app && \
     useradd -u ${APP_UID} -g ${APP_GID} -M -s /usr/sbin/nologin app
 

@@ -18,10 +18,14 @@ RUN apk add --no-cache \
         tini
 
 # --- Non-root user ----------------------------------------------------------
-# uid 1001 to differentiate from the core importer's 1000.  The ssh-keys
-# bind mount on the host should be readable by either uid (set 0644).
-RUN addgroup -g 1001 -S tunnel \
-    && adduser -u 1001 -S -G tunnel -h /home/tunnel -s /bin/sh tunnel \
+# uid 1000 matches the typical host owner of the ssh-keys bind mount, so
+# `id_ed25519` (mode 600 owned by the host's uid 1000) is readable inside
+# the container without forcing the host to chmod 644 (which weakens key
+# security).  Separate containers are already isolated from each other, so
+# sharing a uid with the core importer is fine — they only share the
+# read-only /ssh-keys mount on the host.
+RUN addgroup -g 1000 -S tunnel \
+    && adduser -u 1000 -S -G tunnel -h /home/tunnel -s /bin/sh tunnel \
     && mkdir -p /home/tunnel/.ssh \
     && chown -R tunnel:tunnel /home/tunnel \
     && chmod 700 /home/tunnel/.ssh

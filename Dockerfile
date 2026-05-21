@@ -15,11 +15,15 @@ FROM python:3.12-slim
 # `ca-certificates` is needed for HTTPS to OpenCTI / any TLS dest.
 # `tini` is a tiny init that reaps zombies and forwards signals — without
 # it PID 1 is python, and Ctrl-C / docker stop signal handling gets weird.
+# `libmagic1` is required by pycti at import time (its file-type detection
+# uses python-magic which wraps libmagic). Without it, `import pycti`
+# raises "failed to find libmagic" before tpot2cti's own startup begins.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         tini \
+        libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Python tooling ---------------------------------------------------------

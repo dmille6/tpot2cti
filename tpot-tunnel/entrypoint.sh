@@ -11,7 +11,9 @@
 #   TPOT_SSH_PORT          — default 64295
 #   TPOT_SSH_USER          — default "tpot"
 #   TPOT_ES_REMOTE_PORT    — default 64298 (T-Pot ES on the remote loopback)
-#   TUNNEL_LOCAL_BIND      — default "0.0.0.0:9200" (where we LISTEN in-container)
+#   TUNNEL_LOCAL_BIND      — default "0.0.0.0:64298" (where we LISTEN in-container —
+#                             mirrors the remote port so the core's default ES_PORT
+#                             matches without an .env override)
 #   AUTOSSH_GATETIME       — default 0  (start immediately, even if first
 #                                       connection takes a while)
 #   AUTOSSH_POLL           — default 60 (seconds between liveness probes)
@@ -23,7 +25,7 @@ TPOT_HOST="${TPOT_HOST:-}"
 TPOT_SSH_PORT="${TPOT_SSH_PORT:-64295}"
 TPOT_SSH_USER="${TPOT_SSH_USER:-tpot}"
 TPOT_ES_REMOTE_PORT="${TPOT_ES_REMOTE_PORT:-64298}"
-TUNNEL_LOCAL_BIND="${TUNNEL_LOCAL_BIND:-0.0.0.0:9200}"
+TUNNEL_LOCAL_BIND="${TUNNEL_LOCAL_BIND:-0.0.0.0:64298}"
 AUTOSSH_GATETIME="${AUTOSSH_GATETIME:-0}"
 AUTOSSH_POLL="${AUTOSSH_POLL:-60}"
 
