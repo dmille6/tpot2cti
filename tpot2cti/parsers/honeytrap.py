@@ -48,11 +48,10 @@ logger = logging.getLogger(__name__)
 #: Note SDO.  Per V1_SPEC §5.4.
 SUBSTANCE_PAYLOAD_THRESHOLD = 8
 
-#: Cap on payload_printable bytes preserved in the Note body.
-NOTE_PRINTABLE_CAP = 512
-
-#: Cap on payload_hex bytes preserved in the Note body.
-NOTE_HEX_CAP = 256
+#: Cap on payload_printable bytes preserved in the Sighting.description.
+#: Per LESSONS_LEARNED §7.1 we no longer emit a separate Note per probe.
+#: Keep this short — the description is a one-line summary, not a hex dump.
+SIGHTING_DESC_PREVIEW_CAP = 160
 
 
 # ---------------------------------------------------------------------------
@@ -191,29 +190,17 @@ class HoneytrapParser(BaseParser):
             ):
                 out.append(rel)
 
-            # Sighting on the IP Indicator
+            # Sighting on the IP Indicator — per-probe summary now lives in
+            # the Sighting's `description` field instead of a separate Note
+            # (LESSONS_LEARNED §7.1: per-session Notes at hive scale produce
+            # 50k+ Notes/day that nobody reads; condense into the Sighting).
             sighting = builder.build_sighting(
                 ip_ind["id"], session.sensor_hostname, session,
                 count=session.event_count,
+                description=self._render_sighting_description(session, event),
             )
             if sighting:
                 out.append(sighting)
-
-        # Note with the captured payload — pinned to the IPv4-Addr so
-        # OpenCTI surfaces it on the IP's page (per V1_SPEC §5.4).
-        note_body = self._render_note_body(session, event)
-        if note_body:
-            note = builder.build_session_note(
-                session,
-                body_md=note_body,
-                abstract=(
-                    f"Honeytrap payload from {session.src_ip} "
-                    f"→ {event.protocol or 'tcp'}/{event.dst_port}"
-                ),
-                object_refs=[ipv4_id],
-            )
-            if note:
-                out.append(note)
 
         return out
 
@@ -222,48 +209,35 @@ class HoneytrapParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _render_note_body(session: AttackSession, event: ParsedEvent) -> str:
-        """Format the Note body (markdown) for a substantive session.
+    def _render_sighting_description(session: AttackSession, event: ParsedEvent) -> str:
+        """One-line summary baked into the Sighting's `description` field.
 
-        Includes src_ip, dst_port, proto, capped payload_printable and
-        payload_hex, and the timestamp.  Caps are applied per
-        V1_SPEC §5.4 to keep the bundle small.
+        Replaces the per-probe Note that V0 emitted (and the bare port-scan
+        approach the PoC used). Per LESSONS_LEARNED §7.1: this is the
+        right place for low-signal-per-event protocol summaries — the
+        analyst sees it in OpenCTI's Sighting context without flooding
+        the Notes tab.
+
+        Example output:
+          "Honeytrap probe tcp/22 — payload 187B printable, leads
+          'GET / HTTP/1.1\\r\\nHost: ...' (hex 8 bytes shown)"
         """
         payload_printable = str(event.meta.get("payload_printable") or "")
         payload_hex = str(event.meta.get("payload_hex") or "")
-
-        printable_excerpt = payload_printable[:NOTE_PRINTABLE_CAP]
-        printable_truncated = len(payload_printable) > NOTE_PRINTABLE_CAP
-
-        hex_excerpt = payload_hex[:NOTE_HEX_CAP]
-        hex_truncated = len(payload_hex) > NOTE_HEX_CAP
-
         proto = (event.protocol or "tcp").lower()
         dst_port = event.dst_port if event.dst_port is not None else "?"
 
-        lines = [
-            f"# Honeytrap payload from `{session.src_ip}`",
-            "",
-            f"- **src_ip:** `{session.src_ip}`",
-            f"- **dst_port:** `{dst_port}`",
-            f"- **proto:** `{proto}`",
-            f"- **timestamp:** `{event.timestamp.isoformat()}`",
-            f"- **sensor:** `{session.sensor_hostname}`",
-            "",
-            "## payload (printable)",
-            "",
-            "```",
-            printable_excerpt
-            + ("\n... [truncated]" if printable_truncated else ""),
-            "```",
-            "",
-            "## payload (hex)",
-            "",
-            "```",
-            hex_excerpt + ("\n... [truncated]" if hex_truncated else ""),
-            "```",
-        ]
-        return "\n".join(lines)
+        bits: list[str] = [f"Honeytrap probe {proto}/{dst_port}"]
+        if payload_printable:
+            preview = payload_printable[:SIGHTING_DESC_PREVIEW_CAP]
+            preview = preview.replace("\n", "\\n").replace("\r", "\\r")
+            suffix = " [truncated]" if len(payload_printable) > SIGHTING_DESC_PREVIEW_CAP else ""
+            bits.append(
+                f"payload {len(payload_printable)}B printable, leads {preview!r}{suffix}"
+            )
+        elif payload_hex:
+            bits.append(f"payload hex {len(payload_hex) // 2}B")
+        return " — ".join(bits)
 
     @staticmethod
     def _safe_int(value) -> Optional[int]:
@@ -379,9 +353,21 @@ if __name__ == "__main__":
     for t, n in sorted(subs_counts.items(), key=lambda x: -x[1]):
         print(f"  {t:25s} {n}")
 
-    # Sanity: the substantive bundle must include a Note
-    assert any(o["type"] == "note" for o in subs_objs), "substantive bundle missing Note"
-    # And the drive-by bundle must NOT include a Note
-    assert not any(o["type"] == "note" for o in drive_objs), "drive-by bundle should have no Note"
+    # Per LESSONS_LEARNED §7.1 (post-refactor): Honeytrap no longer emits
+    # a per-probe Note. The per-probe summary now lives on the Sighting's
+    # `description` field. Verify both ends of the contract.
+    assert not any(o["type"] == "note" for o in subs_objs), (
+        "Honeytrap should NOT emit Notes anymore — summary goes in "
+        "Sighting.description per LESSONS_LEARNED §7.1"
+    )
+    sightings = [o for o in subs_objs if o["type"] == "sighting"]
+    assert sightings, "substantive bundle missing Sighting"
+    assert sightings[0].get("description"), \
+        "Sighting must carry a per-probe description string"
+    assert "Honeytrap probe" in sightings[0]["description"], \
+        f"unexpected sighting description: {sightings[0]['description']!r}"
+    # Drive-by bundle still has no Note (unchanged from before)
+    assert not any(o["type"] == "note" for o in drive_objs), \
+        "drive-by bundle should have no Note"
 
     print("\nSmoke test passed.")
