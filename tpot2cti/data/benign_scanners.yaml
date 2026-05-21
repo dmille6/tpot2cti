@@ -69,3 +69,55 @@ scanners:
     asns: [7941]
     org_keywords:
       - "Internet Archive"
+
+  # ─── Added after first-live-install cycle 9 analysis ─────────────
+  # All five below are documented internet-wide research scanners.
+  # Each ASN verified at bgp.he.net before adding; conservative
+  # org_keywords to avoid catching unrelated entities on the same AS.
+
+  stretchoid:
+    # Stretchoid is a long-running benign scanner network announcing
+    # the *.stretchoid.com PTR. Their main ASN is AS62240 but they
+    # also lease ranges from other ASes, so the org keyword is the
+    # primary catch (their reverse-DNS leaks "stretchoid.com" into
+    # the GeoIP org field on most MaxMind databases).
+    asns: [62240]
+    org_keywords:
+      - "Stretchoid"
+      - "stretchoid.com"
+
+  rapid7-sonar:
+    # Project Sonar — Rapid7's internet-wide scan effort (data feeds
+    # the Open Data project at opendata.rapid7.com).
+    # AS19185 = Rapid7 LLC (corporate)
+    # AS62192 = Project Sonar dedicated scanner ASN
+    asns: [19185, 62192]
+    org_keywords:
+      - "Rapid7"
+      - "Project Sonar"
+
+  binaryedge:
+    # BinaryEdge — paid internet attack-surface scanner (binaryedge.io).
+    # AS204904 = BinaryEdge dedicated.
+    asns: [204904]
+    org_keywords:
+      - "BinaryEdge"
+      - "BINARYEDGE"
+
+  onyphe:
+    # ONYPHE — French internet scan / cyber defense data provider.
+    # AS208476 = Onyphe SAS scanner pool.
+    asns: [208476]
+    org_keywords:
+      - "Onyphe"
+      - "ONYPHE"
+
+  net-systems-research:
+    # Net Systems Research / "Internet Census of all the things"
+    # — academic-style scanners; rDNS reads *.netsystemsresearch.com.
+    # AS396355 = LOOKINGGLASS-NSR / Net Systems Research.
+    asns: [396355]
+    org_keywords:
+      - "Net Systems Research"
+      - "NETSYSTEMSRESEARCH"
+      - "Internet Census"

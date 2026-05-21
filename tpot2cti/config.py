@@ -88,6 +88,18 @@ class CycleConfig:
     batch_size: int = 1000
     cycle_anchor_hour_utc: Optional[int] = None  # None = no anchor sleep
     transient_retry_seconds: int = 60       # per LESSONS_LEARNED §5
+    #: Seconds to sleep between the publisher's three passes. Per PoC
+    #: HP_CONNECTOR_HANDOFF §4 ("the single most impactful tuning
+    #: parameter") and V1_SPEC §3. Default 60s tuned conservatively for
+    #: single-sensor deployments; hive operators should raise to 300s.
+    indexing_delay_seconds: int = 60
+    #: Run FATT (passive TLS/SSH fingerprint) parsing only every Nth
+    #: cycle. Per PoC's separate-cadence design (FATT runs at PT60M;
+    #: honeypots run at PT15M). With base interval PT15M and multiplier
+    #: 4, FATT is processed roughly every hour. Fingerprints are
+    #: slowly-evolving so the cycle skew isn't analytically meaningful.
+    #: Set to 1 to process every cycle (matches pre-2026-05-21 behavior).
+    fatt_cycle_multiplier: int = 4
 
 
 @dataclass(frozen=True)
@@ -157,22 +169,22 @@ def _env_int(env: dict, key: str, default: int) -> int:
 
 
 def _env_bool(env: dict, key: str, default: bool) -> bool:
-    """Truthy-env helper, per V2_OPENSOURCE_HANDOFF §3 (`tsec_env.truthy_env`).
+    """Truthy-env helper.
 
-    Accept 1/true/yes/on (any case) as True; 0/false/no/off as False.
-    Empty or unset = default.
+    Delegates to :func:`tpot2cti.env.truthy_str` so the parsing matches
+    everywhere in the project (and is robust to the PoC LESSONS §38
+    "docker --env-file inline-comment footgun"). For a value that comes
+    from anywhere other than the env dict, use ``tpot2cti.env.truthy_str``
+    directly.
+
+    Accepts: 1/true/yes/on/y/t  → True
+    Accepts: 0/false/no/off/n/f → False
+    Empty / unset / unrecognized → ``default``
     """
-    raw = env.get(key)
-    if raw is None:
-        return default
-    s = str(raw).strip().lower()
-    if not s:
-        return default
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off"):
-        return False
-    raise ConfigError(f"{key} must be truthy/falsey; got {raw!r}")
+    # Local import to avoid circular dependency (env.py is dep-free; config
+    # is loaded by many other modules at import time).
+    from tpot2cti.env import truthy_str
+    return truthy_str(env.get(key), default)
 
 
 def _env_list(env: dict, key: str, default: Optional[list[str]] = None,
@@ -243,6 +255,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
             if env.get("TPOT2CTI_CYCLE_ANCHOR_HOUR_UTC") else None
         ),
         transient_retry_seconds=_env_int(env, "TPOT2CTI_TRANSIENT_RETRY_SECONDS", default=60),
+        indexing_delay_seconds=_env_int(env, "TPOT2CTI_INDEXING_DELAY_SECONDS", default=60),
+        fatt_cycle_multiplier=_env_int(env, "TPOT2CTI_FATT_CYCLE_MULTIPLIER", default=4),
     )
 
     # --- Connector IDs ---

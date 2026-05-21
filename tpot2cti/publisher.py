@@ -151,12 +151,21 @@ class Publisher:
 
     Attributes:
         _sleep_seconds: Seconds slept between non-empty passes. Default
-            30 per V1_SPEC §3. Tests override this to 0 to skip the
-            sleeps without mocking ``time.sleep``.
+            60 per the post-cycle-5 tuning + PoC HP_CONNECTOR_HANDOFF §4
+            ("the single most impactful tuning parameter"). V1_SPEC §3
+            originally said 30s but live data showed pycti's per-object
+            Create call rate makes 30s too aggressive for substantive
+            bundles — the second pass can land before OpenCTI's ES
+            finishes indexing the first. Operator-configurable via the
+            ``TPOT2CTI_INDEXING_DELAY_SECONDS`` env var (see config.py
+            and .env.example). Tests override to 0 to skip sleeps without
+            mocking ``time.sleep``.
     """
 
-    #: Override to 0 in tests to skip indexing waits.
-    _sleep_seconds: int = 30
+    #: Default sleep between non-empty passes when no env override is set.
+    #: Overridden per-instance from cfg.cycle.indexing_delay_seconds.
+    #: Tests set this class attribute to 0 to skip indexing waits.
+    _sleep_seconds: int = 60
 
     #: Semantic-set fields whose duplicates should be unioned together
     #: when collapsing duplicate STIX IDs. ``labels`` and the
@@ -170,9 +179,16 @@ class Publisher:
         self,
         client: OpenCTIClient,
         state: Optional[CycleState] = None,
+        *,
+        indexing_delay_seconds: Optional[int] = None,
     ) -> None:
         self.client = client
         self.state = state
+        # Per-instance override of the class-level default; lets main()
+        # thread cfg.cycle.indexing_delay_seconds through without touching
+        # the class attr (which tests reset to 0).
+        if indexing_delay_seconds is not None:
+            self._sleep_seconds = int(indexing_delay_seconds)
 
     # ------------------------------------------------------------------
     # Public API
