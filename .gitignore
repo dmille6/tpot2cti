@@ -13,12 +13,14 @@ venv/
 ssh-keys/
 !ssh-keys/.gitkeep
 
-# Data (per V1_SPEC §2.4 — gitignored)
-data/
-!data/.gitkeep
+# Runtime data (per V1_SPEC §2.4 — gitignored). Anchored to repo root so
+# it doesn't accidentally exclude tpot2cti/data/ (which ships the
+# benign_scanners.yaml allowlist).
+/data/
+!/data/.gitkeep
 
 # Logs (per V1_SPEC §2.4 — gitignored)
-logs/
+/logs/
 !logs/.gitkeep
 
 # OpenCTI clone (created by setup.sh next to us)

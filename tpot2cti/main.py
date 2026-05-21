@@ -52,6 +52,7 @@ from tpot2cti.config import Config, load_config
 from tpot2cti.es_client import TpotESClient
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
+from tpot2cti.benign_filter import BenignScannerFilter, FilterStats
 from tpot2cti.parsers import dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
@@ -226,6 +227,7 @@ def run_cycle(
     publisher: Publisher,
     *,
     now: Optional[datetime] = None,
+    benign_filter: Optional[BenignScannerFilter] = None,
 ) -> dict:
     """Run ONE importer cycle and return a summary dict.
 
@@ -252,6 +254,7 @@ def run_cycle(
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
     sensors_seen: set[str] = set()
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
+    benign_stats = FilterStats()  # populated by benign-scanner allowlist below
 
     try:
         for doc in es.stream_events(
@@ -280,6 +283,17 @@ def run_cycle(
             if honeypot_ips and event.src_ip in honeypot_ips:
                 events_self_filtered += 1
                 continue
+            # Benign-scanner allowlist: drop events from Google / Censys /
+            # Shodan / Shadowserver / Internet-Archive etc. before they
+            # become Indicators. Per the user decision: "we can't blanket
+            # report google as malicious that's silly" — these aren't
+            # attackers, they're internet-wide research scanners. See
+            # tpot2cti/data/benign_scanners.yaml for the source list.
+            if benign_filter is not None:
+                benign_vendor = benign_filter.match(event)
+                if benign_vendor:
+                    benign_stats.record(benign_vendor)
+                    continue
             events_parsed += 1
             parsed_by_type[event.event_type].append(event)
             if event.sensor_hostname:
@@ -297,6 +311,8 @@ def run_cycle(
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
         f"events_dropped={events_dropped} events_self_filtered={events_self_filtered} "
+        f"events_benign={benign_stats.total_filtered} "
+        f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"types={sorted(parsed_by_type.keys())}"
     )
 
@@ -509,6 +525,11 @@ def main() -> int:
     restore_logging()      # pycti's __init__ may have clobbered handlers
     publisher = Publisher(opencti, state=state)
 
+    # Benign-scanner allowlist — static yaml, loaded once at startup.
+    # Filters events from Google / Censys / Shodan / Shadowserver /
+    # Internet-Archive at parse time. See benign_filter.py.
+    benign_filter = BenignScannerFilter.from_yaml()
+
     # Builder is per-cycle (bundle-scoped dedup); pass a factory.
     def builder_factory() -> STIXBuilder:
         return STIXBuilder(cfg)
@@ -536,7 +557,8 @@ def main() -> int:
         while not shutdown.requested:
             cycle_started = time.monotonic()
             try:
-                run_cycle(cfg, state, es, builder_factory, publisher)
+                run_cycle(cfg, state, es, builder_factory, publisher,
+                          benign_filter=benign_filter)
             except Exception as e:
                 # Cycle failed (ES error, publisher crashed, etc.).  Per
                 # V1_SPEC §7: log, record, sleep, continue.  Don't crash
