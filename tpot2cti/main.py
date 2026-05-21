@@ -476,7 +476,7 @@ def main() -> int:
 
     # 3) State + ES + OpenCTI + Publisher.
     state_db = os.environ.get(
-        "TPOT2CTI_STATE_DB", "/opt/connector/data/state.db"
+        "TPOT2CTI_STATE_DB", "/data/state.db"
     )
     state = CycleState(db_path=state_db)
     es = TpotESClient(
