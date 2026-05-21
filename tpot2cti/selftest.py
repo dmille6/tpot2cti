@@ -39,7 +39,11 @@ from tpot2cti.stix.builder import STIXBuilder
 
 def main() -> int:
     cfg = load_config()
-    setup_logging(cfg.logging)
+    setup_logging(
+        log_level=cfg.logging.level,
+        log_retention_days=cfg.logging.retention_days,
+        connector_name="tpot2cti-selftest",
+    )
     logger = logging.getLogger("tpot2cti.selftest")
 
     logger.info("=== tpot2cti install self-test ===")
