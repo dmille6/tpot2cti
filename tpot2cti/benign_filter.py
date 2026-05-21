@@ -1,0 +1,254 @@
+"""tpot2cti — benign-scanner allowlist filter.
+
+Drops events from known internet-wide research scanners (Google,
+Censys, Shodan, Shadowserver, Internet Archive, etc.) at parse time.
+No Indicator, no observable, no Sighting — these aren't attackers and
+we don't want to pollute the threat intel with claims that they are.
+
+The allowlist is loaded from `tpot2cti/data/benign_scanners.yaml` (or
+a path passed explicitly). Matching is OR-of:
+    - integer ASN match (`event.src_asn in vendor.asns`)
+    - case-insensitive substring match on the org name
+      (any keyword from `vendor.org_keywords` is in `event.src_as_org`)
+
+Per the user decision documented in the first-live-install postmortem:
+"we can't blanket report google as malicious that's silly".
+
+This is NOT an enrichment connector — it's a static config file
+shipped in the repo. A future enrichment connector (FireHOL allowlist
+sync, see the PoC's `tsec_fhol_*.py`) can layer dynamic allowlists on
+top, but v1 keeps it simple and local.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
+
+import yaml
+
+from tpot2cti.parsers.base import ParsedEvent
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ScannerRule:
+    """One entry from benign_scanners.yaml."""
+    vendor: str                       # e.g. "google", "censys"
+    asns: frozenset[int]              # ASNs that identify this scanner
+    org_keywords: tuple[str, ...]     # lowercase keyword substrings
+
+
+@dataclass
+class FilterStats:
+    """Per-cycle counters surfaced in the cycle summary log."""
+    total_filtered: int = 0
+    by_vendor: Counter[str] = field(default_factory=Counter)
+
+    def record(self, vendor: str) -> None:
+        self.total_filtered += 1
+        self.by_vendor[vendor] += 1
+
+    def to_log_dict(self) -> dict:
+        return {
+            "total": self.total_filtered,
+            "by_vendor": dict(self.by_vendor),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Default yaml path resolution
+# ---------------------------------------------------------------------------
+
+DEFAULT_YAML_PATH = Path(__file__).parent / "data" / "benign_scanners.yaml"
+
+#: Env var to point at an alternate yaml (useful for ops who want their
+#: own allowlist without forking the repo).
+ENV_YAML_PATH = "TPOT2CTI_BENIGN_SCANNERS_YAML"
+
+
+# ---------------------------------------------------------------------------
+# Filter
+# ---------------------------------------------------------------------------
+
+class BenignScannerFilter:
+    """Stateless allowlist matcher; safe to call from the cycle loop."""
+
+    def __init__(self, rules: list[ScannerRule]):
+        self._rules = rules
+        # Precompute an ASN → vendor lookup for the fast path.
+        self._asn_to_vendor: dict[int, str] = {}
+        for r in rules:
+            for asn in r.asns:
+                # Last write wins on conflict; log so the operator notices.
+                if asn in self._asn_to_vendor and self._asn_to_vendor[asn] != r.vendor:
+                    logger.warning(
+                        f"benign-scanner: ASN {asn} listed under both "
+                        f"{self._asn_to_vendor[asn]!r} and {r.vendor!r}; "
+                        f"using {r.vendor!r}"
+                    )
+                self._asn_to_vendor[asn] = r.vendor
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Path | str] = None) -> "BenignScannerFilter":
+        """Load rules from yaml. Returns an empty filter if file missing."""
+        # Resolution order: explicit arg > env var > shipped default.
+        if path is None:
+            env_override = os.environ.get(ENV_YAML_PATH)
+            if env_override:
+                path = Path(env_override)
+            else:
+                path = DEFAULT_YAML_PATH
+        else:
+            path = Path(path)
+
+        if not path.exists():
+            logger.warning(
+                f"benign_scanners.yaml not found at {path}; filter disabled "
+                f"(every event treated as potentially-malicious)"
+            )
+            return cls([])
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning(
+                f"failed to parse benign_scanners.yaml at {path}: {e}; "
+                f"filter disabled"
+            )
+            return cls([])
+
+        rules: list[ScannerRule] = []
+        for vendor, body in (doc.get("scanners") or {}).items():
+            asns = frozenset(int(a) for a in (body.get("asns") or []))
+            org_keywords = tuple(
+                str(kw).lower() for kw in (body.get("org_keywords") or [])
+            )
+            rules.append(ScannerRule(
+                vendor=str(vendor),
+                asns=asns,
+                org_keywords=org_keywords,
+            ))
+        logger.info(
+            f"benign-scanner filter loaded {len(rules)} vendor rule(s) "
+            f"from {path}: {sorted(r.vendor for r in rules)}"
+        )
+        return cls(rules)
+
+    def match(self, event: ParsedEvent) -> Optional[str]:
+        """Return the vendor name if the event is from a benign scanner, else None.
+
+        Cheap: O(rules) per event, with the ASN fast path being a dict
+        lookup. The org-keyword fallback only runs when the ASN didn't
+        match — keeps the hot path tight.
+        """
+        # Fast path: ASN match
+        if event.src_asn is not None:
+            vendor = self._asn_to_vendor.get(event.src_asn)
+            if vendor:
+                return vendor
+        # Slow path: case-insensitive substring on org name
+        org = (event.src_as_org or "").lower()
+        if not org:
+            return None
+        for rule in self._rules:
+            for kw in rule.org_keywords:
+                if kw in org:
+                    return rule.vendor
+        return None
+
+    def __len__(self) -> int:
+        """Number of vendor rules currently loaded."""
+        return len(self._rules)
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from datetime import datetime, timezone
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    f = BenignScannerFilter.from_yaml()
+    assert len(f) >= 5, f"expected at least 5 vendors loaded, got {len(f)}"
+
+    def mk(ip: str, asn: Optional[int] = None, org: str = "") -> ParsedEvent:
+        return ParsedEvent(
+            src_ip=ip,
+            timestamp=datetime.now(timezone.utc),
+            sensor_hostname="node1",
+            event_type="Suricata",
+            src_asn=asn,
+            src_as_org=org,
+        )
+
+    # ── 1. Google by ASN ──────────────────────────────────────────────
+    ev = mk("34.68.34.67", asn=15169, org="Google LLC")
+    m = f.match(ev)
+    assert m == "google", f"expected 'google', got {m!r}"
+    print(f"OK: google by ASN 15169 → {m!r}")
+
+    # ── 2. Google Cloud by ASN ────────────────────────────────────────
+    ev = mk("35.0.0.1", asn=396982, org="Google Cloud Platform")
+    m = f.match(ev)
+    assert m == "google", f"expected 'google', got {m!r}"
+    print(f"OK: google-cloud by ASN 396982 → {m!r}")
+
+    # ── 3. Censys by ASN ──────────────────────────────────────────────
+    ev = mk("167.94.138.5", asn=398324, org="Censys, Inc.")
+    m = f.match(ev)
+    assert m == "censys", f"expected 'censys', got {m!r}"
+    print(f"OK: censys by ASN 398324 → {m!r}")
+
+    # ── 4. Org-name match (ASN unknown, org keyword present) ──────────
+    ev = mk("1.2.3.4", asn=99999, org="Shodan LLC")
+    m = f.match(ev)
+    assert m == "shodan", f"expected 'shodan', got {m!r}"
+    print(f"OK: shodan by org keyword → {m!r}")
+
+    # ── 5. Random attacker — not in any allowlist ─────────────────────
+    ev = mk("198.51.100.42", asn=12345, org="Some Russian ISP")
+    m = f.match(ev)
+    assert m is None, f"expected None, got {m!r}"
+    print(f"OK: random attacker → not filtered")
+
+    # ── 6. Missing ASN + org (e.g. malformed T-Pot doc) ───────────────
+    ev = mk("203.0.113.1")
+    m = f.match(ev)
+    assert m is None
+    print(f"OK: no asn/org → not filtered")
+
+    # ── 7. Shadowserver org-name match ────────────────────────────────
+    ev = mk("184.105.139.1", asn=33038, org="The Shadowserver Foundation")
+    m = f.match(ev)
+    assert m == "shadowserver", f"expected 'shadowserver', got {m!r}"
+    print(f"OK: shadowserver → {m!r}")
+
+    # ── 8. Empty filter (no yaml) ─────────────────────────────────────
+    f_empty = BenignScannerFilter([])
+    assert f_empty.match(mk("34.68.34.67", asn=15169, org="Google")) is None
+    print(f"OK: empty filter matches nothing")
+
+    # ── 9. Stats ──────────────────────────────────────────────────────
+    stats = FilterStats()
+    stats.record("google")
+    stats.record("google")
+    stats.record("censys")
+    assert stats.total_filtered == 3
+    assert stats.by_vendor["google"] == 2
+    assert stats.by_vendor["censys"] == 1
+    print(f"OK: stats {stats.to_log_dict()}")
+
+    print("\nOK")

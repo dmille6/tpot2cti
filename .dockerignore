@@ -21,9 +21,11 @@ venv/
 .mypy_cache/
 
 # --- Runtime data (gitignored too; never bake into an image) ---
-data/
-logs/
-ssh-keys/
+# Anchored to the build-context root so it doesn't accidentally exclude
+# tpot2cti/data/ (which ships the benign_scanners.yaml allowlist).
+/data/
+/logs/
+/ssh-keys/
 *.duckdb
 *.db
 *.sqlite

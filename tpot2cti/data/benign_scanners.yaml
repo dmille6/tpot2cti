@@ -1,0 +1,71 @@
+# tpot2cti — benign-scanner allowlist
+#
+# Events from these ASNs / organizations get DROPPED at parse time:
+# no Indicator, no IPv4-Addr observable, no Sighting, nothing.
+# We don't want to ship Indicators claiming Google's scanners are
+# malicious — they're not.
+#
+# Matching is OR-of-rules:
+#   1. event.src_asn in `asns` (integer match) → drop
+#   2. any keyword from `org_keywords` is a case-insensitive substring of
+#      event.src_as_org → drop
+#
+# Adding a vendor:
+#   - Verify the ASN(s) at https://bgp.he.net/ or https://radar.cloudflare.com/asn
+#   - Pull the `org_keywords` from how the ASN's organization name
+#     appears in T-Pot's GeoIP enrichment (typically MaxMind ASN org name)
+#   - Be CONSERVATIVE — a too-broad keyword silently drops attacker
+#     traffic from compromised-but-otherwise-legit organizations
+#
+# Live data check before adding:
+#   from tpot2cti within the container:
+#   curl http://tunnel:64298/logstash-*/_search -d '{
+#     "size":0,
+#     "query":{"term":{"src_ip":"<the-IP-you're-curious-about>"}},
+#     "aggs":{"asn":{"terms":{"field":"geoip.asn"}},
+#             "org":{"terms":{"field":"geoip.organization.keyword"}}}}'
+#
+# This file is shipped in-repo and read at startup; no live updates.
+# A future enrichment connector can add a dynamic allowlist on top.
+
+scanners:
+
+  google:
+    # AS15169 = Google LLC (Googlebot, crawlers)
+    # AS396982 = Google Cloud Platform (cloud-hosted scanners, including
+    #            internal Google research scanners that hit our T-Pot)
+    asns: [15169, 396982]
+    org_keywords:
+      - "Google LLC"
+      - "GOOGLE"
+      - "Google Cloud Platform"
+
+  censys:
+    # AS398324 = CENSYS-ARIN-01 — internet-wide research scanner
+    # https://support.censys.io/hc/en-us/articles/360043177092
+    asns: [398324]
+    org_keywords:
+      - "Censys"
+
+  shodan:
+    # AS208046 = Census of Internet, LLC (Shodan's main scanner ASN)
+    # AS20473 = AS-CHOOPA / Vultr (Shodan operates from here partially)
+    # NOTE: AS20473 is a hosting provider; broader keyword filtering
+    # via org_keywords is more reliable for Shodan than ASN alone.
+    asns: [208046]
+    org_keywords:
+      - "Shodan"
+      - "Census of Internet"
+
+  shadowserver:
+    # AS33038 = SHADOWSERVER (Shadowserver Foundation — security NPO)
+    # https://www.shadowserver.org/what-we-do/network-reporting/
+    asns: [33038]
+    org_keywords:
+      - "Shadowserver"
+
+  internet-archive:
+    # AS7941 = INTERNET-ARCHIVE (archive.org's crawlers)
+    asns: [7941]
+    org_keywords:
+      - "Internet Archive"
