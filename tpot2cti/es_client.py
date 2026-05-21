@@ -286,7 +286,12 @@ class TpotESClient:
                 row — caller skips the cycle per §7.
         """
         query = self._build_query(start, end, ignore_types)
-        sort = [{"@timestamp": "asc"}, {"_id": "asc"}]
+        # `_doc` is the canonical tiebreaker for search_after pagination in
+        # ES 8+. We previously used `_id` here, but ES 8 disables fielddata
+        # on _id by default ("all shards failed" / IllegalArgumentException at
+        # query time). `_doc` is cheap, stable across a single point-in-time
+        # window, and ES-recommended. See first-live-install postmortem.
+        sort = [{"@timestamp": "asc"}, {"_doc": "asc"}]
 
         logger.debug(
             "ES stream: index=%s start=%s end=%s batch=%d ignore_types=%s",

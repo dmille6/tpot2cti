@@ -78,8 +78,13 @@ class CredentialsConfig:
     def from_env(cls, env: dict[str, str] | None = None) -> "CredentialsConfig":
         e = env if env is not None else os.environ
         return cls(
-            es_host=e.get("ES_HOST", "tpot-tunnel"),
-            es_port=int(e.get("ES_PORT", "9200")),
+            # Defaults match the core importer (tpot2cti/config.py):
+            # service-name DNS `tunnel` on the compose network, port 64298
+            # which mirrors T-Pot's remote ES port. Was previously
+            # "tpot-tunnel:9200" (wrong on both — service is `tunnel`, port
+            # alignment was fixed in the first-live-install postmortem).
+            es_host=e.get("ES_HOST", "tunnel"),
+            es_port=int(e.get("ES_PORT", "64298")),
             es_scheme=e.get("ES_SCHEME", "http"),
             es_username=e.get("ES_USERNAME") or None,
             es_password=e.get("ES_PASSWORD") or None,

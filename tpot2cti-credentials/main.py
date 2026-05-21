@@ -77,7 +77,10 @@ def stream_credential_docs(es, cfg: CredentialsConfig, start: datetime, end: dat
             ]
         }
     }
-    sort = [{"@timestamp": "asc"}, {"_id": "asc"}]
+    # `_doc` is the canonical tiebreaker for search_after pagination in ES 8+
+    # (`_id` is no longer sortable by default — fielddata disabled). Mirrors
+    # the fix applied in tpot2cti/es_client.py during first-live-install.
+    sort = [{"@timestamp": "asc"}, {"_doc": "asc"}]
     search_after = None
     while True:
         kwargs = {
