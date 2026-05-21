@@ -276,9 +276,266 @@ def render_fallback_no_ip_note_body(event: ParsedEvent, unknown_type: str) -> st
     )
 
 
+# ---------------------------------------------------------------------------
+# Attacker-profile renderers (per attacker_profile.py).
+# ---------------------------------------------------------------------------
+
+#: How many entries from each sample category we render in the profile
+#: body. Matches the cap in CycleState._ATTACKER_SAMPLE_CAP — anything
+#: beyond becomes an "and N more" marker.
+_PROFILE_SAMPLE_RENDER_CAP = 25
+
+#: Cap on the inline command preview within the profile body.
+_PROFILE_COMMAND_PREVIEW_BYTES = 4000
+
+
+def _fmt_int(n) -> str:
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+
+def _render_per_parser_section(row: dict) -> list[str]:
+    """One markdown subsection per (parser, sensor) activity row."""
+    lines: list[str] = []
+    parser = row.get("parser") or "Unknown"
+    sensor = row.get("sensor") or "unknown"
+    lines.append(f"### {parser} on `{sensor}`")
+    lines.append("")
+    lines.append(
+        f"- **Sessions:** {_fmt_int(row.get('sessions_count'))} "
+        f"(**events:** {_fmt_int(row.get('events_count'))})"
+    )
+    lines.append(
+        f"- **First seen:** `{row.get('first_seen')}`  •  "
+        f"**Last seen:** `{row.get('last_seen')}`"
+    )
+    substance_bits: list[str] = []
+    if (n := row.get("auth_success_count") or 0):
+        substance_bits.append(f"auth-success x{_fmt_int(n)}")
+    if (n := row.get("credentials_count") or 0):
+        substance_bits.append(f"{_fmt_int(n)} credential attempt(s)")
+    if (n := row.get("commands_count") or 0):
+        substance_bits.append(f"{_fmt_int(n)} command(s)")
+    if (n := row.get("malware_drop_count") or 0):
+        substance_bits.append(f"{_fmt_int(n)} file drop(s)")
+    if substance_bits:
+        lines.append(f"- **Substance signals:** {', '.join(substance_bits)}")
+    if (hassh := row.get("hassh")):
+        lines.append(f"- **HASSH:** `{hassh}`")
+    if (ver := row.get("ssh_version")):
+        lines.append(f"- **SSH version:** `{ver}`")
+    return lines
+
+
+def _render_credentials_table(rows: list[dict]) -> list[str]:
+    """Aggregated top-25 credentials table across all parsers/sensors."""
+    bucket: dict[tuple, int] = {}
+    for row in rows:
+        for entry in row.get("sample_credentials_json", []) or []:
+            if isinstance(entry, list) and len(entry) >= 3:
+                u, p, c = entry[0], entry[1], int(entry[-1])
+                bucket[(str(u), str(p))] = bucket.get((str(u), str(p)), 0) + c
+    if not bucket:
+        return []
+    top = sorted(bucket.items(), key=lambda kv: (-kv[1], kv[0]))[:_PROFILE_SAMPLE_RENDER_CAP]
+    out = [
+        "## Top credentials attempted",
+        "",
+        "| # | Username | Password | Count |",
+        "|---|----------|----------|-------|",
+    ]
+    for i, ((u, p), c) in enumerate(top, start=1):
+        u_disp = u.replace("|", "\\|").replace("\n", " ")[:128]
+        p_disp = p.replace("|", "\\|").replace("\n", " ")[:128]
+        out.append(f"| {i} | `{u_disp}` | `{p_disp}` | {_fmt_int(c)} |")
+    remaining = len(bucket) - len(top)
+    if remaining > 0:
+        out.append(f"_… and {remaining} more credential pair(s)_")
+    return out
+
+
+def _render_commands_section(rows: list[dict]) -> list[str]:
+    """Aggregated top-25 commands as a code-fenced block."""
+    bucket: dict[str, int] = {}
+    for row in rows:
+        for entry in row.get("sample_commands_json", []) or []:
+            if isinstance(entry, list) and entry:
+                cmd, c = entry[0], int(entry[-1])
+                bucket[str(cmd)] = bucket.get(str(cmd), 0) + c
+    if not bucket:
+        return []
+    top = sorted(bucket.items(), key=lambda kv: (-kv[1], kv[0]))[:_PROFILE_SAMPLE_RENDER_CAP]
+    out = ["## Top commands executed", ""]
+    block: list[str] = []
+    total_bytes = 0
+    for cmd, c in top:
+        line = f"[{c}x] {cmd}"
+        total_bytes += len(line.encode("utf-8")) + 1
+        if total_bytes > _PROFILE_COMMAND_PREVIEW_BYTES:
+            block.append("... [truncated for size]")
+            break
+        block.append(line)
+    out.append("```")
+    out.extend(block)
+    out.append("```")
+    remaining = len(bucket) - len(top)
+    if remaining > 0:
+        out.append(f"_… and {remaining} more command(s)_")
+    return out
+
+
+def _render_unique_section(
+    rows: list[dict], col: str, heading: str, fence: bool = False,
+) -> list[str]:
+    """Render a deduplicated list from one JSON column across parser rows."""
+    seen: list = []
+    seen_set: set = set()
+    for row in rows:
+        for v in row.get(col, []) or []:
+            key = repr(v)
+            if key in seen_set:
+                continue
+            seen_set.add(key)
+            seen.append(v)
+    if not seen:
+        return []
+    rendered = seen[:_PROFILE_SAMPLE_RENDER_CAP]
+    out = [f"## {heading}", ""]
+    if fence:
+        out.append("```")
+        for v in rendered:
+            out.append(str(v))
+        out.append("```")
+    else:
+        for v in rendered:
+            out.append(f"- `{v}`")
+    remaining = len(seen) - len(rendered)
+    if remaining > 0:
+        out.append(f"_… and {remaining} more_")
+    return out
+
+
+def render_attacker_profile_body(
+    ip: str,
+    rows: list[dict],
+    *,
+    cadence: str = "live",
+    window_label: str = "all-time",
+    max_bytes: int = 64 * 1024,
+) -> str:
+    """Render the markdown body of an attacker-profile Note.
+
+    ``rows`` is the list produced by ``CycleState.get_attacker_activity(ip)``
+    — one row per (parser, sensor). Empty list returns the empty string
+    so the caller can skip emission.
+
+    ``cadence`` is one of ``"live"`` / ``"daily"`` / ``"weekly"`` and
+    selects the heading. ``window_label`` is the human-readable window
+    descriptor (e.g. ``"2026-05-21 (UTC)"`` for daily, ``"ISO week
+    2026-W21"`` for weekly).
+
+    Sections (each omitted when empty):
+      - Header (IP / window / country / AS / totals)
+      - Per-parser activity (one subsection per parser+sensor row)
+      - Top credentials attempted (aggregated table)
+      - Top commands executed (aggregated code-fenced block)
+      - Files dropped (sha256 list)
+      - URLs / domains referenced
+      - Suricata signatures
+      - MITRE techniques
+      - Honeytrap ports probed
+      - SSH client fingerprints
+
+    Truncated to ``max_bytes`` with a "[truncated]" marker (matches the
+    cap in stix/builder.py:MAX_NOTE_BODY_BYTES).
+    """
+    if not rows:
+        return ""
+
+    # Aggregate header bits.
+    total_sessions = sum(int(r.get("sessions_count") or 0) for r in rows)
+    total_events = sum(int(r.get("events_count") or 0) for r in rows)
+    first_seen = min((r["first_seen"] for r in rows if r.get("first_seen")), default="?")
+    last_seen = max((r["last_seen"] for r in rows if r.get("last_seen")), default="?")
+    country = next((r.get("geoip_country") for r in rows if r.get("geoip_country")), None)
+    asn = next((r.get("geoip_asn") for r in rows if r.get("geoip_asn")), None)
+    as_org = next((r.get("geoip_as_org") for r in rows if r.get("geoip_as_org")), None)
+    parsers = sorted({r.get("parser") for r in rows if r.get("parser")})
+
+    if cadence == "daily":
+        title = f"Daily attacker snapshot — {ip} — {window_label}"
+    elif cadence == "weekly":
+        title = f"Weekly attacker snapshot — {ip} — {window_label}"
+    else:
+        title = f"Attacker profile — {ip} (live)"
+
+    lines: list[str] = [
+        f"# {title}",
+        "",
+        f"- **IP:** `{ip}`",
+        f"- **Window:** {window_label}",
+        f"- **First seen:** `{first_seen}`",
+        f"- **Last seen:** `{last_seen}`",
+        f"- **Parsers observed:** {', '.join(parsers) if parsers else '(none)'}",
+        f"- **Total sessions:** {_fmt_int(total_sessions)}  •  "
+        f"**total events:** {_fmt_int(total_events)}",
+    ]
+    if country or asn or as_org:
+        geo_bits: list[str] = []
+        if country:
+            geo_bits.append(f"country: {country}")
+        if asn:
+            geo_bits.append(f"AS{asn}" + (f" ({as_org})" if as_org else ""))
+        lines.append(f"- **Geo:** {' • '.join(geo_bits)}")
+
+    # Per-parser activity
+    lines.append("")
+    lines.append("## Per-parser activity")
+    lines.append("")
+    for r in rows:
+        lines.extend(_render_per_parser_section(r))
+        lines.append("")
+
+    # Top credentials, commands, files, urls, domains, signatures, mitre, ports
+    lines.extend(_render_credentials_table(rows))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_commands_section(rows))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_hashes_json", "Files dropped (sha256)"))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_urls_json", "URLs referenced"))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_domains_json", "Domains referenced"))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_signatures_json", "Suricata signatures"))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_mitre_json", "MITRE techniques"))
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(_render_unique_section(rows, "sample_dst_ports_json", "Destination ports probed"))
+
+    body = "\n".join(lines).rstrip() + "\n"
+
+    # Hard cap. Match the stix/builder.py MAX_NOTE_BODY_BYTES truncation
+    # marker so analysts recognize the pattern.
+    encoded = body.encode("utf-8")
+    if len(encoded) > max_bytes:
+        body = encoded[: max_bytes - 32].decode("utf-8", errors="ignore") + "\n... [truncated]\n"
+    return body
+
+
 __all__ = [
     "MAX_RAW_DOC_BYTES",
     "SIGHTING_DESC_PREVIEW_CAP",
+    "render_attacker_profile_body",
     "render_cowrie_session_note_body",
     "render_cowrie_sighting_description",
     "render_fallback_no_ip_note_body",

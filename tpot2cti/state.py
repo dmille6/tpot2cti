@@ -100,6 +100,60 @@ CREATE TABLE IF NOT EXISTS object_max_state (
 
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
+
+-- Per-attacker rolling aggregates feeding the attacker-profile Notes.
+-- One row per (src_ip, parser, sensor). Updated every cycle that has
+-- activity from this attacker via that parser on that sensor.
+-- See tpot2cti/attacker_profile.py for the consumer + V1_SPEC §6 (the
+-- daily-creds Note has a similar pattern; this is the more-general
+-- multi-parser sibling).
+CREATE TABLE IF NOT EXISTS attacker_activity (
+    src_ip                  TEXT NOT NULL,
+    parser                  TEXT NOT NULL,       -- "Cowrie", "Suricata", etc.
+    sensor                  TEXT NOT NULL,
+    sessions_count          INTEGER NOT NULL DEFAULT 0,
+    events_count            INTEGER NOT NULL DEFAULT 0,
+    auth_success_count      INTEGER NOT NULL DEFAULT 0,
+    credentials_count       INTEGER NOT NULL DEFAULT 0,
+    commands_count          INTEGER NOT NULL DEFAULT 0,
+    malware_drop_count      INTEGER NOT NULL DEFAULT 0,
+    first_seen              TEXT NOT NULL,
+    last_seen               TEXT NOT NULL,
+    sample_credentials_json TEXT,                -- top-N (user,pass,count) JSON list
+    sample_commands_json    TEXT,                -- top-N (command,count) JSON list
+    sample_hashes_json      TEXT,                -- malware sha256 JSON list
+    sample_urls_json        TEXT,                -- URLs JSON list
+    sample_domains_json     TEXT,                -- Domains JSON list
+    sample_signatures_json  TEXT,                -- Suricata sig names JSON list
+    sample_mitre_json       TEXT,                -- MITRE technique ids JSON list
+    sample_dst_ports_json   TEXT,                -- Honeytrap dst_ports JSON list
+    geoip_country           TEXT,
+    geoip_asn               INTEGER,
+    geoip_as_org            TEXT,
+    hassh                   TEXT,                -- if known (Cowrie)
+    ssh_version             TEXT,                -- if known (Cowrie)
+    PRIMARY KEY (src_ip, parser, sensor)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attacker_activity_src_ip
+    ON attacker_activity(src_ip);
+CREATE INDEX IF NOT EXISTS idx_attacker_activity_last_seen
+    ON attacker_activity(last_seen);
+
+-- Tracks the per-cadence emission point for attacker-profile Notes, so
+-- the per-cycle emitter can skip IPs that haven't accumulated new activity
+-- since the last emission. Idempotent UUID5 keeps OpenCTI from creating
+-- duplicates regardless, but this saves bundle bytes.
+CREATE TABLE IF NOT EXISTS attacker_profile_emit_log (
+    src_ip         TEXT NOT NULL,
+    cadence        TEXT NOT NULL,                -- "live" / "daily" / "weekly"
+    last_seen_seen TEXT NOT NULL,                -- the activity row's last_seen at emit time
+    emitted_at     TEXT NOT NULL,
+    PRIMARY KEY (src_ip, cadence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attacker_profile_emit_log_emitted_at
+    ON attacker_profile_emit_log(emitted_at);
 """
 
 
@@ -404,6 +458,391 @@ class CycleState:
                 rows,
             )
 
+    # ----------------------------------------------------------------------
+    # Attacker-profile rolling aggregates (see tpot2cti/attacker_profile.py).
+    # ----------------------------------------------------------------------
+
+    # Cap on each "sample_*_json" array length. Per the spec hard rules:
+    # "Cap sample-list growth to 25 entries each by sorting by frequency
+    # in the merge and trimming." Bigger lists become "and N more" markers
+    # in the rendered Note body.
+    _ATTACKER_SAMPLE_CAP = 25
+
+    @staticmethod
+    def _decode_json_list(blob: Optional[str]) -> list:
+        import json
+        if not blob:
+            return []
+        try:
+            v = json.loads(blob)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    @classmethod
+    def _merge_counted_pairs(
+        cls, existing: list, additions: list
+    ) -> list:
+        """Merge two lists of [key, count] (or [user, pass, count]) entries.
+
+        Keys are matched by everything-except-the-trailing-count. Counts
+        are summed. The result is sorted by count descending and trimmed
+        to ``_ATTACKER_SAMPLE_CAP`` items. ``additions`` entries may be
+        bare keys (no count) — in which case they contribute 1.
+        """
+        bucket: dict[tuple, int] = {}
+
+        def _split(entry):
+            if isinstance(entry, list) and entry and isinstance(entry[-1], int):
+                return tuple(entry[:-1]), int(entry[-1])
+            if isinstance(entry, list):
+                return tuple(entry), 1
+            return (str(entry),), 1
+
+        for e in (existing or []):
+            k, c = _split(e)
+            bucket[k] = bucket.get(k, 0) + c
+        for e in (additions or []):
+            k, c = _split(e)
+            bucket[k] = bucket.get(k, 0) + c
+
+        items = sorted(bucket.items(), key=lambda kv: (-kv[1], kv[0]))
+        items = items[:cls._ATTACKER_SAMPLE_CAP]
+        # Re-encode as [key_parts..., count]
+        return [list(k) + [c] for k, c in items]
+
+    @classmethod
+    def _merge_unique_list(
+        cls, existing: list, additions: list
+    ) -> list:
+        """Union two flat lists, preserving order, capped at the sample cap."""
+        out: list = []
+        seen: set = set()
+        for v in (existing or []) + list(additions or []):
+            if v is None:
+                continue
+            key = v if isinstance(v, (str, int, float, bool)) else json_dumps_stable(v)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(v)
+            if len(out) >= cls._ATTACKER_SAMPLE_CAP:
+                break
+        return out
+
+    def upsert_attacker_activity(self, session) -> None:
+        """Merge one session's activity signals into the per-(ip, parser,
+        sensor) row of ``attacker_activity``.
+
+        Increments the counters, merges the sample collections (union /
+        frequency-merged, both capped at ``_ATTACKER_SAMPLE_CAP``), and
+        updates first_seen (min) / last_seen (max). Pulls geo / fingerprint
+        fields off the first event when available.
+
+        Called from ``main.run_cycle`` for every session in the cycle
+        (see ``attacker_profile.update_activity_from_session`` which
+        wraps this).
+        """
+        import json
+        from datetime import datetime as _dt, timezone as _tz
+
+        src_ip = getattr(session, "src_ip", None)
+        parser_name = getattr(session, "event_type", None) or "Unknown"
+        sensor = getattr(session, "sensor_hostname", None) or "unknown"
+        if not src_ip:
+            return
+
+        first_seen = session.first_seen.isoformat()
+        last_seen = session.last_seen.isoformat()
+
+        # Pull session counters
+        auth_success_inc = 1 if getattr(session, "auth_success", False) else 0
+        creds_list = list(getattr(session, "credentials_tried", []) or [])
+        cmds_list = list(getattr(session, "commands", []) or [])
+        hashes_list = list(getattr(session, "malware_hashes", []) or [])
+        urls_list = list(getattr(session, "urls", []) or [])
+        domains_list = list(getattr(session, "domains", []) or [])
+
+        # Parser-specific extras from session.meta + first event
+        meta = getattr(session, "meta", {}) or {}
+        signatures_add: list = []
+        if sig := meta.get("signature"):
+            signatures_add.append(str(sig))
+        mitre_add: list = list(meta.get("mitre_techniques") or [])
+        dst_ports_add: list = sorted(int(p) for p in (getattr(session, "dst_ports", set()) or set()) if p is not None)
+
+        # Geo + fingerprints from the first event (parsers populate these
+        # consistently per BaseParser._populate_geoip).
+        first_event = (getattr(session, "events", []) or [None])[0]
+        geo_country = getattr(first_event, "src_country_code", None) if first_event else None
+        geo_asn = getattr(first_event, "src_asn", None) if first_event else None
+        geo_as_org = getattr(first_event, "src_as_org", None) if first_event else None
+        hassh_val = getattr(session, "hassh", None)
+        ssh_ver_val = getattr(session, "ssh_version", None)
+
+        # Render credential / command additions as count-bearing entries.
+        # credentials: [[user, pass, count], ...] ; commands: [[cmd, count], ...]
+        creds_add: list = []
+        creds_bucket: dict[tuple, int] = {}
+        for u, p in creds_list:
+            key = (str(u), str(p))
+            creds_bucket[key] = creds_bucket.get(key, 0) + 1
+        for (u, p), c in creds_bucket.items():
+            creds_add.append([u, p, c])
+
+        cmds_add: list = []
+        cmd_bucket: dict[str, int] = {}
+        for cmd in cmds_list:
+            cs = str(cmd)
+            cmd_bucket[cs] = cmd_bucket.get(cs, 0) + 1
+        for cs, c in cmd_bucket.items():
+            cmds_add.append([cs, c])
+
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT sessions_count, events_count, auth_success_count, "
+                "credentials_count, commands_count, malware_drop_count, "
+                "first_seen, last_seen, sample_credentials_json, "
+                "sample_commands_json, sample_hashes_json, sample_urls_json, "
+                "sample_domains_json, sample_signatures_json, "
+                "sample_mitre_json, sample_dst_ports_json, "
+                "geoip_country, geoip_asn, geoip_as_org, hassh, ssh_version "
+                "FROM attacker_activity WHERE src_ip = ? AND parser = ? AND sensor = ?",
+                (src_ip, parser_name, sensor),
+            ).fetchone()
+
+            if row is None:
+                merged_creds = self._merge_counted_pairs([], creds_add)
+                merged_cmds = self._merge_counted_pairs([], cmds_add)
+                merged_hashes = self._merge_unique_list([], hashes_list)
+                merged_urls = self._merge_unique_list([], urls_list)
+                merged_domains = self._merge_unique_list([], domains_list)
+                merged_sigs = self._merge_unique_list([], signatures_add)
+                merged_mitre = self._merge_unique_list([], mitre_add)
+                merged_ports = self._merge_unique_list([], dst_ports_add)
+                c.execute(
+                    "INSERT INTO attacker_activity ("
+                    "src_ip, parser, sensor, sessions_count, events_count, "
+                    "auth_success_count, credentials_count, commands_count, "
+                    "malware_drop_count, first_seen, last_seen, "
+                    "sample_credentials_json, sample_commands_json, "
+                    "sample_hashes_json, sample_urls_json, sample_domains_json, "
+                    "sample_signatures_json, sample_mitre_json, "
+                    "sample_dst_ports_json, geoip_country, geoip_asn, "
+                    "geoip_as_org, hassh, ssh_version"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        src_ip, parser_name, sensor,
+                        1,
+                        int(getattr(session, "event_count", len(getattr(session, "events", []) or []))),
+                        auth_success_inc,
+                        len(creds_list),
+                        len(cmds_list),
+                        len(hashes_list),
+                        first_seen, last_seen,
+                        json.dumps(merged_creds),
+                        json.dumps(merged_cmds),
+                        json.dumps(merged_hashes),
+                        json.dumps(merged_urls),
+                        json.dumps(merged_domains),
+                        json.dumps(merged_sigs),
+                        json.dumps(merged_mitre),
+                        json.dumps(merged_ports),
+                        geo_country,
+                        int(geo_asn) if geo_asn is not None else None,
+                        geo_as_org,
+                        hassh_val,
+                        ssh_ver_val,
+                    ),
+                )
+                return
+
+            (
+                sessions_count, events_count, auth_success_count,
+                credentials_count, commands_count, malware_drop_count,
+                old_first_seen, old_last_seen, old_creds, old_cmds,
+                old_hashes, old_urls, old_domains, old_sigs, old_mitre,
+                old_ports, old_country, old_asn, old_as_org,
+                old_hassh, old_ssh_ver,
+            ) = row
+
+            merged_creds = self._merge_counted_pairs(
+                self._decode_json_list(old_creds), creds_add,
+            )
+            merged_cmds = self._merge_counted_pairs(
+                self._decode_json_list(old_cmds), cmds_add,
+            )
+            merged_hashes = self._merge_unique_list(
+                self._decode_json_list(old_hashes), hashes_list,
+            )
+            merged_urls = self._merge_unique_list(
+                self._decode_json_list(old_urls), urls_list,
+            )
+            merged_domains = self._merge_unique_list(
+                self._decode_json_list(old_domains), domains_list,
+            )
+            merged_sigs = self._merge_unique_list(
+                self._decode_json_list(old_sigs), signatures_add,
+            )
+            merged_mitre = self._merge_unique_list(
+                self._decode_json_list(old_mitre), mitre_add,
+            )
+            merged_ports = self._merge_unique_list(
+                self._decode_json_list(old_ports), dst_ports_add,
+            )
+
+            new_first = old_first_seen if old_first_seen <= first_seen else first_seen
+            new_last = old_last_seen if old_last_seen >= last_seen else last_seen
+
+            c.execute(
+                "UPDATE attacker_activity SET "
+                "sessions_count = ?, events_count = ?, auth_success_count = ?, "
+                "credentials_count = ?, commands_count = ?, malware_drop_count = ?, "
+                "first_seen = ?, last_seen = ?, "
+                "sample_credentials_json = ?, sample_commands_json = ?, "
+                "sample_hashes_json = ?, sample_urls_json = ?, sample_domains_json = ?, "
+                "sample_signatures_json = ?, sample_mitre_json = ?, "
+                "sample_dst_ports_json = ?, geoip_country = ?, geoip_asn = ?, "
+                "geoip_as_org = ?, hassh = ?, ssh_version = ? "
+                "WHERE src_ip = ? AND parser = ? AND sensor = ?",
+                (
+                    sessions_count + 1,
+                    events_count + int(getattr(session, "event_count", len(getattr(session, "events", []) or []))),
+                    auth_success_count + auth_success_inc,
+                    credentials_count + len(creds_list),
+                    commands_count + len(cmds_list),
+                    malware_drop_count + len(hashes_list),
+                    new_first, new_last,
+                    json.dumps(merged_creds),
+                    json.dumps(merged_cmds),
+                    json.dumps(merged_hashes),
+                    json.dumps(merged_urls),
+                    json.dumps(merged_domains),
+                    json.dumps(merged_sigs),
+                    json.dumps(merged_mitre),
+                    json.dumps(merged_ports),
+                    geo_country or old_country,
+                    int(geo_asn) if geo_asn is not None else old_asn,
+                    geo_as_org or old_as_org,
+                    hassh_val or old_hassh,
+                    ssh_ver_val or old_ssh_ver,
+                    src_ip, parser_name, sensor,
+                ),
+            )
+
+    @staticmethod
+    def _row_to_attacker_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        # Decode the JSON columns into Python lists for callers.
+        for k in (
+            "sample_credentials_json", "sample_commands_json",
+            "sample_hashes_json", "sample_urls_json",
+            "sample_domains_json", "sample_signatures_json",
+            "sample_mitre_json", "sample_dst_ports_json",
+        ):
+            try:
+                import json
+                d[k] = json.loads(d.get(k) or "[]")
+            except Exception:
+                d[k] = []
+        return d
+
+    def get_attacker_activity(self, src_ip: str) -> list[dict]:
+        """Return all per-(parser, sensor) rows for one attacker IP.
+
+        Used by the profile renderer to aggregate across parsers and
+        sensors. Empty list when the IP is unknown.
+        """
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            rows = c.execute(
+                "SELECT * FROM attacker_activity WHERE src_ip = ? "
+                "ORDER BY parser, sensor",
+                (src_ip,),
+            ).fetchall()
+        return [self._row_to_attacker_dict(r) for r in rows]
+
+    def get_attacker_activity_window(
+        self, start_iso: str, end_iso: str
+    ) -> dict[str, list[dict]]:
+        """Return ``{src_ip: [rows]}`` for every IP with activity in
+        ``[start_iso, end_iso]``.
+
+        The window predicate is ``last_seen >= start AND first_seen <= end``,
+        i.e. the IP had at least one row whose lifespan overlapped the
+        window. Used by the daily/weekly aggregators in attacker_profile.
+        """
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            rows = c.execute(
+                "SELECT * FROM attacker_activity "
+                "WHERE last_seen >= ? AND first_seen <= ? "
+                "ORDER BY src_ip, parser, sensor",
+                (start_iso, end_iso),
+            ).fetchall()
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            d = self._row_to_attacker_dict(r)
+            out.setdefault(d["src_ip"], []).append(d)
+        return out
+
+    def get_active_attackers_since(self, since_iso: str) -> list[str]:
+        """Return the distinct src_ip set with activity since ``since_iso``.
+
+        Used by the per-cycle attacker-profile emitter to find which IPs
+        warrant a live-profile refresh this cycle.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT src_ip FROM attacker_activity "
+                "WHERE last_seen >= ? ORDER BY src_ip",
+                (since_iso,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def record_attacker_profile_emitted(
+        self, src_ip: str, cadence: str, last_seen_seen: str
+    ) -> None:
+        """Record that we emitted an attacker-profile Note for this IP /
+        cadence with the given activity ``last_seen`` value.
+
+        Subsequent emissions of the same cadence can compare against this
+        to skip IPs that haven't accumulated new activity.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO attacker_profile_emit_log "
+                "(src_ip, cadence, last_seen_seen, emitted_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(src_ip, cadence) DO UPDATE SET "
+                "last_seen_seen = excluded.last_seen_seen, "
+                "emitted_at = excluded.emitted_at",
+                (src_ip, cadence, last_seen_seen, now),
+            )
+
+    def get_last_attacker_profile_emit(
+        self, src_ip: str, cadence: str
+    ) -> Optional[str]:
+        """Return the last-emitted ``last_seen_seen`` for (IP, cadence),
+        or None if we've never emitted this combination.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT last_seen_seen FROM attacker_profile_emit_log "
+                "WHERE src_ip = ? AND cadence = ?",
+                (src_ip, cadence),
+            ).fetchone()
+        return row[0] if row else None
+
+
+def json_dumps_stable(v) -> str:
+    """Stable JSON serialization for use as a dict-set key."""
+    import json
+    try:
+        return json.dumps(v, sort_keys=True, default=str)
+    except Exception:
+        return repr(v)
+
 
 if __name__ == "__main__":
     import tempfile
@@ -482,6 +921,115 @@ if __name__ == "__main__":
         # newest first — should include the failed row
         assert any(r["success"] == 0 for r in rows), "failure row not recorded"
         print("OK: record_cycle_failure stamps state + cycle_log row")
+
+        # ── attacker_activity smoke ──
+        # Build minimal session-like stub. We avoid importing AttackSession
+        # here to keep the state module dependency-free of parsers.
+        from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td3
+
+        class _SS:
+            def __init__(self, src_ip, parser, sensor, first, last,
+                         events_n=1, auth=False, creds=None, cmds=None,
+                         hashes=None, urls=None, domains=None,
+                         country="US", asn=64500, as_org="ExampleNet",
+                         hassh=None, ssh_version=None, dst_ports=None,
+                         signature=None, mitre=None):
+                self.src_ip = src_ip
+                self.event_type = parser
+                self.sensor_hostname = sensor
+                self.first_seen = first
+                self.last_seen = last
+                self.event_count = events_n
+                self.auth_success = auth
+                self.credentials_tried = creds or []
+                self.commands = cmds or []
+                self.malware_hashes = hashes or []
+                self.urls = urls or []
+                self.domains = domains or []
+                self.hassh = hassh
+                self.ssh_version = ssh_version
+                self.dst_ports = set(dst_ports or [])
+                self.meta = {}
+                if signature:
+                    self.meta["signature"] = signature
+                if mitre:
+                    self.meta["mitre_techniques"] = list(mitre)
+                # Fake event[0] with geo fields
+                class _E:
+                    src_country_code = country
+                    src_asn = asn
+                    src_as_org = as_org
+                self.events = [_E()]
+
+        t0 = _dt2.now(_tz2.utc) - _td3(hours=2)
+        t1 = t0 + _td3(minutes=10)
+        t2 = t0 + _td3(minutes=30)
+
+        # First session — Cowrie, with creds + commands.
+        s.upsert_attacker_activity(_SS(
+            "203.0.113.7", "Cowrie", "tpot01", t0, t1, events_n=5,
+            auth=True, creds=[("root", "root"), ("admin", "admin")],
+            cmds=["uname -a", "cat /etc/passwd"],
+            hashes=["a" * 64], urls=["http://evil/x.sh"], domains=["evil"],
+            hassh="hassh1", ssh_version="SSH-2.0-Foo", dst_ports=[22],
+        ))
+        # Second session same IP / parser / sensor — incremental merge.
+        s.upsert_attacker_activity(_SS(
+            "203.0.113.7", "Cowrie", "tpot01", t1, t2, events_n=3,
+            auth=False, creds=[("root", "root"), ("oracle", "oracle")],
+            cmds=["uname -a"], hassh="hassh1", dst_ports=[22],
+        ))
+        # Third session different parser, same IP.
+        s.upsert_attacker_activity(_SS(
+            "203.0.113.7", "Suricata", "tpot01", t1, t2, events_n=1,
+            signature="ET SCAN Nmap", mitre=["T1046"],
+        ))
+        # Different IP, just to verify isolation.
+        s.upsert_attacker_activity(_SS(
+            "198.51.100.9", "Honeytrap", "tpot01", t0, t1, events_n=1,
+            dst_ports=[23, 2323],
+        ))
+
+        rows = s.get_attacker_activity("203.0.113.7")
+        assert len(rows) == 2, f"expected 2 parser/sensor rows, got {len(rows)}"
+        cowrie_row = next(r for r in rows if r["parser"] == "Cowrie")
+        assert cowrie_row["sessions_count"] == 2
+        assert cowrie_row["events_count"] == 8
+        assert cowrie_row["auth_success_count"] == 1
+        assert cowrie_row["credentials_count"] == 4
+        assert cowrie_row["commands_count"] == 3
+        # ("root","root") seen twice, ("admin","admin") once, ("oracle","oracle") once
+        creds = cowrie_row["sample_credentials_json"]
+        # First entry is the most frequent
+        assert creds[0][:2] == ["root", "root"] and creds[0][2] == 2, creds
+        assert any(e[:2] == ["admin", "admin"] for e in creds), creds
+        cmds = cowrie_row["sample_commands_json"]
+        assert cmds[0] == ["uname -a", 2], cmds
+        assert cowrie_row["geoip_country"] == "US"
+        assert cowrie_row["hassh"] == "hassh1"
+        print(f"OK: attacker_activity rows merged: cowrie sessions={cowrie_row['sessions_count']} "
+              f"events={cowrie_row['events_count']} creds_sample={creds[:2]}")
+
+        # Window query
+        window_start = (t0 - _td3(minutes=1)).isoformat()
+        window_end = (t2 + _td3(minutes=1)).isoformat()
+        win = s.get_attacker_activity_window(window_start, window_end)
+        assert "203.0.113.7" in win and "198.51.100.9" in win, list(win.keys())
+        print(f"OK: window query returned {len(win)} attacker IP(s)")
+
+        # active_since
+        active = s.get_active_attackers_since((t0 - _td3(seconds=1)).isoformat())
+        assert "203.0.113.7" in active and "198.51.100.9" in active
+        print(f"OK: get_active_attackers_since → {sorted(active)}")
+
+        # emit log idempotency
+        ls = cowrie_row["last_seen"]
+        assert s.get_last_attacker_profile_emit("203.0.113.7", "live") is None
+        s.record_attacker_profile_emitted("203.0.113.7", "live", ls)
+        assert s.get_last_attacker_profile_emit("203.0.113.7", "live") == ls
+        # second call updates rather than duplicates
+        s.record_attacker_profile_emitted("203.0.113.7", "live", ls)
+        print("OK: attacker_profile_emit_log records + upserts")
 
         print("\nSmoke test passed.")
     finally:

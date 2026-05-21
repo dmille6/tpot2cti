@@ -1065,53 +1065,13 @@ class STIXBuilder:
             if sighting:
                 out.append(sighting)
 
-        # Session-transcript Note — ONE per Cowrie SSH session, containing
-        # the full command transcript + auth + credentials + HASSH + SSH
-        # version + malware hashes + URLs. This is the carve-out from
-        # LESSONS_LEARNED §7.1: per-session Notes are an anti-pattern in
-        # general, but a Cowrie SSH login session is genuinely-per-session
-        # content (commands the attacker actually ran) and is what an
-        # analyst expects to find on the indicator's page.
-        note_body = render_cowrie_session_note_body(session)
-        if note_body:
-            note_object_refs: list[str] = [ipv4_id]
-            if ip_ind:
-                note_object_refs.append(ip_ind["id"])
-            # Include the Process so OpenCTI's "Notes about this entity"
-            # surfaces the transcript on the Process detail page too —
-            # per the live cycle-16 review (Process pages were showing
-            # zero Notes because the Note's object_refs didn't include
-            # them).
-            if process_id:
-                note_object_refs.append(process_id)
-            note = self.build_session_note(
-                session,
-                body_md=note_body,
-                abstract=(
-                    f"Cowrie SSH session from {session.src_ip} "
-                    f"({len(session.commands)} command(s)"
-                    + (", auth success" if session.auth_success else "")
-                    + ")"
-                ),
-                object_refs=note_object_refs,
-            )
-            if note:
-                out.append(note)
-                if ip_ind:
-                    if rel := self.build_relationship(
-                        note["id"], "related-to", ip_ind["id"],
-                        description=f"Cowrie session transcript for {session.src_ip}",
-                    ):
-                        out.append(rel)
-                # Also link Note → Process so OpenCTI's graph view draws
-                # the edge from the Process side (object_refs alone
-                # doesn't surface in the relationship browser).
-                if process_id:
-                    if rel := self.build_relationship(
-                        note["id"], "related-to", process_id,
-                        description=f"Cowrie session transcript for process {process_id[:24]}…",
-                    ):
-                        out.append(rel)
+        # Per-session Notes replaced by attacker-profile Notes emitted from
+        # main.run_cycle (see tpot2cti/attacker_profile.py); per-session
+        # command transcripts are preserved in the Process SDO's
+        # command_line field. Per PoC LESSONS §7.1 + the 2026-05-21 user
+        # decision: ONE rolling Note per attacker IP scales; 50 per-session
+        # Notes per attacker do not.
+        _ = process_id  # referenced above; kept for future per-session links
 
         return out
 
