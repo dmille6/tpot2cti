@@ -6,10 +6,13 @@
 
 FROM python:3.12-slim AS base
 
-# Non-root user (uid 1101). Distinct from the credentials sidecar so the
-# two services' file ownership in `data/` is easy to tell apart.
-ARG APP_UID=1101
-ARG APP_GID=1101
+# Non-root user. uid 1000 matches the host owner of the bind-mounted
+# ssh-keys/ directory (the vault makes its own direct SFTP connection to
+# T-Pot per V1_SPEC §8.2 and needs to read id_ed25519 at mode 600 without
+# forcing host-side chmod 644). Containers are isolated so sharing a uid
+# with the core importer is fine — they only share read-only mounts.
+ARG APP_UID=1000
+ARG APP_GID=1000
 RUN groupadd -g ${APP_GID} app && \
     useradd -u ${APP_UID} -g ${APP_GID} -M -s /usr/sbin/nologin app
 
