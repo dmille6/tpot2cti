@@ -788,9 +788,17 @@ start_tpot2cti() {
     done
     ok "Pre-created bind-mount dirs as $(id -un) (uid $(id -u))"
 
+    # Build-time git SHA — baked into the image via Dockerfile ARG so
+    # the startup banner can identify which build is running. Best-
+    # effort: if not in a git checkout, fall through to "unknown".
+    local _git_sha
+    _git_sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    ok "Building tpot2cti image with TPOT2CTI_GIT_SHA=${_git_sha:0:12}"
+
     (
         cd "$SCRIPT_DIR"
-        docker compose --env-file ./.env -p "$TPOT2CTI_PROJECT" up -d --build >&2
+        TPOT2CTI_GIT_SHA="$_git_sha" \
+            docker compose --env-file ./.env -p "$TPOT2CTI_PROJECT" up -d --build >&2
     )
 
     info "Polling for tpot2cti containers to come up (max 120s)"
