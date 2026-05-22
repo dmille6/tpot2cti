@@ -231,8 +231,20 @@ def generate_ip_indicator_id(ip: str) -> str:
     return sdo_id("indicator", "indicator", "ip", ip)
 
 
-def generate_sighting_id(sensor: str, session_id: str) -> str:
-    """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>``."""
+def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") -> str:
+    """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>[:<discriminator>]``.
+
+    The optional ``discriminator`` lets callers mint a second distinct
+    Sighting ID for the same (sensor, session) pair — used by the dual-
+    sighting pattern where one Sighting targets the IP Indicator (SDO)
+    and a second targets the IPv4-Addr observable (SCO) so OpenCTI's
+    "Sightings" tab populates on BOTH the Indicator page and the
+    Observable page.  Empty discriminator (the default) preserves the
+    pre-existing Indicator-side ID family so cross-cycle re-emission
+    updates the same Sighting count, not orphan a new one.
+    """
+    if discriminator:
+        return sdo_id("sighting", "sighting", sensor, session_id, discriminator)
     return sdo_id("sighting", "sighting", sensor, session_id)
 
 
