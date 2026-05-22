@@ -120,6 +120,14 @@ def _build_aggregation_query(
 
     Sensor filter uses `t-pot_hostname` (T-Pot's canonical sensor field
     per V1_SPEC.md Appendix A).
+
+    Field-name discipline (V1_SPEC + LESSONS): T-Pot's logstash mappings
+    declare ``src_ip``, ``username``, ``password``, ``type``, and
+    ``t-pot_hostname`` as ``text`` with a ``keyword`` sub-field and
+    ``fielddata: false``.  Aggregating or running ``term`` queries on
+    the analyzed text path fails server-side (``Fielddata is disabled``).
+    The :code:`.keyword` suffix routes through the non-analyzed sub-field
+    and is the same fix shape applied to ``type.keyword`` in task #50.
     """
     return {
         "size": 0,
@@ -135,8 +143,8 @@ def _build_aggregation_query(
                             }
                         }
                     },
-                    {"terms": {"type": list(credential_types)}},
-                    {"term": {"t-pot_hostname": sensor}},
+                    {"terms": {"type.keyword": list(credential_types)}},
+                    {"term": {"t-pot_hostname.keyword": sensor}},
                 ],
                 # Drop docs that didn't carry creds (e.g. Cowrie connect
                 # events without a login attempt) — they'd produce empty
@@ -148,20 +156,21 @@ def _build_aggregation_query(
             }
         },
         "aggs": {
-            "unique_src_ips": {"cardinality": {"field": "src_ip"}},
+            "unique_src_ips": {"cardinality": {"field": "src_ip.keyword"}},
             # Cardinality of (user, pass) tuples via a runtime script_field
             # would be heavier; instead approximate via the bucket count of
             # the same composite agg, but bounded — close enough for the
             # "unique_pairs" headline number.  We ask ES for a cheap
-            # cardinality on a runtime concat.
+            # cardinality on a runtime concat.  Script reads .keyword
+            # because doc-values aren't loaded for the analyzed text path.
             "unique_pairs": {
                 "cardinality": {
                     "script": {
                         "source": (
-                            "if (doc['username'].size() > 0 && "
-                            "doc['password'].size() > 0) "
-                            "return doc['username'].value + '\\u0000' + "
-                            "doc['password'].value; return null;"
+                            "if (doc['username.keyword'].size() > 0 && "
+                            "doc['password.keyword'].size() > 0) "
+                            "return doc['username.keyword'].value + '\\u0000' + "
+                            "doc['password.keyword'].value; return null;"
                         )
                     }
                 }
@@ -169,15 +178,15 @@ def _build_aggregation_query(
             "top_creds": {
                 "multi_terms": {
                     "terms": [
-                        {"field": "username"},
-                        {"field": "password"},
+                        {"field": "username.keyword"},
+                        {"field": "password.keyword"},
                     ],
                     "size": top_n,
                     "order": {"_count": "desc"},
                 },
                 "aggs": {
                     "unique_srcs": {
-                        "cardinality": {"field": "src_ip"}
+                        "cardinality": {"field": "src_ip.keyword"}
                     }
                 },
             },
@@ -456,16 +465,15 @@ def maybe_emit_pending(
     Relationships) renders the edge.
     """
     if lookback_days is None:
-        # Read TPOT2CTI_CREDS_LOOKBACK_DAYS via the state passthrough.
-        # We don't extend config.py for one env var that's purely a
-        # daily_creds concern — keep the blast radius small.
-        import os
-        try:
-            lookback_days = int(os.environ.get(
-                "TPOT2CTI_CREDS_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS
-            ))
-        except ValueError:
-            lookback_days = DEFAULT_LOOKBACK_DAYS
+        # Per 2026-05-22 audit #4: read from cfg.runtime, not os.environ.
+        # Falls back to the module default when cfg lacks a runtime block
+        # (e.g. older test harness building a partial Config by hand).
+        runtime = getattr(cfg, "runtime", None)
+        lookback_days = (
+            getattr(runtime, "daily_creds_lookback_days", DEFAULT_LOOKBACK_DAYS)
+            if runtime is not None
+            else DEFAULT_LOOKBACK_DAYS
+        )
 
     sensor_list: list[str] = list(sensors) if sensors is not None else discover_sensors(state, cfg)
     if not sensor_list:
@@ -595,7 +603,7 @@ if __name__ == "__main__":
     # ---- Stub config with the minimum the builder needs ----
     from tpot2cti.config import (
         Config, TPotConfig, ESConfig, OpenCTIConfig, OperatorConfig,
-        CycleConfig, ConnectorIDs, LoggingConfig,
+        CycleConfig, ConnectorIDs, LoggingConfig, RuntimeConfig,
     )
     cfg = Config(
         tpot=TPotConfig(host="tpot.example"),
@@ -605,6 +613,7 @@ if __name__ == "__main__":
         cycle=CycleConfig(),
         connector_ids=ConnectorIDs(core="00000000-0000-0000-0000-000000000001"),
         logging=LoggingConfig(),
+        runtime=RuntimeConfig(),
     )
     builder = STIXBuilder(cfg)
 
@@ -691,12 +700,12 @@ if __name__ == "__main__":
         # Verify the ES body filtered to the right sensor + day window
         assert StubES.last_body is not None
         q = StubES.last_body["query"]["bool"]["must"]
-        sensor_term = [c for c in q if "term" in c and "t-pot_hostname" in c["term"]]
-        assert sensor_term, "agg query missing sensor filter"
-        assert sensor_term[0]["term"]["t-pot_hostname"] == "tpot01"
-        types_term = [c for c in q if "terms" in c and "type" in c["terms"]]
-        assert types_term, "agg query missing type filter"
-        assert "Cowrie" in types_term[0]["terms"]["type"]
+        sensor_term = [c for c in q if "term" in c and "t-pot_hostname.keyword" in c["term"]]
+        assert sensor_term, "agg query missing sensor filter (.keyword sub-field)"
+        assert sensor_term[0]["term"]["t-pot_hostname.keyword"] == "tpot01"
+        types_term = [c for c in q if "terms" in c and "type.keyword" in c["terms"]]
+        assert types_term, "agg query missing type filter (.keyword sub-field)"
+        assert "Cowrie" in types_term[0]["terms"]["type.keyword"]
         print("OK: ES aggregation query has sensor + type filters")
 
         # Now record one pair as emitted; second call should produce 1 less.

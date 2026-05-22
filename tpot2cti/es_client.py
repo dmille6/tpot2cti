@@ -107,11 +107,25 @@ class TpotESClient:
         if username is not None and password is not None:
             basic_auth = (username, password)
 
+        # Per 2026-05-22 audit #9: idle SSH tunnel between cycles half-
+        # closes the TCP socket; the next ``search`` raises
+        # ``ConnectionResetError``.  Two mitigations layered:
+        #
+        #   1. ``retry_on_timeout=True`` + ``max_retries=2`` — the library
+        #      itself retries on connection errors before raising, which
+        #      handles the 80% case (one transient socket).
+        #
+        #   2. The application-level ``_search_with_retry`` wrapper catches
+        #      whatever escapes (1) and retries once more with a 2-second
+        #      backoff.  Combined, a 15-minute idle gap produces at worst
+        #      one warning line, not a cycle failure.
         self._es = Elasticsearch(
             hosts=[{"host": host, "port": port, "scheme": scheme}],
             basic_auth=basic_auth,
             verify_certs=verify_certs,
             request_timeout=request_timeout,
+            retry_on_timeout=True,
+            max_retries=2,
             # `ssl_show_warn=False` quiets the urllib3 warning when
             # `verify_certs=False`. Not a security choice — the SSH
             # tunnel is what we trust.
@@ -377,17 +391,36 @@ class TpotESClient:
             total,
         )
 
+    #: Exception types treated as transient and worth retrying once.
+    #: Per 2026-05-22 audit #5: pre-patch we caught only ``ConnectionTimeout``,
+    #: but the live cycle 22 ES stream died on ``ConnectionResetError`` →
+    #: ``elasticsearch.ConnectionError`` raised by the SSH tunnel idling
+    #: between cycles.  We now also retry the broader connection / transport
+    #: errors (urllib3 reset, half-open socket from the keepalive gap, etc.),
+    #: each with one short backoff before the second attempt.
+    _RETRYABLE_EXC = (ConnectionTimeout, ESConnectionError, TransportError)
+
     def _search_with_retry(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """`search` with the §7 retry-once-on-timeout policy."""
+        """`search` with a one-shot retry-on-transient-error policy.
+
+        Per V1_SPEC §7: a single retry is enough to clear the typical
+        flake (idle tunnel reset, brief ES GC pause).  More aggressive
+        retries belong upstream in the elasticsearch library's own
+        ``retry_on_timeout`` config, which we set in ``__init__``.
+        """
+        import time as _time
         try:
             return self._es.search(**kwargs).body
-        except ConnectionTimeout as exc:
+        except self._RETRYABLE_EXC as exc:
             logger.warning(
-                "ES search timed out, retrying once (index=%s, size=%s): %s",
+                "ES search transient failure (%s); retrying once after 2s "
+                "(index=%s, size=%s): %s",
+                type(exc).__name__,
                 kwargs.get("index"),
                 kwargs.get("size"),
                 exc,
             )
+            _time.sleep(2.0)
             return self._es.search(**kwargs).body
 
     # ------------------------------------------------------------------ #

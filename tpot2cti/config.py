@@ -119,6 +119,28 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    """Runtime knobs that don't fit a specific subsystem.
+
+    Previously these three were read via ``os.environ`` directly from
+    main.py + daily_creds.py, bypassing the config validation layer.
+    Per the 2026-05-22 audit #4 they live here now so the dataclass is
+    the single source of truth and tests can override them via the
+    ``env_dict`` parameter to :func:`load_config`.
+    """
+    #: SQLite path for ``CycleState``.  Defaults to ``/data/state.db``
+    #: which matches the bind-mount in docker-compose.yml.
+    state_db_path: str = "/data/state.db"
+    #: ``host:port`` for the lightweight health endpoint.  Empty string
+    #: disables the health server entirely.
+    health_bind: str = "0.0.0.0:8080"
+    #: How many calendar days back ``daily_creds.maybe_emit_pending`` will
+    #: look for unsent (sensor, day) pairs.  Larger = more backfill on
+    #: container restart; smaller = more risk of dropping a missed day.
+    daily_creds_lookback_days: int = 7
+
+
+@dataclass(frozen=True)
 class Config:
     """Top-level resolved config — what callers actually use."""
     tpot: TPotConfig
@@ -128,6 +150,7 @@ class Config:
     cycle: CycleConfig
     connector_ids: ConnectorIDs
     logging: LoggingConfig
+    runtime: RuntimeConfig
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +296,13 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         retention_days=_env_int(env, "LOG_RETENTION_DAYS", default=30),
     )
 
+    # --- Runtime (was three direct os.environ reads pre-audit #4) ---
+    runtime_cfg = RuntimeConfig(
+        state_db_path=_env_str(env, "TPOT2CTI_STATE_DB", default="/data/state.db") or "/data/state.db",
+        health_bind=_env_str(env, "TPOT2CTI_HEALTH_BIND", default="0.0.0.0:8080") or "0.0.0.0:8080",
+        daily_creds_lookback_days=_env_int(env, "TPOT2CTI_CREDS_LOOKBACK_DAYS", default=7),
+    )
+
     cfg = Config(
         tpot=tpot,
         es=es,
@@ -281,6 +311,7 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         cycle=cycle,
         connector_ids=connector_ids,
         logging=logging_cfg,
+        runtime=runtime_cfg,
     )
 
     # Defer validation of cycle_anchor_hour_utc range (0-23)

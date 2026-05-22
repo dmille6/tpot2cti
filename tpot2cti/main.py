@@ -563,6 +563,23 @@ def run_cycle(
         duration_seconds=duration_s,
     )
 
+    # State-DB hygiene (per 2026-05-22 audit #2): prune bounded tables
+    # every cycle and run VACUUM monthly. Failure here is non-fatal — we
+    # log and continue so a stuck VACUUM never blocks a cycle.
+    try:
+        prune_counts = state.prune_all()
+        vacuumed = state.maybe_vacuum(min_age_days=30)
+        db_size_mb = state.db_size_bytes() / (1024 * 1024)
+        if any(prune_counts.values()) or vacuumed:
+            logger.info(
+                f"cycle {cycle_id}: state-db hygiene pruned={prune_counts} "
+                f"vacuumed={vacuumed} db_size={db_size_mb:.1f}MB"
+            )
+        summary["db_size_mb"] = round(db_size_mb, 2)
+        summary["prune_counts"] = prune_counts
+    except Exception as e:
+        logger.warning(f"cycle {cycle_id}: state-db hygiene failed (non-fatal): {e}")
+
     # Surface bundle-dedup % per PoC LESSONS §6 + our LESSONS §6:
     # the label-union pass should be cutting ~20-25% before send. If our
     # ratio drops to ~0% it likely means parsers aren't emitting labels
@@ -616,10 +633,7 @@ def main() -> int:
     )
 
     # 3) State + ES + OpenCTI + Publisher.
-    state_db = os.environ.get(
-        "TPOT2CTI_STATE_DB", "/data/state.db"
-    )
-    state = CycleState(db_path=state_db)
+    state = CycleState(db_path=cfg.runtime.state_db_path)
     es = TpotESClient(
         host=cfg.es.host,
         port=cfg.es.port,
@@ -653,10 +667,9 @@ def main() -> int:
     #    healthcheck can probe immediately (it will read 503 until the
     #    first cycle lands, which is correct).
     interval_s = parse_iso_duration_seconds(cfg.cycle.interval_iso, default_seconds=900.0)
-    health_bind = os.environ.get("TPOT2CTI_HEALTH_BIND", "0.0.0.0:8080")
     health = HealthServer(
         state, opencti,
-        bind=health_bind,
+        bind=cfg.runtime.health_bind,
         cycle_interval_seconds=interval_s,
     )
     health.start_in_background()

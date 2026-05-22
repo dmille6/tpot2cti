@@ -101,6 +101,10 @@ CREATE TABLE IF NOT EXISTS object_max_state (
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
 
+-- Indexed for prune_object_max_state's "WHERE updated_at < cutoff" scan.
+CREATE INDEX IF NOT EXISTS idx_object_max_state_updated_at
+    ON object_max_state(updated_at);
+
 -- Per-attacker rolling aggregates feeding the attacker-profile Notes.
 -- One row per (src_ip, parser, sensor). Updated every cycle that has
 -- activity from this attacker via that parser on that sensor.
@@ -372,8 +376,13 @@ class CycleState:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def prune_cycles(self, keep_last: int = 1000) -> int:
-        """Delete cycle_log rows beyond the last N.  Returns rows deleted."""
+    def prune_cycles(self, keep_last: int = 10_000) -> int:
+        """Delete cycle_log rows beyond the last N.  Returns rows deleted.
+
+        Default of 10k rows ≈ 104 days at 15-min cycle. Calling it once
+        per cycle is cheap (SQLite ``DELETE … NOT IN (SELECT … LIMIT N)``
+        on a small indexed table is microseconds).
+        """
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM cycle_log "
@@ -384,6 +393,130 @@ class CycleState:
                 (keep_last,),
             )
             return cur.rowcount
+
+    # ----------------------------------------------------------------------
+    # Pruning — keep the SQLite footprint bounded.
+    #
+    # Per the 2026-05-22 audit: ``attacker_activity``, ``object_max_state``,
+    # and ``attacker_profile_emit_log`` had no pruning at all.  Without
+    # bounds, the DB grows monotonically at honeypot-hive rates (~50k new
+    # IPs/day) and SQLite query time degrades within months.
+    #
+    # Pruning semantics:
+    #   - ``attacker_activity``: drop rows whose last_seen is older than
+    #     ``cutoff_days`` (default 90).  Same attacker reappearing after
+    #     pruning starts fresh — acceptable: they'll get a new "first_seen"
+    #     and a fresh attacker-profile Note cadence.
+    #   - ``attacker_profile_emit_log``: drop rows whose ``emitted_at`` is
+    #     older than ``profile_log_cutoff_days`` (default 100, > activity
+    #     cutoff so the emit gate stays intact for any IP whose activity
+    #     row is still present).
+    #   - ``object_max_state``: drop rows not touched in
+    #     ``max_state_cutoff_days`` (default 180).  Worst case after prune:
+    #     a re-emission of that object UPSERTs without cross-cycle merge;
+    #     publisher will re-establish the row on first re-emit.  6 months
+    #     of inactivity is a strong signal we won't see it again.
+    #   - ``daily_creds_log``: kept indefinitely (one row per
+    #     sensor+day, growth is bounded by sensor count and lookback
+    #     window — tiny).
+    # ----------------------------------------------------------------------
+
+    def prune_attacker_activity(self, cutoff_days: int = 90) -> int:
+        """Drop attacker_activity rows whose last_seen is older than cutoff."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=cutoff_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM attacker_activity WHERE last_seen < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+    def prune_attacker_profile_emit_log(self, cutoff_days: int = 100) -> int:
+        """Drop attacker_profile_emit_log rows older than cutoff (default 100d).
+
+        Cutoff intentionally exceeds ``prune_attacker_activity``'s default
+        so the per-IP emission gate stays present for any IP whose activity
+        row is still present (prevents Note storm on re-emit after activity
+        prune lag).
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=cutoff_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM attacker_profile_emit_log WHERE emitted_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+    def prune_object_max_state(self, cutoff_days: int = 180) -> int:
+        """Drop object_max_state rows not updated in cutoff days (default 180d).
+
+        Idempotent UUID5 means a re-emission re-establishes the row from
+        the current cycle's signal; the worst case is loss of cross-cycle
+        label-union for one cycle if a long-dormant object suddenly
+        reappears.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=cutoff_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM object_max_state WHERE updated_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+    def db_size_bytes(self) -> int:
+        """Return the SQLite file size in bytes (0 if missing).
+
+        Surfaced in cycle log so operators can watch growth / verify
+        that pruning is keeping pace with ingest.
+        """
+        try:
+            return self.db_path.stat().st_size
+        except (FileNotFoundError, OSError):
+            return 0
+
+    def maybe_vacuum(self, min_age_days: int = 30) -> bool:
+        """VACUUM the DB if it hasn't been vacuumed in ``min_age_days``.
+
+        VACUUM rewrites the file in place, reclaiming space freed by
+        DELETEs and defragmenting B-trees.  Cheap on a small DB but
+        holds an exclusive write lock — only do it occasionally.
+        Tracks last run via the ``state`` k/v table.
+        """
+        last = self.get("last_vacuum_at")
+        now = datetime.now(timezone.utc)
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last)
+                if (now - last_dt).total_seconds() < min_age_days * 86400:
+                    return False
+            except ValueError:
+                pass  # corrupted value — vacuum anyway
+        with self._conn() as c:
+            c.execute("VACUUM")
+        self.set("last_vacuum_at", now.isoformat())
+        return True
+
+    def prune_all(
+        self,
+        *,
+        cycles_keep_last: int = 10_000,
+        activity_cutoff_days: int = 90,
+        profile_log_cutoff_days: int = 100,
+        max_state_cutoff_days: int = 180,
+    ) -> dict[str, int]:
+        """Run all per-cycle prune passes.  Returns rows-deleted per table.
+
+        Caller (``main.run_cycle``) invokes this once per cycle.  All four
+        DELETEs together take low-millisecond time on a healthy DB.
+        VACUUM runs separately via :meth:`maybe_vacuum` (heavier — gated
+        by age).
+        """
+        return {
+            "cycles": self.prune_cycles(keep_last=cycles_keep_last),
+            "attacker_activity": self.prune_attacker_activity(cutoff_days=activity_cutoff_days),
+            "profile_emit_log": self.prune_attacker_profile_emit_log(cutoff_days=profile_log_cutoff_days),
+            "object_max_state": self.prune_object_max_state(cutoff_days=max_state_cutoff_days),
+        }
 
     # ----------------------------------------------------------------------
     # Cross-cycle label/score preservation (PoC LESSONS §29 + the
