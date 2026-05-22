@@ -131,7 +131,7 @@ class FallbackParser(BaseParser):
                 or "unknown"
             ),
             event_type=unknown_type,
-            dst_port=self._safe_int(doc.get("dst_port")),
+            dst_port=self._safe_int((doc.get("dest_port") or doc.get("dst_port"))),
             raw_doc=dict(doc),
         )
 

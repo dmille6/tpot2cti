@@ -210,7 +210,7 @@ class H0neytr4pParser(BaseParser):
 
         # h0neytr4p typically lands on 80/443 — but T-Pot occasionally
         # exposes it on alt ports, so we trust the doc.
-        dst_port = self._safe_int(doc.get("dst_port"))
+        dst_port = self._safe_int((doc.get("dest_port") or doc.get("dst_port")))
 
         # Pick a protocol label: tls (port 443 / 8443) wins, otherwise http.
         protocol = "https" if dst_port in (443, 8443) else "http"
@@ -226,7 +226,7 @@ class H0neytr4pParser(BaseParser):
             event_type="H0neytr4p",
             src_port=self._safe_int(doc.get("src_port")),
             dst_port=dst_port,
-            dst_ip=doc.get("dst_ip"),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
             protocol=protocol,
             raw_doc=doc,
         )

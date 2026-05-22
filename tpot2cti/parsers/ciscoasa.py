@@ -103,8 +103,8 @@ class CiscoasaParser(BaseParser):
             event_type="Ciscoasa",
             session_id=doc.get("session_id"),
             src_port=self._safe_int(doc.get("src_port")),
-            dst_port=self._safe_int(doc.get("dst_port") or 443),
-            dst_ip=doc.get("dst_ip"),
+            dst_port=self._safe_int((doc.get("dest_port") or doc.get("dst_port")) or 443),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
             protocol="https",
             raw_doc=doc,
         )
