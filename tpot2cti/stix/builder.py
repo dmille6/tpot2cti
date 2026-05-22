@@ -966,15 +966,26 @@ class STIXBuilder:
 
     def build_sighting(
         self,
-        indicator_id: str,
+        target_ref: str,
         sensor_hostname: str,
         session: AttackSession,
         *,
         count: int = 1,
         description: Optional[str] = None,
+        id_discriminator: str = "",
     ) -> Optional[dict]:
         """Sighting SDO — per V1_SPEC §4 'sighting target=Indicator,
         where=sensor Identity'.
+
+        ``target_ref`` is the STIX id this Sighting refers to.  In
+        STIX 2.1 the spec says ``sighting_of_ref`` SHOULD be an SDO
+        (typically an Indicator), but the field accepts any SDO/SCO id.
+        We exploit that to emit *two* Sightings per session (see
+        :meth:`build_dual_sighting`): one on the IP Indicator and one
+        directly on the IPv4-Addr observable, so OpenCTI's "Sightings"
+        tab populates on both pages.  The optional ``id_discriminator``
+        threads through to :func:`generate_sighting_id` so the two
+        Sightings get distinct deterministic IDs.
 
         Per LESSONS_LEARNED §7.1: putting per-session activity summaries
         in the Sighting `description` is the preferred place for
@@ -984,13 +995,15 @@ class STIXBuilder:
         are the genuinely-per-session content the lesson called out
         as the carve-out.
         """
-        if not (indicator_id and sensor_hostname):
+        if not (target_ref and sensor_hostname):
             return None
         sensor_id = generate_sensor_id(sensor_hostname)
         obj = {
             "type": "sighting",
-            "id": generate_sighting_id(sensor_hostname, session.session_id),
-            "sighting_of_ref": indicator_id,
+            "id": generate_sighting_id(
+                sensor_hostname, session.session_id, id_discriminator,
+            ),
+            "sighting_of_ref": target_ref,
             "where_sighted_refs": [sensor_id],
             "first_seen": session.first_seen.isoformat(),
             "last_seen": session.last_seen.isoformat(),
@@ -999,6 +1012,56 @@ class STIXBuilder:
         if description:
             obj["description"] = description
         return self._dedup(self._stamp(obj))
+
+    def build_dual_sighting(
+        self,
+        indicator_id: str,
+        ipv4_id: Optional[str],
+        sensor_hostname: str,
+        session: AttackSession,
+        *,
+        count: int = 1,
+        description: Optional[str] = None,
+    ) -> list[dict]:
+        """Emit Sightings on BOTH the IP Indicator and the IPv4-Addr.
+
+        STIX 2.1 §4.13 says ``sighting_of_ref`` SHOULD be an SDO; OpenCTI's
+        Observable→Sightings tab only walks Sightings whose
+        ``sighting_of_ref`` is the observable itself (it does NOT follow
+        the ``based-on`` edge from Indicator to Observable).  Operators
+        clicking through to an IP page therefore see an empty Sightings
+        tab — confusing and easy to misread as "we have no telemetry".
+
+        To fix that without losing the STIX-correct Indicator sighting,
+        we emit BOTH:
+
+          1. Indicator-side Sighting — preserved ID family
+             (``sighting:<sensor>:<session>``).  This is the canonical
+             Sighting and is what cross-cycle preservation keys off.
+          2. Observable-side Sighting — distinct ID family
+             (``sighting:<sensor>:<session>:ipv4``).  Same first/last
+             seen, same count, same description, same sensor identity.
+
+        Callers pass the already-resolved ``indicator_id`` and
+        ``ipv4_id``; if either is None that side is skipped.
+        """
+        out: list[dict] = []
+        if indicator_id:
+            sighting = self.build_sighting(
+                indicator_id, sensor_hostname, session,
+                count=count, description=description,
+            )
+            if sighting:
+                out.append(sighting)
+        if ipv4_id:
+            obs_sighting = self.build_sighting(
+                ipv4_id, sensor_hostname, session,
+                count=count, description=description,
+                id_discriminator="ipv4",
+            )
+            if obs_sighting:
+                out.append(obs_sighting)
+        return out
 
     # ──────────────────────────────────────────────────────────────────
     # High-level convenience: build the common entity bundle for one
@@ -1105,15 +1168,14 @@ class STIXBuilder:
             if d:
                 out.append(d)
 
-        # Sighting (on the IP Indicator)
+        # Dual sighting (Indicator + Observable) — see build_dual_sighting
+        # docstring for the OpenCTI UX rationale.
         if ip_ind:
-            sighting = self.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session,
+            out.extend(self.build_dual_sighting(
+                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_cowrie_sighting_description(session),
-            )
-            if sighting:
-                out.append(sighting)
+            ))
 
         # Per-session Notes replaced by attacker-profile Notes emitted from
         # main.run_cycle (see tpot2cti/attacker_profile.py); per-session
@@ -1252,14 +1314,12 @@ class STIXBuilder:
                 ):
                     out.append(rel)
 
-        # ── Sighting (on the IP Indicator) ────────────────────────────
+        # ── Dual sighting (Indicator + IPv4 observable) ───────────────
         if ip_ind:
-            sighting = self.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session,
+            out.extend(self.build_dual_sighting(
+                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
                 count=1,
-            )
-            if sighting:
-                out.append(sighting)
+            ))
 
         return out
 
@@ -1294,17 +1354,15 @@ class STIXBuilder:
             ):
                 out.append(rel)
 
-            # Sighting on the IP Indicator — per-probe summary now lives in
-            # the Sighting's `description` field instead of a separate Note
-            # (LESSONS_LEARNED §7.1: per-session Notes at hive scale produce
-            # 50k+ Notes/day that nobody reads; condense into the Sighting).
-            sighting = self.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session,
+            # Dual sighting (Indicator + IPv4 observable) — per-probe
+            # summary lives on the Sighting `description` (LESSONS_LEARNED
+            # §7.1: per-session Notes at hive scale produce 50k+/day that
+            # nobody reads; condense into the Sighting).
+            out.extend(self.build_dual_sighting(
+                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_honeytrap_sighting_description(session, event),
-            )
-            if sighting:
-                out.append(sighting)
+            ))
 
         return out
 
@@ -1348,19 +1406,17 @@ class STIXBuilder:
                     ):
                         out.append(rel)
 
-                # Sighting on the IP Indicator — the per-event summary
-                # (unknown_type + dst_port) now lives in the Sighting's
+                # Dual sighting on Indicator + IPv4 observable — per-event
+                # summary (unknown_type + dst_port) lives on the Sighting
                 # `description` field. Per LESSONS_LEARNED §7.1 we do NOT
                 # emit a separate Note per event for high-volume / low-
                 # signal protocols. If a maintainer wants per-event
                 # forensics, the raw doc is preserved on T-Pot's ES.
-                sighting = self.build_sighting(
-                    ip_ind["id"], session.sensor_hostname, session,
+                out.extend(self.build_dual_sighting(
+                    ip_ind["id"], ipv4_id, session.sensor_hostname, session,
                     count=session.event_count,
                     description=render_fallback_sighting_description(first, unknown_type),
-                )
-                if sighting:
-                    out.append(sighting)
+                ))
         else:
             # Edge case: unknown-type event has no src_ip.  Without an IP
             # there is no Sighting to attach a description to — emit a
@@ -1477,12 +1533,11 @@ class STIXBuilder:
             )
             if rel:
                 out.append(rel)
-            # Sighting
-            sighting = self.build_sighting(
-                ip_ind["id"], session.sensor_hostname, session, count=session.event_count,
-            )
-            if sighting:
-                out.append(sighting)
+            # Dual sighting (Indicator + IPv4 observable)
+            out.extend(self.build_dual_sighting(
+                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                count=session.event_count,
+            ))
 
         return out
 
