@@ -5,15 +5,18 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![T-Pot](https://img.shields.io/badge/T--Pot-24.04-orange)](https://github.com/telekom-security/tpotce)
 [![OpenCTI](https://img.shields.io/badge/OpenCTI-6.x-009688)](https://github.com/OpenCTI-Platform/opencti)
-[![Status](https://img.shields.io/badge/Status-Pre--v1.0-red)](#project-status)
+[![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
+[![Tests](https://img.shields.io/badge/tests-273%20passing-brightgreen)](tests/)
 
-> ⚠️ **Status: pre-v1.0 implementation in progress.** This repository
-> currently contains the project scaffold and the authoritative
-> specification ([`V1_SPEC.md`](V1_SPEC.md)). The `setup.sh` /
-> `teardown.sh` / `update.sh` scripts are stubs that exit non-zero;
-> the importer source under `tpot2cti/` is empty. Track v1.0
-> implementation in [the issues](https://github.com/dmille6/tpot2cti/issues).
-> Lessons-learned from the V0 prototype (`tpot_threatintel`) are in
+> 🚧 **Status: Beta — feature-complete v1.0, soak-testing in progress.**
+> The importer, the three sidecars, and the install / teardown /
+> wipe-and-fresh scripts all work end-to-end. Live ingestion against a
+> production T-Pot has been running cleanly for multi-day soaks (see
+> [`docs/SOAK_NOTES.md`](docs/SOAK_NOTES.md)). What we're polishing
+> before a 1.0 tag: doc coverage, additional parsers as new T-Pot
+> honeypot types ship, OpenCTI version-compat pinning. Bug reports and
+> first-cycle install feedback are especially welcome.
+> Predecessor V0 prototype (`tpot_threatintel`) post-mortem lives in
 > [`docs/LESSONS_LEARNED_FROM_V0.md`](docs/LESSONS_LEARNED_FROM_V0.md).
 
 ---

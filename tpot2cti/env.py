@@ -1,6 +1,6 @@
 """Robust env-var parsing helpers.
 
-Ported from /home/mike/poc/tsec-tpot-connectors/shared/tsec_env.py — see
+Ported from tsec-tpot-connectors/shared/tsec_env.py — see
 PoC LESSONS_LEARNED §38 (the "docker --env-file inline-comment footgun")
 for the motivating bug.
 

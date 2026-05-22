@@ -2,8 +2,8 @@
 
 This document is the operator-facing reference for "what does a healthy
 tpot2cti deployment look like?" — populated from the first live soak
-run starting 2026-05-21 at the threatintelv1 host against the single
-T-Pot at `192.0.2.10`.
+run starting 2026-05-21 at the threat-intel host against the single
+T-Pot at `203.0.113.10`.
 
 The numbers below are the **single-sensor baseline.** Hive deployments
 will scale most of these linearly with sensor count (events_read,
@@ -22,13 +22,13 @@ sensors.
 | pycti | 7.260521.0 |
 | OpenCTI platform | 7.260521.0 |
 | ES (T-Pot side) | 8.x via SSH tunnel on :64298 |
-| Host | threatintelv1 (Ubuntu 24.04, 39 GB RAM, 4 cores) |
-| T-Pot | single sensor at `192.0.2.10`, T-Pot 24.04.1 |
+| Host | Ubuntu 24.04, 4 cores, 39 GB RAM |
+| T-Pot | single sensor at `203.0.113.10`, T-Pot 24.04.1 |
 | Cycle interval | PT15M |
 | Indexing delay between passes | 60s (default) |
 | FATT cadence multiplier | 4 (FATT every ~60 min) |
 | Ignored types | `P0f` |
-| Self-filter IPs | `192.0.2.10` |
+| Self-filter IPs | `203.0.113.10` |
 | Benign scanner ASNs | 10 vendors (Google, Censys, Shodan, Shadowserver, Internet Archive, Stretchoid, Rapid7, BinaryEdge, Onyphe, NSR) |
 
 ---
