@@ -123,10 +123,29 @@ class SuricataParser(BaseParser):
         if cves:
             event.meta["cves"] = cves
 
-        # ── App-layer context (TLS SNI, HTTP host/url) ────────────────
+        # ── App-layer context — TLS / HTTP / SSH / SIP / RFB / fileinfo ─
+        # Per 2026-05-22 field-name audit vs real ES exports: every one
+        # of these surfaces appears at 100% within its event-type slice
+        # and was previously dropped on the floor by the parser. We now
+        # stash them in meta so the downstream Sighting / Note can
+        # render useful context (and downstream builders / pivot menus
+        # can build off them).
         tls = doc.get("tls") or {}
-        if isinstance(tls, dict) and (sni := tls.get("sni")):
-            event.meta["tls_sni"] = str(sni).lower()
+        if isinstance(tls, dict):
+            if sni := tls.get("sni"):
+                event.meta["tls_sni"] = str(sni).lower()
+            # JA3/JA3S/JA4 fingerprints — 100% of TLS events.  These are
+            # the SAME shape as FATT's TLS output, just observed by
+            # Suricata on the wire instead of by FATT's pcap mirror.
+            for fp_key in ("ja3", "ja3s", "ja4"):
+                if v := tls.get(fp_key):
+                    if isinstance(v, dict):
+                        v = v.get("hash") or v.get("fingerprint") or ""
+                    if v:
+                        event.meta[f"tls_{fp_key}"] = str(v).lower()
+            # subject / issuerdn — let downstream Note name the cert.
+            if subj := tls.get("subject"):
+                event.meta["tls_subject"] = str(subj)
 
         http = doc.get("http") or {}
         if isinstance(http, dict):
@@ -136,6 +155,66 @@ class SuricataParser(BaseParser):
                 event.meta["http_url"] = str(url)
             if ua := (http.get("http_user_agent") or http.get("user_agent")):
                 event.meta["http_user_agent"] = str(ua)
+            if method := http.get("http_method"):
+                event.meta["http_method"] = str(method).upper()
+            if status := http.get("status"):
+                try:
+                    event.meta["http_status"] = int(status)
+                except (TypeError, ValueError):
+                    pass
+
+        # SSH client/server banners — fingerprint surface for non-Cowrie
+        # SSH attackers (e.g. those hitting a sensor's actual sshd).
+        ssh = doc.get("ssh") or {}
+        if isinstance(ssh, dict):
+            ssh_client = ssh.get("client") if isinstance(ssh.get("client"), dict) else {}
+            ssh_server = ssh.get("server") if isinstance(ssh.get("server"), dict) else {}
+            if ver := (ssh_client.get("software_version")
+                       or ssh_client.get("proto_version")):
+                event.meta["ssh_client_version"] = str(ver)
+            if ver := (ssh_server.get("software_version")
+                       or ssh_server.get("proto_version")):
+                event.meta["ssh_server_version"] = str(ver)
+
+        # fileinfo — Suricata extracted a file during the alert. Hash +
+        # filename let us emit a File observable downstream when the
+        # signature implicates malware delivery.
+        fi = doc.get("fileinfo") or {}
+        if isinstance(fi, dict):
+            for algo in ("sha256", "sha1", "md5"):
+                if h := fi.get(algo):
+                    event.meta[f"file_{algo}"] = str(h).lower()
+            if name := fi.get("filename"):
+                event.meta["file_name"] = str(name)
+            if size := fi.get("size"):
+                try:
+                    event.meta["file_size"] = int(size)
+                except (TypeError, ValueError):
+                    pass
+
+        # RFB (VNC) — 100% of rfb events carry the protocol version +
+        # auth method; useful for the "VNC bruteforce" attacker profile.
+        rfb = doc.get("rfb") or {}
+        if isinstance(rfb, dict):
+            if ver := rfb.get("server_protocol_version"):
+                event.meta["rfb_version"] = str(ver)
+            if auth := rfb.get("authentication"):
+                event.meta["rfb_auth"] = str(auth) if not isinstance(auth, dict) else (
+                    auth.get("security_type") or ""
+                )
+
+        # SIP — Suricata catches SIP probes that don't reach SentryPeer
+        # (e.g. on ports SentryPeer isn't listening on). Mirror the
+        # SentryPeer parser's surface so downstream Note rendering is
+        # consistent across the two sources.
+        sip = doc.get("sip") or {}
+        if isinstance(sip, dict):
+            if m := sip.get("method"):
+                event.meta["sip_method"] = str(m).upper()
+            if u := sip.get("uri"):
+                event.meta["sip_uri"] = str(u)
+            if v := sip.get("version"):
+                event.meta["sip_version"] = str(v)
 
         if flow_id := doc.get("flow_id"):
             event.meta["flow_id"] = flow_id

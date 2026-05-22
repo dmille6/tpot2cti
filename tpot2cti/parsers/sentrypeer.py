@@ -147,6 +147,23 @@ class SentryPeerParser(BaseParser):
         if (cr := doc.get("caller")) is not None:
             event.meta["caller"] = str(cr).strip()
 
+        # ── SIP fingerprint surface (per 2026-05-22 field-name audit) ──
+        # Real SentryPeer data ships `sip_user_agent` + `sip_message` +
+        # `transport_type` (UDP/TCP/TLS) on 100% of probes — useful for
+        # tool clustering (e.g. sipvicious vs pplsip vs friendly-scanner)
+        # and Note enrichment. Pre-audit the parser read none of these.
+        if (ua := doc.get("sip_user_agent")) is not None:
+            event.meta["sip_user_agent"] = str(ua).strip()
+        if (msg := doc.get("sip_message")) is not None:
+            # Cap at 1KB so a pathological INVITE doesn't blow up the
+            # Note body. Whole-message is useful but bounded.
+            msg_s = str(msg).strip()
+            if len(msg_s) > 1024:
+                msg_s = msg_s[:1024] + "…(truncated)"
+            event.meta["sip_message"] = msg_s
+        if (tt := doc.get("transport_type")) is not None:
+            event.meta["transport_type"] = str(tt).strip().upper()
+
         # Optional session id (rare in SentryPeer)
         if (sid := doc.get("session") or doc.get("session_id")):
             event.session_id = str(sid)

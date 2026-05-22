@@ -81,10 +81,13 @@ class HeraldingParser(BaseParser):
             logger.debug("heralding: skipping doc with unparseable @timestamp")
             return None
 
-        # protocol comes through as the application-layer service name
+        # Protocol comes through as the application-layer service name
         # ("ssh", "ftp", "smtp", "pop3", ...).  We lowercase to match
         # the convention used elsewhere in the codebase.
-        protocol = doc.get("protocol")
+        # Per 2026-05-22 field-name audit vs real ES exports: T-Pot
+        # actually ships this as `proto` (100% of real Heralding docs)
+        # NOT `protocol`. Same dual-spelling bug class as dest_port.
+        protocol = doc.get("proto") or doc.get("protocol")
         protocol = str(protocol).lower() if protocol else None
 
         event = ParsedEvent(

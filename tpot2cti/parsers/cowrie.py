@@ -51,6 +51,16 @@ _DOWNLOAD_EVENTID = "cowrie.session.file_download"
 _UPLOAD_EVENTID = "cowrie.session.file_upload"
 _CONNECT_EVENTID = "cowrie.session.connect"
 _CLIENT_VERSION_EVENTID = "cowrie.client.version"
+# `cowrie.client.kex` ships the full SSH client algorithm negotiation
+# (key-exchange algs, host-key algs, encryption / MAC / compression
+# algs in both directions, languages). Per 2026-05-22 field-name audit
+# vs real ES exports this eventid carries the richest fingerprint we
+# have for a Cowrie attacker — HASSH alone is a 16-char hash, but the
+# raw algorithm list lets us discriminate two tools that happen to
+# collide. Real T-Pot uses camelCase: `kexAlgs`, `keyAlgs`, `encCS`,
+# `macCS`, `compCS`, `langCS`. NOT `kex_algs` (snake_case) as an
+# earlier docstring claimed.
+_CLIENT_KEX_EVENTID = "cowrie.client.kex"
 
 # Regex for URL extraction from command text (wget/curl/etc.)
 _URL_RE = re.compile(r'\bhttps?://[^\s\'"<>|]+', re.IGNORECASE)
@@ -116,8 +126,18 @@ class CowrieParser(BaseParser):
         elif eventid == _CLIENT_VERSION_EVENTID:
             if version := doc.get("version"):
                 event.meta["ssh_version"] = str(version)
+        elif eventid == _CLIENT_KEX_EVENTID:
+            # Cowrie.client.kex carries HASSH + the algorithm
+            # negotiation. The HASSH bubbles up via the unconditional
+            # `if hassh := doc.get("hassh")` below, but the algorithm
+            # lists are otherwise lost — capture the canonical concat
+            # (hasshAlgorithms) plus the raw kexAlgs for the Note.
+            if algs := doc.get("hasshAlgorithms"):
+                event.meta["hassh_algorithms"] = str(algs)
+            if kex := doc.get("kexAlgs"):
+                event.meta["kex_algs"] = kex if isinstance(kex, list) else [str(kex)]
 
-        # HASSH may appear on connect events
+        # HASSH may appear on connect events OR cowrie.client.kex events.
         if hassh := doc.get("hassh"):
             event.meta["hassh"] = str(hassh)
 
@@ -167,6 +187,12 @@ class CowrieParser(BaseParser):
                 session.hassh = hassh
             if ver := meta.get("ssh_version"):
                 session.ssh_version = ver
+            # HASSH algorithm list (raw form behind the hash) — useful
+            # for Note context + manual fingerprint disambiguation.
+            if algs := meta.get("hassh_algorithms"):
+                session.meta["hassh_algorithms"] = algs
+            if kex := meta.get("kex_algs"):
+                session.meta["kex_algs"] = kex
 
         # Derive domains from URLs
         for url in session.urls:

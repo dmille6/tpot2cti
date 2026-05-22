@@ -108,20 +108,61 @@ class FattParser(BaseParser):
             logger.debug("fatt: doc missing/unparseable @timestamp; skipping")
             return None
 
-        # Fingerprints may be nested under `fatt` or flattened to top
-        # level depending on T-Pot version.  Prefer nested.
+        # Per 2026-05-22 field-name audit vs real ES exports:
+        # T-Pot ships FATT fingerprints under per-protocol containers,
+        # NOT a single `fatt` dict and NOT flat top-level.  Real shape:
+        #
+        #   fatt_ssh:  {hassh, hasshServer, hasshAlgorithms,
+        #               hasshServerAlgorithms, client, server, ...}      (~51%)
+        #   fatt_tls:  {ja3, ja3s, ja3Algorithms, serverName, ...}        (~38%)
+        #   fatt_http: {userAgent, requestURI, requestMethod,
+        #               clientHeaderHash, serverHeaderHash, ...}          (~12%)
+        #
+        # The legacy nested `fatt` and flat top-level reads remain as
+        # fallbacks for older T-Pot installs (no real data triggers them
+        # at audit time, but they're cheap insurance).
+        fatt_ssh = doc.get("fatt_ssh") or {}
+        fatt_tls = doc.get("fatt_tls") or {}
+        fatt_http = doc.get("fatt_http") or {}
+        if not isinstance(fatt_ssh, dict):
+            fatt_ssh = {}
+        if not isinstance(fatt_tls, dict):
+            fatt_tls = {}
+        if not isinstance(fatt_http, dict):
+            fatt_http = {}
+        # Legacy single-container shape (kept for cross-version safety)
         fatt = doc.get("fatt") or {}
         if not isinstance(fatt, dict):
             fatt = {}
 
-        ja3 = self._first_str(fatt.get("ja3"), doc.get("ja3"))
-        ja3s = self._first_str(fatt.get("ja3s"), doc.get("ja3s"))
-        hassh = self._first_str(fatt.get("hassh"), doc.get("hassh"))
-        hassh_server = self._first_str(
-            fatt.get("hasshServer"), doc.get("hasshServer")
+        ja3 = self._first_str(
+            fatt_tls.get("ja3"), fatt.get("ja3"), doc.get("ja3"),
         )
-        tls_client = self._first_str(fatt.get("tlsClient"), doc.get("tlsClient"))
-        tls_server = self._first_str(fatt.get("tlsServer"), doc.get("tlsServer"))
+        ja3s = self._first_str(
+            fatt_tls.get("ja3s"), fatt.get("ja3s"), doc.get("ja3s"),
+        )
+        hassh = self._first_str(
+            fatt_ssh.get("hassh"), fatt.get("hassh"), doc.get("hassh"),
+        )
+        hassh_server = self._first_str(
+            fatt_ssh.get("hasshServer"), fatt.get("hasshServer"),
+            doc.get("hasshServer"),
+        )
+        # The human-readable client/server banner strings live alongside
+        # the hash. SSH path: fatt_ssh.{client, server}; TLS path:
+        # fatt_tls.serverName (server only — TLS has no client banner).
+        tls_client = self._first_str(
+            fatt_ssh.get("client"), fatt.get("tlsClient"), doc.get("tlsClient"),
+        )
+        tls_server = self._first_str(
+            fatt_ssh.get("server"), fatt_tls.get("serverName"),
+            fatt.get("tlsServer"), doc.get("tlsServer"),
+        )
+        # HTTP fingerprint surface (audit-#1 finding — was completely
+        # absent before): userAgent + clientHeaderHash give us per-tool
+        # identification on HTTP attackers FATT observed via mirror.
+        http_user_agent = self._first_str(fatt_http.get("userAgent"))
+        http_client_hash = self._first_str(fatt_http.get("clientHeaderHash"))
 
         event = ParsedEvent(
             src_ip=str(src_ip),
@@ -156,6 +197,10 @@ class FattParser(BaseParser):
             event.meta["tlsClient"] = tls_client
         if tls_server:
             event.meta["tlsServer"] = tls_server
+        if http_user_agent:
+            event.meta["http_user_agent"] = http_user_agent
+        if http_client_hash:
+            event.meta["http_client_hash"] = http_client_hash
 
         return event
 
