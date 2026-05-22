@@ -850,15 +850,42 @@ final_verification() {
         warn "To re-run after fixing: docker exec tpot2cti-core python3 -m tpot2cti.selftest"
     fi
 
+    # Read the OpenCTI admin credentials back out of opencti/.env so the
+    # operator can copy/paste straight from the install output rather
+    # than `grep ^OPENCTI_ADMIN_PASSWORD opencti/.env`. Defensive: if any
+    # field is missing (incomplete install) we fall back to a pointer at
+    # the file path so the operator still has a path to recovery.
+    local opencti_env="${SCRIPT_DIR}/opencti/.env"
+    local oc_email="" oc_password="" oc_token=""
+    if [[ -r "$opencti_env" ]]; then
+        oc_email="$(grep -E '^OPENCTI_ADMIN_EMAIL=' "$opencti_env" | cut -d= -f2- | head -n1)"
+        oc_password="$(grep -E '^OPENCTI_ADMIN_PASSWORD=' "$opencti_env" | cut -d= -f2- | head -n1)"
+        oc_token="$(grep -E '^OPENCTI_ADMIN_TOKEN=' "$opencti_env" | cut -d= -f2- | head -n1)"
+        # Heads-up if opencti/.env is world- or group-readable. setup.sh
+        # writes it 600 in generate_secrets(), but a paranoid umask check
+        # never hurt anyone.
+        local mode
+        mode="$(stat -c '%a' "$opencti_env" 2>/dev/null || echo "?")"
+        if [[ "$mode" != "600" ]] && [[ "$mode" != "?" ]]; then
+            warn "opencti/.env is mode $mode (expected 600). Consider:  chmod 600 $opencti_env"
+        fi
+    fi
+    : "${oc_email:=admin@opencti.io}"
+    : "${oc_password:=<missing — see opencti/.env>}"
+    : "${oc_token:=<missing — see opencti/.env>}"
+
     cat <<EOF
 
 ===========================================================================
   Setup complete.
 
   OpenCTI:    http://localhost:8080
-  Username:   admin@opencti.io
-  Password:   stored in opencti/.env as OPENCTI_ADMIN_PASSWORD
-              (also OPENCTI_ADMIN_TOKEN if you need API access)
+  Username:   ${oc_email}
+  Password:   ${oc_password}
+  API token:  ${oc_token}
+
+  Credentials are also stored in:  ${opencti_env}
+  Treat them like SSH keys — do not commit, do not share over chat.
 
   First T-Pot ingestion cycle starts within 15 minutes.
 
