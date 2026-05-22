@@ -65,6 +65,32 @@ _CLIENT_KEX_EVENTID = "cowrie.client.kex"
 # Regex for URL extraction from command text (wget/curl/etc.)
 _URL_RE = re.compile(r'\bhttps?://[^\s\'"<>|]+', re.IGNORECASE)
 
+# Planted SSH public-key extraction.
+#
+# Post-compromise, many botnets (most famously Outlaw / SBIDIOT, but
+# generally any actor that wants persistence) drop their own public key
+# into ~/.ssh/authorized_keys. The canonical shape is some variation of
+#
+#     echo "ssh-rsa AAAAB3NzaC1yc2... comment" >> ~/.ssh/authorized_keys
+#
+# Each unique key planted is a campaign-level IoC: every attacker IP
+# that plants the same key is part of the same campaign / botnet, and
+# defenders can pivot on the key in OpenCTI to see the whole footprint.
+#
+# We match the key inside any quoted echo argument that mentions one of
+# the four key types OpenSSH supports. Comments are optional (the
+# trailing free-form string after the base64 blob).
+_PLANTED_KEY_TYPES = ("ssh-rsa", "ssh-ed25519", "ssh-dss", "ecdsa-sha2-nistp256",
+                       "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521")
+_PLANTED_KEY_RE = re.compile(
+    # Match: keytype, whitespace, base64 blob, optional whitespace+comment
+    r'(?P<type>ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp(?:256|384|521))'
+    r'\s+'
+    r'(?P<key>[A-Za-z0-9+/=]{60,})'           # base64 — must be >= 60 chars
+    r'(?:\s+(?P<comment>[^"\'>|\s][^"\'>|]*))?',
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Parser
@@ -116,7 +142,19 @@ class CowrieParser(BaseParser):
             event.meta["username"] = doc.get("username")
             event.meta["password"] = doc.get("password")
         elif eventid == _COMMAND_EVENTID:
-            event.meta["command"] = doc.get("input")
+            cmd = doc.get("input")
+            event.meta["command"] = cmd
+            # Scan the command for planted-SSH-key patterns. The
+            # Outlaw botnet is the headline case (mdrfckr-tagged key
+            # observed from 472 source IPs in 30d) but the regex
+            # catches any actor's `echo "ssh-rsa AAA..." >>
+            # authorized_keys` style persistence.  Found keys go on
+            # event.meta so the aggregator can fold them onto the
+            # session.
+            if cmd:
+                found = self._extract_planted_keys(str(cmd))
+                if found:
+                    event.meta["planted_ssh_keys"] = found
         elif eventid in (_DOWNLOAD_EVENTID, _UPLOAD_EVENTID):
             sha256 = doc.get("shasum") or doc.get("sha256")
             if sha256:
@@ -194,6 +232,17 @@ class CowrieParser(BaseParser):
             if kex := meta.get("kex_algs"):
                 session.meta["kex_algs"] = kex
 
+            # Planted SSH keys — dedup by fingerprint across the session
+            # (one attacker may plant the same key multiple times via
+            # repeated commands; that's still one IoC).
+            for key_info in (meta.get("planted_ssh_keys") or []):
+                fp = key_info.get("fingerprint")
+                if not fp:
+                    continue
+                if not any(k.get("fingerprint") == fp
+                            for k in session.planted_ssh_keys):
+                    session.planted_ssh_keys.append(key_info)
+
         # Derive domains from URLs
         for url in session.urls:
             try:
@@ -237,6 +286,49 @@ class CowrieParser(BaseParser):
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _extract_planted_keys(cmd: str) -> list[dict]:
+        """Return all planted-SSH-key dicts found in a command string.
+
+        Each result is::
+
+            {"type": "ssh-rsa",
+             "key": "<base64 blob>",
+             "comment": "<trailing comment>" or "",
+             "fingerprint": "<sha256 hex>"}
+
+        The fingerprint is SHA256(keytype || ' ' || key_blob) hex —
+        the same convention OpenSSH's ``ssh-keygen -lf`` uses for
+        SHA256 fingerprints (minus the ``SHA256:`` prefix and base64
+        encoding). Deterministic and stable across re-emission, so two
+        attackers planting the same key map to the same SCO id.
+
+        Returns an empty list when nothing matches — most commands
+        won't, so the call site is cheap on the hot path.
+        """
+        import hashlib
+        out: list[dict] = []
+        seen: set[str] = set()
+        for m in _PLANTED_KEY_RE.finditer(cmd):
+            key_type = m.group("type").lower()
+            key_blob = m.group("key")
+            comment_raw = m.group("comment") or ""
+            # Trim trailing closing quotes / redirect characters left
+            # behind by greedy comment matching against shell syntax.
+            comment = comment_raw.split('"')[0].split("'")[0].split(">")[0].strip()
+            fp_src = f"{key_type} {key_blob}".encode("ascii", errors="ignore")
+            fingerprint = hashlib.sha256(fp_src).hexdigest()
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            out.append({
+                "type": key_type,
+                "key": key_blob,
+                "comment": comment,
+                "fingerprint": fingerprint,
+            })
+        return out
 
 
 # Register on import

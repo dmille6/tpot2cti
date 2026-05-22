@@ -123,6 +123,18 @@ class AttackSession:
     ja3s: Optional[str] = None
     http_header_hash: Optional[str] = None
 
+    # Planted SSH public keys — populated by parsers that observe post-
+    # compromise key-planting (Outlaw botnet's `echo "ssh-rsa AAA..." >>
+    # authorized_keys` is the canonical case but any actor that drops
+    # their own SSH key triggers this).  Each entry is the dict
+    # ``{"type": "ssh-rsa", "key": "<base64 blob>", "comment":
+    # "<comment>", "fingerprint": "<sha256 hex of the blob>"}``. The
+    # fingerprint is what the downstream Cryptographic-Key observable
+    # uses as its deterministic UUID5 seed, so every attacker IP that
+    # planted the same key links to the same SCO — one click in OpenCTI
+    # to see the entire campaign.
+    planted_ssh_keys: list[dict] = field(default_factory=list)
+
     # Per-parser extras (e.g., DICOM command type, SIP method)
     meta: dict = field(default_factory=dict)
 

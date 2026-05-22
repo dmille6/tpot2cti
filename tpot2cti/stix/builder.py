@@ -773,6 +773,95 @@ class STIXBuilder:
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj))
 
+    def build_planted_ssh_key(
+        self,
+        key_info: dict,
+        *,
+        session: Optional[AttackSession] = None,
+    ) -> Optional[dict]:
+        """Cryptographic-Key SCO for an attacker-planted SSH public key.
+
+        Distinct from :meth:`build_cryptographic_key` (which models a
+        HASSH SSH-client hash) — this one represents the public key
+        material the attacker dropped into the victim's
+        ``~/.ssh/authorized_keys``.  The observable value is the SHA256
+        fingerprint of the key blob (matching OpenSSH ``ssh-keygen
+        -lf`` semantics minus the ``SHA256:`` prefix and base64
+        encoding); the full key + type + comment go in the description
+        so operators can copy/paste it into a hunt.
+
+        Every attacker IP that planted the SAME key produces the SAME
+        UUID5 here, so OpenCTI dedups them onto one SCO.  Each IP's
+        Cowrie session adds a ``related-to`` edge to that one SCO —
+        and clicking the SCO in OpenCTI's UI walks those edges back to
+        the entire campaign footprint.  This is the operator-pivot
+        we couldn't get from HASSH alone (HASSH groups by client
+        tool; a planted key groups by C&C identity).
+        """
+        if not isinstance(key_info, dict):
+            return None
+        fingerprint = key_info.get("fingerprint")
+        key_blob = key_info.get("key")
+        key_type = key_info.get("type") or "ssh-rsa"
+        comment = key_info.get("comment") or ""
+        if not fingerprint or not key_blob:
+            return None
+
+        # Compose a copy-paste-ready authorized_keys line for the desc.
+        full_line = f"{key_type} {key_blob}"
+        if comment:
+            full_line += f" {comment}"
+
+        obj = {
+            "type": "cryptographic-key",
+            "id": generate_cryptographic_key_id(fingerprint),
+            # The visible "value" is the SHA256 fingerprint — short,
+            # uniquely identifying, copy-pasteable. Operators wanting
+            # the full key material read the description.
+            "value": f"SHA256:{fingerprint}",
+        }
+        comment_disp = comment or "∅ (no comment)"
+        desc_lines = [
+            f"Attacker-planted SSH public key (campaign IoC).",
+            f"",
+            f"Key type:      {key_type}",
+            f"SHA256 fp:     {fingerprint}",
+            f"Comment:       {comment_disp}",
+            f"",
+            f"authorized_keys line (verbatim):",
+            f"    {full_line}",
+            f"",
+            f"Every attacker IP that planted this key links to this "
+            f"SCO via `related-to`. Click 'Related entities' to see "
+            f"the campaign footprint.",
+        ]
+        if session is not None:
+            desc_lines.insert(
+                1,
+                f"First observed: {session.first_seen.isoformat()} from "
+                f"{session.src_ip} via Cowrie on "
+                f"sensor {session.sensor_hostname!r}.",
+            )
+        obj["x_opencti_description"] = "\n".join(desc_lines)
+
+        labels = ["ssh-key", "planted-key", "campaign-ioc", key_type]
+        if comment:
+            # Comment is often a botnet tag ("mdrfckr" for Outlaw,
+            # "JenX" for that family, etc.) — make it a label for
+            # quick filtering.
+            tag = re.sub(r'[^A-Za-z0-9._-]', '', comment.lower())[:32]
+            if tag:
+                labels.append(f"comment:{tag}")
+        if session is not None:
+            labels.extend(parser_labels_for(session.event_type))
+            obj["x_opencti_created_at"] = session.first_seen.isoformat()
+        obj["x_opencti_labels"] = sorted(set(labels))
+        # Confidence/score: a planted-key SCO is one of the highest-
+        # signal IoCs we emit. Score it at 85 so it stands out vs the
+        # routine SCO-50 baseline.
+        obj["x_opencti_score"] = 85
+        return self._dedup(self._stamp(obj))
+
     # ──────────────────────────────────────────────────────────────────
     # SDOs (indicators, notes, vulnerabilities)
     # ──────────────────────────────────────────────────────────────────
@@ -1180,6 +1269,42 @@ class STIXBuilder:
                 if rel := self.build_relationship(
                     ck["id"], "related-to", ipv4_id,
                     description=f"HASSH fingerprint observed from {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        # Planted SSH public keys → Cryptographic-Key SCOs (campaign IoC).
+        # Each unique fingerprint becomes one observable, and every
+        # attacker IP that planted that key links to it via `related-to`.
+        # Operator pivot: click the key in OpenCTI → see every src_ip
+        # that planted it = the full campaign footprint.  Outlaw is the
+        # canonical example (470+ src_ips, one key) but this catches any
+        # actor doing `echo "ssh-rsa AAA..." >> authorized_keys` style
+        # persistence.
+        for key_info in (session.planted_ssh_keys or []):
+            fp = key_info.get("fingerprint")
+            if not fp:
+                continue
+            ck = self.build_planted_ssh_key(key_info, session=session)
+            if not ck:
+                continue
+            out.append(ck)
+            # IP observable → key (so the key's "Related Entities" tab
+            # shows every IP that planted it — the campaign view).
+            if rel := self.build_relationship(
+                ipv4_id, "related-to", ck["id"],
+                description=(
+                    f"Planted SSH key (type={key_info.get('type')}, "
+                    f"comment={key_info.get('comment') or '∅'!r}) "
+                    f"installed by attacker {session.src_ip}"
+                ),
+            ):
+                out.append(rel)
+            # IP Indicator → key (so the indicator-side knowledge tab
+            # also shows the campaign pivot).
+            if ip_ind:
+                if rel := self.build_relationship(
+                    ip_ind["id"], "related-to", ck["id"],
+                    description=f"Indicator for IP that planted SSH key {fp[:12]}…",
                 ):
                     out.append(rel)
 
