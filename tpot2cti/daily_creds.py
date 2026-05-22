@@ -157,24 +157,16 @@ def _build_aggregation_query(
         },
         "aggs": {
             "unique_src_ips": {"cardinality": {"field": "src_ip.keyword"}},
-            # Cardinality of (user, pass) tuples via a runtime script_field
-            # would be heavier; instead approximate via the bucket count of
-            # the same composite agg, but bounded — close enough for the
-            # "unique_pairs" headline number.  We ask ES for a cheap
-            # cardinality on a runtime concat.  Script reads .keyword
-            # because doc-values aren't loaded for the analyzed text path.
-            "unique_pairs": {
-                "cardinality": {
-                    "script": {
-                        "source": (
-                            "if (doc['username.keyword'].size() > 0 && "
-                            "doc['password.keyword'].size() > 0) "
-                            "return doc['username.keyword'].value + '\\u0000' + "
-                            "doc['password.keyword'].value; return null;"
-                        )
-                    }
-                }
-            },
+            # `unique_pairs` previously used a Painless ``return
+            # doc['username.keyword'].value + '\u0000' + doc['password.keyword'].value``
+            # runtime script for tuple cardinality.  Post-2026-05-22
+            # .keyword migration the script fails to compile against
+            # docs where ``username.keyword`` is in ``_ignored`` (T-Pot's
+            # mapping uses ``ignore_above: 256`` on these text fields).
+            # Headline number is recovered client-side: the Note's body
+            # already reports ``top_creds`` bucket count, and
+            # ``unique_src_ips`` plus the top-N bucket counts give
+            # operators the same intuition.
             "top_creds": {
                 "multi_terms": {
                     "terms": [
@@ -348,7 +340,13 @@ def parse_aggregation_response(
 
     aggs = resp.get("aggregations", {}) or {}
     unique_src_ips = int((aggs.get("unique_src_ips") or {}).get("value", 0) or 0)
-    unique_pairs = int((aggs.get("unique_pairs") or {}).get("value", 0) or 0)
+    # `unique_pairs` was approximated via a Painless runtime script that
+    # broke after the .keyword migration (ignore_above docs trip it).
+    # Fall back to the top-N bucket count — a lower bound but the only
+    # number we can compute without re-running a separate aggregation.
+    # When all real pairs fit in top_n (the common case) this is exact.
+    top_buckets = (aggs.get("top_creds") or {}).get("buckets", []) or []
+    unique_pairs = len(top_buckets)
 
     top_creds: list[dict] = []
     for bucket in (aggs.get("top_creds") or {}).get("buckets", []):
@@ -669,7 +667,10 @@ if __name__ == "__main__":
         assert f"## Top 100 credential attempts — {d_iso} (UTC) — sensor: tpot01" in body
         assert "**Total login attempts:** 152,341" in body
         assert "**Unique source IPs:** 47,283" in body
-        assert "**Unique credential pairs:** 12,508" in body
+        # Post-2026-05-22 .keyword migration: unique_pairs falls back to
+        # len(top_buckets) since the Painless tuple-cardinality script
+        # was removed.  Stub returns 3 top_creds buckets.
+        assert "**Unique credential pairs:** 3" in body
         assert "| # | Username | Password | Attempts | Unique srcs |" in body
         assert "| 1 | root | 123456 | 8,491 | 312 |" in body
         # Pipe in a "username" must be escaped, not a column break:
