@@ -111,10 +111,14 @@ class CiscoasaParser(BaseParser):
         self._populate_geoip(doc, event)
 
         # ── Payload handling ──────────────────────────────────────────
-        # `payload` may be str or bytes (older T-Pot indexed bytes
-        # before logstash decoded them).  Normalize to str and truncate
-        # to _PAYLOAD_CAP_BYTES to keep ParsedEvent.meta small.
-        raw_payload = doc.get("payload")
+        # `payload_printable` is the canonical T-Pot field (100% of real
+        # docs per 2026-05-22 field-name audit). The flat `payload`
+        # spelling is kept as a fallback for older T-Pot versions —
+        # never appears in current data but cheap to retain.
+        # May be str or bytes (older T-Pot indexed bytes before logstash
+        # decoded them).  Normalize to str and truncate to
+        # _PAYLOAD_CAP_BYTES to keep ParsedEvent.meta small.
+        raw_payload = doc.get("payload_printable") or doc.get("payload")
         if isinstance(raw_payload, (bytes, bytearray)):
             try:
                 payload = raw_payload.decode("utf-8", errors="replace")

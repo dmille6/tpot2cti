@@ -112,7 +112,28 @@ class RedishoneypotParser(BaseParser):
             )
             return None
 
+        # Per 2026-05-22 field-name audit vs real ES exports: T-Pot's
+        # actual Redis honeypot ships one doc per command with `action`
+        # holding the command verb (NewConnect / PING / SET / INFO / ...)
+        # at 100% of real docs. The `msg` field (also 100% present) is
+        # usually empty for these connect/command events but can carry
+        # an argument string for commands like SET / GET.  The legacy
+        # `commands_received` array shape never appears in real data —
+        # kept as a defensive read for cross-version safety.
         commands = self._normalize_commands(doc.get("commands_received"))
+        if not commands:
+            action = doc.get("action")
+            msg = doc.get("msg")
+            if isinstance(action, str) and action.strip():
+                # Pre-2026-05-22 the parser dropped every Redis event
+                # because it only looked at the (never-populated)
+                # commands_received list. Now we synthesize a command
+                # string from action [+ msg argument] so the substance
+                # filter and the Note both see real signal.
+                if isinstance(msg, str) and msg.strip():
+                    commands = [f"{action.strip()} {msg.strip()}"]
+                else:
+                    commands = [action.strip()]
 
         event = ParsedEvent(
             src_ip=str(src_ip),

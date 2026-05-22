@@ -118,7 +118,17 @@ class ElasticPotParser(BaseParser):
             logger.debug("elasticpot: doc missing/unparseable @timestamp; skipping")
             return None
 
-        request_url = str(doc.get("request_url") or "")
+        # Per 2026-05-22 field-name audit vs real ES exports: T-Pot ships
+        # the URL under the literal-dotted top-level key `"http.url"`
+        # (100% of real Elasticpot docs) — this is a single key with a
+        # dot in its name, NOT nested `http: {url: ...}`. Python dict
+        # access works fine, just spell the key correctly. Legacy
+        # `request_url` kept as fallback for older T-Pot versions.
+        request_url = str(
+            doc.get("http.url")
+            or doc.get("request_url")
+            or ""
+        )
         request_method = str(doc.get("request_method") or "").upper() or "GET"
         request_body = doc.get("request_body")
         # ES request bodies are usually JSON but T-Pot may store them as

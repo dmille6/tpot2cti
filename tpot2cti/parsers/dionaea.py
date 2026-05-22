@@ -114,11 +114,17 @@ class DionaeaParser(BaseParser):
             )
             return None
 
-        # T-Pot's Dionaea docs carry ``connection_protocol`` (smbd /
-        # ftpd / httpd / etc.) — strictly more informative than the L4
-        # transport.  Fall back to ``protocol`` then the literal "tcp".
+        # T-Pot's Dionaea docs carry the application protocol (smbd /
+        # ftpd / httpd / mysqld / etc.) under `connection.protocol` —
+        # strictly more informative than the L4 transport.
+        # Per 2026-05-22 field-name audit vs real ES exports: real data
+        # always uses `connection.protocol` (nested); the flat
+        # `connection_protocol` and `protocol` spellings never appear.
+        # Legacy flat reads kept as fallback for older T-Pot versions.
+        conn = doc.get("connection") if isinstance(doc.get("connection"), dict) else {}
         connection_protocol = (
-            doc.get("connection_protocol")
+            conn.get("protocol")
+            or doc.get("connection_protocol")
             or doc.get("protocol")
             or None
         )

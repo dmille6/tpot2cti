@@ -184,16 +184,40 @@ class H0neytr4pParser(BaseParser):
             )
             return None
 
-        # h0neytr4p nests request fields under ``request`` per V1_SPEC §5.7.
+        # h0neytr4p ES shape per 2026-05-22 field-name audit:
+        # T-Pot actually ships these fields FLAT at the top level
+        # (request_method, request_uri, user-agent, host_header,
+        # header_*), NOT nested under a `request` dict as V1_SPEC §5.7
+        # originally documented. The nested form is kept as a fallback
+        # for older/forked T-Pot versions, but real data hits the flat
+        # path on every event. Note the hyphenated `user-agent` and
+        # `header_user-agent` spellings — Python dict access works
+        # with hyphens, this is not a typo.
         request = doc.get("request") or {}
         if not isinstance(request, dict):
             request = {}
 
-        method = str(request.get("method") or "").upper() or None
-        uri = request.get("uri") or ""
-        body = request.get("body") or ""
-        user_agent = request.get("user_agent") or ""
-        host_header = doc.get("host_header") or request.get("host") or ""
+        method = str(
+            doc.get("request_method") or request.get("method") or ""
+        ).upper() or None
+        uri = (
+            doc.get("request_uri") or request.get("uri") or ""
+        )
+        body = (
+            doc.get("request_body") or request.get("body") or ""
+        )
+        user_agent = (
+            doc.get("user-agent")
+            or doc.get("header_user-agent")
+            or request.get("user_agent")
+            or ""
+        )
+        host_header = (
+            doc.get("host_header")
+            or doc.get("header_host")
+            or request.get("host")
+            or ""
+        )
 
         # Truncate the body for storage — we cap at REQUEST_BODY_CAP so
         # the downstream Note never carries a megabyte payload, but we

@@ -193,15 +193,39 @@ class TannerParser(BaseParser):
 
     @staticmethod
     def _extract_attack_type(doc: dict) -> str:
-        """Pull `attack_type` from the doc, tolerating either the
-        top-level string form or the nested `paths[].attack_type`
-        list form.  Returns "" if nothing is set.
+        """Pull the attack classification from a Tanner doc.
+
+        Per 2026-05-22 field-name audit vs real ES exports the canonical
+        location is
+
+            response_msg.response.message.detection.name   (xss, sqli, ...)
+
+        which is what Tanner's emulator API actually produces (100% of
+        current docs). The legacy top-level ``attack_type`` and the
+        nested ``paths[].attack_type`` forms are retained as fallbacks
+        for older T-Pot versions but never appear in 2026 data.
+        Returns "" if nothing is set.
         """
+        # ── Modern shape: response_msg.response.message.detection.name ──
+        rm = doc.get("response_msg")
+        if isinstance(rm, dict):
+            det = (
+                ((rm.get("response") or {}).get("message") or {}).get("detection")
+                or {}
+            )
+            if isinstance(det, dict):
+                name = det.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip().lower()
+
+        # ── Legacy top-level string form ───────────────────────────────
         top = doc.get("attack_type")
         if isinstance(top, str) and top.strip():
             return top.strip().lower()
-        # paths[].attack_type — return the first non-"unknown" if any,
-        # else the first one we see (covers all-unknown docs too).
+
+        # ── Legacy paths[].attack_type list form ──────────────────────
+        # Return the first non-"unknown" if any, else the first one we
+        # see (covers all-unknown docs too).
         paths = doc.get("paths")
         if isinstance(paths, list):
             first: str = ""

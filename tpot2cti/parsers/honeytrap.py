@@ -121,24 +121,75 @@ class HoneytrapParser(BaseParser):
         )
         self._populate_geoip(doc, event)
 
-        # Payload bytes — store both representations in meta so the
-        # builder can preserve them verbatim in the Sighting description.
-        payload_printable = (
-            doc.get("payload_printable")
-            or ac.get("payload_printable")
-            or ""
-        )
+        # Payload bytes — per 2026-05-22 field-name audit vs real ES
+        # exports, T-Pot's Honeytrap actually ships:
+        #
+        #   attack_connection.payload: {
+        #     data_hex:    <hex string of raw payload>,
+        #     md5_hash:    <md5 of payload>,
+        #     sha512_hash: <sha512 of payload>,
+        #     length:      <byte count>,
+        #   }
+        #
+        # There is NO `payload_printable` or `payload_hex` field at any
+        # level — the pre-audit reads were silently dropping every
+        # probe's payload, which meant the substance filter
+        # (len(payload_printable) > 8) NEVER fired. The legacy field
+        # names are retained as fallbacks for older T-Pot versions.
+        payload_obj = ac.get("payload") if isinstance(ac.get("payload"), dict) else {}
         payload_hex = (
-            doc.get("payload_hex")
+            payload_obj.get("data_hex")
+            or doc.get("payload_hex")
             or ac.get("payload_hex")
             or ""
         )
+        # Derive printable from hex when the printable spelling is
+        # absent (true for all current T-Pot versions). Only ASCII
+        # printable bytes (0x20–0x7E plus \t \n \r) survive — anything
+        # else becomes '.', matching tcpdump-style payload preview.
+        payload_printable = (
+            doc.get("payload_printable")
+            or ac.get("payload_printable")
+            or self._hex_to_printable(payload_hex)
+        )
         event.meta["payload_printable"] = str(payload_printable)
         event.meta["payload_hex"] = str(payload_hex)
+        # Payload-derived hashes are themselves intel — wire to the
+        # session aggregator so the builder can emit a File observable
+        # for the captured bytes when they're substantive enough.
+        if isinstance(ac.get("payload"), dict):
+            if md5 := payload_obj.get("md5_hash"):
+                event.meta["payload_md5"] = str(md5).lower()
+            if sha512 := payload_obj.get("sha512_hash"):
+                event.meta["payload_sha512"] = str(sha512).lower()
+            if length := payload_obj.get("length"):
+                try:
+                    event.meta["payload_length"] = int(length)
+                except (TypeError, ValueError):
+                    pass
         if ac:
             event.meta["attack_connection"] = ac
 
         return event
+
+    @staticmethod
+    def _hex_to_printable(hex_str: str) -> str:
+        """Decode a hex string to a tcpdump-style printable preview.
+
+        Non-printable bytes become '.'. Returns empty string on any
+        decode failure — Honeytrap docs without payload data should not
+        cause a parse failure.
+        """
+        if not hex_str:
+            return ""
+        try:
+            raw = bytes.fromhex(hex_str)
+        except (ValueError, TypeError):
+            return ""
+        return "".join(
+            chr(b) if (0x20 <= b <= 0x7E) or b in (0x09, 0x0A, 0x0D) else "."
+            for b in raw
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # correlate() — we use the default (one event per session)
