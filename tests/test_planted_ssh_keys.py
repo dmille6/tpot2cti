@@ -17,7 +17,8 @@ import pytest
 from tpot2cti.parsers.cowrie import CowrieParser, _PLANTED_KEY_RE
 
 
-# The actual Outlaw payload observed on the user's node2 sensor.
+# The actual Outlaw payload observed in live Cowrie sessions.
+# `mdrfckr` is the bot family's calling card (in the SSH key comment).
 OUTLAW_AUTH_KEY = (
     "ssh-rsa "
     "AAAAB3NzaC1yc2EAAAABJQAAAQEArDp4cun2lhr4KUhBGE7VvAcwdli2a8dbnrTO"

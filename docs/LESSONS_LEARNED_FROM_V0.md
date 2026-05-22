@@ -888,7 +888,7 @@ Good luck with V1.
 ## Appendix A — Lessons ported from the production PoC (newer than V0)
 
 Added 2026-05-21 after the structural evaluation against the new PoC
-codebase at `/home/mike/poc/tsec-tpot-connectors/`. Each item below is a
+codebase at `tsec-tpot-connectors/`. Each item below is a
 one-paragraph paraphrase of a lesson from PoC's `docs/LESSONS_LEARNED.md`;
 the section number references theirs. Read the originals for full
 context — they're the canonical source.

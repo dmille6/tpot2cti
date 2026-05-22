@@ -160,7 +160,7 @@ sudo iptables -nvL INPUT --line-numbers | head -25
 # trying to reach the T-Pot ES port.
 ```
 
-Symptom from a node2 incident: `tpoti-platform-watchdog` on the
+Symptom from a node1 incident: `tpoti-platform-watchdog` on the
 threat-intel server failing to write to `tpoti-platform-health-*` via the
 SSH tunnel, while `curl http://127.0.0.1:64298/` **on the sensor itself**
 also timed out.  That second observation is the tell — if it can't reach
@@ -196,7 +196,7 @@ DROP fires first.
 ### Gotcha 4 — DOCKER-USER needs an ESTABLISHED-return RETURN rule
 
 The Gotcha 2 fix (`--ctorigdst` for DOCKER-published ports) gets the
-**forward path** right: a packet from `99.18.26.20:*` → `node2:64297` (or
+**forward path** right: a packet from `203.0.113.20:*` → `node1:64297` (or
 any docker-NAT'd mgmt port) is correctly accepted by the per-port
 admin-source ACCEPT rule.
 
@@ -206,10 +206,10 @@ different source IP (the container's, not the admin's).  In DOCKER-USER:
 
 | Direction | source | ctorigdst | ctorigdstport | Hits which rule? |
 |---|---|---|---|---|
-| Forward (SYN) | `99.18.26.20` | `76.165.200.142` | `64297` | ACCEPT ✓ |
-| Return (SYN-ACK) | `172.23.0.5` (container) | `76.165.200.142` | `64297` | DROP ✗ |
+| Forward (SYN) | `203.0.113.20` | `203.0.113.10` | `64297` | ACCEPT ✓ |
+| Return (SYN-ACK) | `172.23.0.5` (container) | `203.0.113.10` | `64297` | DROP ✗ |
 
-Because the ADMIN-allow rules are scoped `-s 99.18.26.20`, return
+Because the ADMIN-allow rules are scoped `-s 203.0.113.20`, return
 packets fall past them and hit the catch-all `0.0.0.0/0` DROP scoped on
 `--ctorigdst $ME --ctorigdstport $port`.
 
@@ -219,8 +219,8 @@ non-zero counts.**
 
 ```bash
 sudo iptables -nvL DOCKER-USER --line-numbers | grep 64297
-# 3  78  4688  ACCEPT  ...  99.18.26.20  ctorigdst 76...  ctorigdstport 64297
-# 10 84  5040  DROP    ...  0.0.0.0/0    ctorigdst 76...  ctorigdstport 64297
+# 3  78  4688  ACCEPT  ...  203.0.113.20  ctorigdst 203...  ctorigdstport 64297
+# 10 84  5040  DROP    ...  0.0.0.0/0    ctorigdst 203...  ctorigdstport 64297
                                                             ^ both firing! return-direction drop
 ```
 
@@ -249,7 +249,7 @@ returns out of DOCKER-USER so the packet continues into DOCKER-FORWARD
 short-circuit those chains and could break docker's own forwarding
 sometimes.
 
-After this, a browser to `https://node2:64297` works for the admin IP.
+After this, a browser to `https://node1:64297` works for the admin IP.
 Verify the fix:
 
 ```bash
@@ -267,7 +267,7 @@ incrementing in normal operation.
 ## 3. The complete lockdown script
 
 This is the working `/usr/local/bin/tpot-port-lockdown.sh` from the
-node2 build.  Idempotent (safe to re-run), survives reboots via a
+node1 build.  Idempotent (safe to re-run), survives reboots via a
 systemd oneshot, covers INPUT + DOCKER-USER + IPv6:
 
 ```bash
@@ -487,7 +487,7 @@ runner, etc.), modify the script to allow multiple sources.  Pattern:
 
 ```bash
 # Top of /usr/local/bin/tpot-port-lockdown.sh
-ADMIN_IPS=("99.18.26.20" "76.165.200.190")
+ADMIN_IPS=("203.0.113.20" "203.0.113.30")
 
 # Wherever we use $ADMIN, loop over the array:
 for src in "${ADMIN_IPS[@]}"; do

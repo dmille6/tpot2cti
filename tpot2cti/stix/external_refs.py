@@ -8,7 +8,7 @@ page, so the pivot menu belongs on the observable too — not only the
 indicator.
 
 Adapted from the PoC at
-/home/mike/poc/tsec-tpot-connectors/shared/tsec_external_refs.py
+tsec-tpot-connectors/shared/tsec_external_refs.py
 (see also docs/LESSONS_LEARNED_FROM_V0.md §6 and the first-live-install
 postmortem on "thin objects").
 

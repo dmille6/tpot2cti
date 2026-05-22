@@ -142,7 +142,7 @@ _KNOWN_MITRE_TECHNIQUES: dict[str, str] = {
 
 # ---------------------------------------------------------------------------
 # Parser-aware enrichment vocabulary (port of PoC's `source_labels` pattern
-# from /home/mike/poc/tsec-tpot-connectors/tsec-tpot-hp-connector/src/stix/
+# from tsec-tpot-connectors/tsec-tpot-hp-connector/src/stix/
 # observables.py + indicators.py).
 #
 # Every observable/indicator emitted on behalf of a session gets:
@@ -876,7 +876,7 @@ class STIXBuilder:
         """Build a STIX Indicator for an attacker IP.
 
         Per the PoC pattern (
-        /home/mike/poc/tsec-tpot-connectors/tsec-tpot-hp-connector/src/stix/indicators.py
+        tsec-tpot-connectors/tsec-tpot-hp-connector/src/stix/indicators.py
         ): rich `name` template, multi-paragraph `description` with
         session/event counts + date range + severity context, source
         labels, computed score, valid_until from validity_days.
