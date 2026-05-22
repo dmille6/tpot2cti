@@ -203,16 +203,35 @@ def parser_labels_for(event_type: Optional[str]) -> list[str]:
 #: session count for IP indicators. Missing entries fall back to a
 #: generic template.
 _INDICATOR_NAME_TEMPLATES: dict[str, str] = {
-    "Cowrie":     "Cowrie SSH/Telnet Attack - {ip} ({n} session{s})",
-    "Suricata":   "Suricata Alert - {ip} ({n} alert{s})",
-    "Honeytrap":  "Honeytrap Probe - {ip} ({n} probe{s})",
-    "Dionaea":    "Dionaea Malware Drop - {ip} ({n} drop{s})",
-    "Heralding":  "Heralding Credential Attack - {ip} ({n} session{s})",
-    "Mailoney":   "Mailoney SMTP Abuse - {ip} ({n} session{s})",
-    "ConPot":     "ConPot ICS Probe - {ip} ({n} probe{s})",
-    "Tanner":     "Tanner Web Attack - {ip} ({n} session{s})",
-    "H0neytr4p":  "H0neytr4p Web Probe - {ip} ({n} probe{s})",
-    "__fallback__": "Honeypot Activity (unknown type) - {ip} ({n} event{s})",
+    # Coverage MUST match _PARSER_LABEL_VOCAB. The 2026-05-22 spot-check
+    # found 40 "fallback" indicators that were actually CiscoASA / FATT /
+    # SentryPeer / IppHoney / Honeyaml / Dicompot / Miniprint emissions
+    # falling through to the generic "Honeypot Attacker" name because
+    # they had no template here. Keep this dict in sync with vocab.
+    "Cowrie":        "Cowrie SSH/Telnet Attack - {ip} ({n} session{s})",
+    "Suricata":      "Suricata Alert - {ip} ({n} alert{s})",
+    "Honeytrap":     "Honeytrap Probe - {ip} ({n} probe{s})",
+    "Dionaea":       "Dionaea Malware Drop - {ip} ({n} drop{s})",
+    "Heralding":     "Heralding Credential Attack - {ip} ({n} session{s})",
+    "Mailoney":      "Mailoney SMTP Abuse - {ip} ({n} session{s})",
+    "ConPot":        "ConPot ICS Probe - {ip} ({n} probe{s})",
+    "Dicompot":      "Dicompot DICOM Probe - {ip} ({n} probe{s})",
+    "Medpot":        "Medpot HL7 Probe - {ip} ({n} probe{s})",
+    "ElasticPot":    "ElasticPot ES API Abuse - {ip} ({n} session{s})",
+    "Redishoneypot": "RedisHoneypot Probe - {ip} ({n} session{s})",
+    "Ciscoasa":      "CiscoASA Probe - {ip} ({n} probe{s})",
+    "Adbhoney":      "ADBhoney Android Debug Bridge Abuse - {ip} ({n} session{s})",
+    "Ipphoney":      "IppHoney Printer Probe - {ip} ({n} probe{s})",
+    "Miniprint":     "Miniprint Printer Probe - {ip} ({n} probe{s})",
+    "Tanner":        "Tanner Web Attack - {ip} ({n} session{s})",
+    "Wordpot":       "Wordpot WordPress Probe - {ip} ({n} probe{s})",
+    "Sentrypeer":    "SentryPeer SIP/VoIP Abuse - {ip} ({n} session{s})",
+    "Fatt":          "FATT Fingerprint Observation - {ip} ({n} burst{s})",
+    "NGINX":         "NGINX Web Probe - {ip} ({n} session{s})",
+    "Honeyaml":      "Honeyaml IaC Config Probe - {ip} ({n} probe{s})",
+    "Router":        "Router Telnet Abuse - {ip} ({n} session{s})",
+    "H0neytr4p":     "H0neytr4p Web Probe - {ip} ({n} probe{s})",
+    "__fallback__":  "Honeypot Activity (unknown type) - {ip} ({n} event{s})",
 }
 
 
@@ -648,7 +667,25 @@ class STIXBuilder:
         }
         return self._dedup(self._stamp(obj))
 
-    def build_cryptographic_key(self, value: str) -> Optional[dict]:
+    def build_cryptographic_key(
+        self,
+        value: str,
+        *,
+        session: Optional[AttackSession] = None,
+    ) -> Optional[dict]:
+        """Cryptographic-Key SCO (HASSH / SSH client fingerprint / etc.).
+
+        Type spelling is critical: `cryptographic-key` per STIX 2.1 and
+        LESSONS §8.4. The custom `x-opencti-cryptographic-key` typo gets
+        silently dropped by OpenCTI's worker — never use it.
+
+        When `session` is provided, attaches OpenCTI x_opencti_*
+        extensions so the HASSH page shows analyst-useful context (which
+        attacker IP it came from, which sensor, what SSH client banner).
+        Plugged in 2026-05-22 after spot-check showed Cryptographic-Key
+        as 100% missing description+labels — same gap Process had until
+        commit f66da5c.
+        """
         if not value:
             return None
         obj = {
@@ -656,6 +693,19 @@ class STIXBuilder:
             "id": generate_cryptographic_key_id(value),
             "value": value,
         }
+        if session is not None:
+            ssh_ver = (session.ssh_version or "unknown SSH client").strip() or "unknown SSH client"
+            obj["x_opencti_description"] = (
+                f"HASSH SSH-client fingerprint {value[:16]}… observed from "
+                f"attacker {session.src_ip} via {session.event_type} on "
+                f"sensor {session.sensor_hostname!r}. Banner: {ssh_ver}. "
+                f"Same fingerprint across different IPs implies same SSH "
+                f"client / tool — useful for campaign correlation."
+            )
+            obj["x_opencti_labels"] = sorted(set(
+                parser_labels_for(session.event_type) + ["ssh-fingerprint", "hassh"]
+            ))
+            obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj))
 
     # ──────────────────────────────────────────────────────────────────
@@ -996,7 +1046,7 @@ class STIXBuilder:
 
         # HASSH fingerprint → Cryptographic-Key
         if session.hassh:
-            ck = self.build_cryptographic_key(session.hassh)
+            ck = self.build_cryptographic_key(session.hassh, session=session)
             if ck:
                 out.append(ck)
                 if rel := self.build_relationship(
