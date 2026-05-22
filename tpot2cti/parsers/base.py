@@ -292,3 +292,79 @@ class BaseParser:
             if v not in (None, "", [], {}):
                 return v
         return None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Defensive-read helpers for T-Pot's dual-spelled fields
+    #
+    # Per 2026-05-22 audit #10-11 (and the 2026-05-22 dst_port bug,
+    # commit decc6df): T-Pot's logstash pipelines have shipped some
+    # fields under multiple names across versions.  Confirmed dual-
+    # spellings as of live ES sample 2026-05-22:
+    #
+    #   canonical → seen alternates
+    #   ──────────────────────────────────────────────────────────────
+    #   dest_port → dst_port   (real, every honeypot type)
+    #   dest_ip   → dst_ip     (real, every honeypot type)
+    #   src_port  → source_port (defensive — not currently shipping)
+    #   proto     → protocol   (real, ``protocol`` appears under
+    #                            ``attack_connection.protocol``)
+    #
+    # Always pass the CANONICAL T-Pot spelling first; the helper falls
+    # through to legacy names in order.  Helpers chosen over inline
+    # ``a or b or c`` so the convention is grep-able and a future
+    # parser author sees the dual-spelling discipline documented.
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def pick(doc: dict, *fields: str, default: Any = None) -> Any:
+        """First non-None doc[f] among ``fields``; ``default`` if none.
+
+        Strict ``is not None`` test — preserves 0 / ""  / [] so caller
+        can distinguish "field absent" from "field present with falsy
+        value" (matters for e.g. ``dst_port=0`` ICMP probes).
+        """
+        for f in fields:
+            v = doc.get(f)
+            if v is not None:
+                return v
+        return default
+
+    @classmethod
+    def pick_int(cls, doc: dict, *fields: str, default: Optional[int] = None) -> Optional[int]:
+        """``pick`` + ``int()`` coercion. Returns ``default`` on absence
+        or non-coercible values."""
+        v = cls.pick(doc, *fields)
+        if v is None:
+            return default
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def pick_str(cls, doc: dict, *fields: str, default: Optional[str] = None) -> Optional[str]:
+        """``pick`` + ``str()`` coercion. Returns ``default`` on absence."""
+        v = cls.pick(doc, *fields)
+        return default if v is None else str(v)
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test helpers — used by per-parser ``__main__`` blocks
+# ---------------------------------------------------------------------------
+# Per 2026-05-22 audit #15: several parsers' ``__main__`` smoke tests
+# duplicated identical ``os.environ.setdefault`` boilerplate to satisfy
+# load_config()'s required-vars check.  Pulled out so a future parser
+# author writes one line, and any future env-var addition only touches
+# this helper.
+
+def _smoketest_env() -> None:
+    """Seed the minimum env vars ``load_config()`` requires for smoke tests.
+
+    Idempotent (``setdefault``) so importing this from a parser smoke
+    test never clobbers a real container env.  Used only by per-parser
+    ``__main__`` blocks; production code paths never call this.
+    """
+    import os
+    os.environ.setdefault("TPOT_HOST", "test")
+    os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
+    os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")

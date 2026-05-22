@@ -625,12 +625,84 @@ def main() -> int:
         log_file=os.path.join(cfg.logging.log_dir, "tpot2cti.log"),
     )
 
+    # Build a richer startup banner so post-upgrade "which build is
+    # running" is answerable from logs alone (audit #L6). Best-effort —
+    # any sub-piece that fails to resolve drops to "unknown" rather than
+    # blocking startup.
+    def _banner_bits() -> dict:
+        bits = {}
+        # Git SHA from build-time env (Dockerfile ARG)
+        bits["git_sha"] = os.environ.get("TPOT2CTI_GIT_SHA", "unknown")[:12]
+        # pycti version — already imported via OpenCTIClient module
+        try:
+            import pycti  # type: ignore
+            bits["pycti"] = getattr(pycti, "__version__", "unknown")
+        except Exception:
+            bits["pycti"] = "unknown"
+        # Config fingerprint (excluding secrets) — short hash so an
+        # operator can compare "same config across containers" without
+        # leaking tokens.
+        import hashlib as _h
+        cfg_fp = {
+            "tlp": cfg.operator.default_tlp,
+            "interval": cfg.cycle.interval_iso,
+            "tpot": f"{cfg.tpot.host}:{cfg.tpot.ssh_port}",
+            "ignore_types": sorted(cfg.cycle.ignore_types),
+            "batch": cfg.cycle.batch_size,
+            "fatt_mult": cfg.cycle.fatt_cycle_multiplier,
+        }
+        bits["cfg_hash"] = _h.sha256(repr(sorted(cfg_fp.items())).encode()).hexdigest()[:8]
+        return bits
+
+    _bits = _banner_bits()
     logger.info(
         f"tpot2cti starting — operator={cfg.operator.org_name!r} "
         f"tlp={cfg.operator.default_tlp} "
         f"interval={cfg.cycle.interval_iso} "
-        f"tpot={cfg.tpot.host}:{cfg.tpot.ssh_port}"
+        f"tpot={cfg.tpot.host}:{cfg.tpot.ssh_port} "
+        f"git_sha={_bits['git_sha']} pycti={_bits['pycti']} "
+        f"cfg_hash={_bits['cfg_hash']} "
+        f"ignore_types={sorted(cfg.cycle.ignore_types)}"
     )
+
+    # 2.5) Parser-registry parity check (per 2026-05-22 audit #8).
+    #
+    # The two dispatch tables in builder.py (_PARSER_LABEL_VOCAB and
+    # _INDICATOR_NAME_TEMPLATES) MUST list the same parser type_name set
+    # as the runtime parser registry — otherwise events fall through to
+    # generic fallback labels / name templates ("Honeypot Attacker —
+    # 1.2.3.4 (1 event)") and operators lose per-honeypot scannability.
+    # We log a WARNING (not fatal) so a brand-new parser added before
+    # its vocab entry doesn't break the container — just makes the gap
+    # impossible to miss at startup.
+    try:
+        from tpot2cti.parsers import registered_types, FALLBACK_KEY
+        from tpot2cti.stix.builder import (
+            _PARSER_LABEL_VOCAB, _INDICATOR_NAME_TEMPLATES,
+        )
+        runtime_parsers = set(registered_types()) | {FALLBACK_KEY}
+        vocab_keys = set(_PARSER_LABEL_VOCAB.keys())
+        templ_keys = set(_INDICATOR_NAME_TEMPLATES.keys())
+        missing_in_vocab = runtime_parsers - vocab_keys
+        missing_in_templ = runtime_parsers - templ_keys
+        extra_in_vocab = vocab_keys - runtime_parsers
+        extra_in_templ = templ_keys - runtime_parsers
+        if missing_in_vocab or missing_in_templ or extra_in_vocab or extra_in_templ:
+            logger.warning(
+                f"parser-registry parity drift: "
+                f"missing_in_vocab={sorted(missing_in_vocab)} "
+                f"missing_in_templ={sorted(missing_in_templ)} "
+                f"extra_in_vocab={sorted(extra_in_vocab)} "
+                f"extra_in_templ={sorted(extra_in_templ)} — "
+                f"events may emit with generic labels / names"
+            )
+        else:
+            logger.info(
+                f"parser-registry parity OK: {len(runtime_parsers)} parsers "
+                f"(vocab + name-templates match registry)"
+            )
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug(f"parser-registry parity check skipped: {e}")
 
     # 3) State + ES + OpenCTI + Publisher.
     state = CycleState(db_path=cfg.runtime.state_db_path)

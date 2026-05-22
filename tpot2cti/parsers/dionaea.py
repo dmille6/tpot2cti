@@ -142,21 +142,38 @@ class DionaeaParser(BaseParser):
         self._populate_geoip(doc, event)
 
         # ── Hashes ─────────────────────────────────────────────────────
-        # We validate hex-ness and lowercase before stashing so the
+        # Dionaea's canonical ELK shape (per the dionaea.download.complete
+        # event) puts sha256/md5/sha1 at the top level of the doc.  Per
+        # 2026-05-22 audit #14 we also defensively read the nested
+        # ``connection.payload.*_hash`` / ``proxy_connection.payload.*_hash``
+        # paths used by some T-Pot versions when Dionaea emits via the
+        # connection-level payload event instead of the dedicated download
+        # event.  Hex-validated + lowercased before stashing so the
         # downstream STIX File / Indicator builders never see garbage.
+        conn = doc.get("connection") or {}
+        proxy = doc.get("proxy_connection") or {}
+        conn_payload = conn.get("payload") if isinstance(conn, dict) else None
+        proxy_payload = proxy.get("payload") if isinstance(proxy, dict) else None
+        conn_payload = conn_payload if isinstance(conn_payload, dict) else {}
+        proxy_payload = proxy_payload if isinstance(proxy_payload, dict) else {}
+
         all_hashes: dict[str, str] = {}
-        for field in ("sha256", "md5", "sha1"):
-            raw = doc.get(field)
+        for algo in ("sha256", "md5", "sha1"):
+            raw = (
+                doc.get(algo)
+                or conn_payload.get(f"{algo}_hash")
+                or proxy_payload.get(f"{algo}_hash")
+            )
             if not raw:
                 continue
             h = str(raw).strip().lower()
             if not _HEX_RE.match(h):
                 logger.debug(
-                    f"dionaea: ignoring non-hex {field}={raw!r} on "
+                    f"dionaea: ignoring non-hex {algo}={raw!r} on "
                     f"src_ip={src_ip}"
                 )
                 continue
-            all_hashes[field] = h
+            all_hashes[algo] = h
         if all_hashes:
             event.meta["all_hashes"] = all_hashes
             # Primary hash for ``session.malware_hashes`` — prefer

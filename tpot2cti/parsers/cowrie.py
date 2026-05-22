@@ -294,9 +294,8 @@ if __name__ == "__main__":
     # parser no longer carries a build() method; the orchestrator calls
     # builder.build_cowrie_session(session) instead.
     import os
-    os.environ.setdefault("TPOT_HOST", "test")
-    os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
-    os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
+    from tpot2cti.parsers.base import _smoketest_env
+    _smoketest_env()
     from tpot2cti.config import load_config
     from tpot2cti.stix.builder import STIXBuilder
 

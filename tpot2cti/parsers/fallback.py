@@ -249,9 +249,8 @@ if __name__ == "__main__":
     print(f"case 3: parsed no-src_ip event type={e3.event_type}")
 
     # --- Build STIX via the builder for all three cases -------------------
-    os.environ.setdefault("TPOT_HOST", "test")
-    os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
-    os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
+    from tpot2cti.parsers.base import _smoketest_env
+    _smoketest_env()
     from tpot2cti.config import load_config
     from tpot2cti.stix.builder import STIXBuilder
 

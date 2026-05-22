@@ -70,6 +70,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Build-time git SHA. Pass via `--build-arg TPOT2CTI_GIT_SHA=$(git rev-parse HEAD)`
+# from setup.sh / CI. Surfaced in the startup banner so post-upgrade
+# "which build is running" is answerable from logs alone (logging audit #L6).
+ARG TPOT2CTI_GIT_SHA=unknown
+ENV TPOT2CTI_GIT_SHA=${TPOT2CTI_GIT_SHA}
+
 # Per V1_SPEC §3 (Health endpoint) — 200 if last cycle succeeded within
 # 2× the cycle interval, else 503.  start_period gives the first cycle
 # time to complete before the healthcheck starts failing the container.

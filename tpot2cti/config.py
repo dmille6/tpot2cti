@@ -271,7 +271,13 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     cycle = CycleConfig(
         interval_iso=_env_str(env, "TPOT2CTI_INTERVAL", default="PT15M") or "PT15M",
         initial_lookback_hours=_env_int(env, "TPOT2CTI_INITIAL_LOOKBACK_HOURS", default=0),
-        ignore_types=_env_list(env, "TPOT2CTI_IGNORE_TYPES", default=[]),
+        # Default ignore list: P0f (passive OS-fingerprint enrichment, not attacks)
+        # and ssh-rsa (Cowrie public-key sub-events re-typed by T-Pot's logstash —
+        # the actual session data is already captured by the Cowrie parser via
+        # type=Cowrie). Per 2026-05-22 audit #8: 492 ssh-rsa docs/cycle were
+        # falling through to the Fallback parser as "Honeypot Activity (unknown
+        # type)" before this default landed.
+        ignore_types=_env_list(env, "TPOT2CTI_IGNORE_TYPES", default=["P0f", "ssh-rsa"]),
         batch_size=_env_int(env, "TPOT2CTI_BATCH_SIZE", default=1000),
         cycle_anchor_hour_utc=(
             _env_int(env, "TPOT2CTI_CYCLE_ANCHOR_HOUR_UTC", default=-1)

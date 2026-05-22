@@ -410,7 +410,18 @@ class STIXBuilder:
         self,
         country_code: str,
         country_name: Optional[str] = None,
+        *,
+        session: Optional[AttackSession] = None,
     ) -> Optional[dict]:
+        """Country-level Location SDO.
+
+        Per 2026-05-22 audit #6: accepts an optional ``session`` like the
+        other observable-style builders so the Location page in OpenCTI
+        gets a context description + parser-derived labels + the actual
+        first-seen timestamp.  Geographic browse views in particular
+        benefit — a bare ``"RO"`` is far less useful than ``"RO — sourcing
+        Cowrie SSH attacks via node2"``.
+        """
         if not country_code:
             return None
         cc = country_code.upper()
@@ -420,13 +431,31 @@ class STIXBuilder:
             "country": cc,
             "name": country_name or cc,
         }
+        if session is not None:
+            cname = country_name or cc
+            obj["x_opencti_description"] = (
+                f"Country observed sourcing honeypot attacks: {cname} ({cc}). "
+                f"Recent activity: {session.src_ip} via {session.event_type} "
+                f"on sensor {session.sensor_hostname!r}."
+            )
+            obj["x_opencti_labels"] = sorted(set(
+                parser_labels_for(session.event_type) + ["attacker-country"]
+            ))
+            obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_city_location(
         self,
         country_code: str,
         city: str,
+        *,
+        session: Optional[AttackSession] = None,
     ) -> Optional[dict]:
+        """City-level Location SDO.
+
+        See :meth:`build_country_location` for the ``session`` rationale —
+        same shape, scoped to the (country, city) pair.
+        """
         if not (country_code and city):
             return None
         cc = country_code.upper()
@@ -437,6 +466,16 @@ class STIXBuilder:
             "country": cc,
             "name": f"{city}, {cc}",
         }
+        if session is not None:
+            obj["x_opencti_description"] = (
+                f"City observed sourcing honeypot attacks: {city}, {cc}. "
+                f"Recent activity: {session.src_ip} via {session.event_type} "
+                f"on sensor {session.sensor_hostname!r}."
+            )
+            obj["x_opencti_labels"] = sorted(set(
+                parser_labels_for(session.event_type) + ["attacker-city"]
+            ))
+            obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_autonomous_system(
@@ -471,7 +510,21 @@ class STIXBuilder:
             obj["external_references"] = refs
         return self._dedup(self._stamp(obj, add_confidence=False))
 
-    def build_attack_pattern(self, name: str, mitre_id: Optional[str] = None) -> dict:
+    def build_attack_pattern(
+        self,
+        name: str,
+        mitre_id: Optional[str] = None,
+        *,
+        session: Optional[AttackSession] = None,
+    ) -> dict:
+        """AttackPattern SDO (optionally tied to a MITRE ATT&CK technique).
+
+        Per 2026-05-22 audit #6: accepts an optional ``session`` so the
+        pattern carries an evidence description + parser labels, mirroring
+        the enrichment shape we already apply to Indicator / AS / IP.
+        Without ``session`` the bare SDO is still emitted (drive-by path,
+        unit tests).
+        """
         obj = {
             "type": "attack-pattern",
             "id": generate_attack_pattern_id(name),
@@ -483,6 +536,18 @@ class STIXBuilder:
                 "external_id": mitre_id,
                 "url": f"https://attack.mitre.org/techniques/{mitre_id}/",
             }]
+        if session is not None:
+            mitre_str = f" (MITRE {mitre_id})" if mitre_id else ""
+            obj["description"] = (
+                f"Attack pattern {name!r}{mitre_str} observed in honeypot "
+                f"telemetry: {session.src_ip} via {session.event_type} on "
+                f"sensor {session.sensor_hostname!r}."
+            )
+            # AttackPattern is an SDO so it gets canonical objectLabel
+            # via labels= rather than x_opencti_labels (the latter is for SCOs).
+            obj["labels"] = sorted(set(
+                parser_labels_for(session.event_type) + ["attack-pattern"]
+            ))
         return self._dedup(self._stamp(obj, add_confidence=False)) or obj
 
     # ──────────────────────────────────────────────────────────────────
@@ -1232,7 +1297,7 @@ class STIXBuilder:
                     f"{meta.get('signature')!r}; skipping AttackPattern emission"
                 )
                 continue
-            ap = self.build_attack_pattern(name=name, mitre_id=tid)
+            ap = self.build_attack_pattern(name=name, mitre_id=tid, session=session)
             if ap:
                 out.append(ap)
                 attack_pattern_ids.append(ap["id"])
@@ -1241,7 +1306,7 @@ class STIXBuilder:
         # generic "Network Attack" AttackPattern so we always have an
         # indicates-target per V1_SPEC §5.2.
         if ip_ind and not attack_pattern_ids:
-            generic = self.build_attack_pattern(name="Network Attack")
+            generic = self.build_attack_pattern(name="Network Attack", session=session)
             if generic:
                 out.append(generic)
                 attack_pattern_ids.append(generic["id"])
@@ -1461,7 +1526,9 @@ class STIXBuilder:
 
         # GeoIP (logstash-enriched)
         if event.src_country_code:
-            country = self.build_country_location(event.src_country_code, event.src_country_name)
+            country = self.build_country_location(
+                event.src_country_code, event.src_country_name, session=session,
+            )
             if country:
                 out.append(country)
                 rel = self.build_relationship(
@@ -1471,7 +1538,9 @@ class STIXBuilder:
                 if rel:
                     out.append(rel)
             if event.src_city:
-                city = self.build_city_location(event.src_country_code, event.src_city)
+                city = self.build_city_location(
+                    event.src_country_code, event.src_city, session=session,
+                )
                 if city:
                     out.append(city)
                     rel = self.build_relationship(
