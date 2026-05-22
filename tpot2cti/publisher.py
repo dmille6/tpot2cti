@@ -275,7 +275,8 @@ class Publisher:
                 logger.info(
                     f"[{cycle_id}] Cross-cycle merge: restored {n_promoted} "
                     f"object(s) to their previously-higher-signal version "
-                    f"(per LESSONS §29 + 2026-05-21 P0f-overwrite bug)"
+                    f"(cross-cycle label/score preservation — pycti UPSERT "
+                    f"overwrite + 2026-05-21 P0f-overwrite bug)"
                 )
 
         # --- Step 1: label-union dedup (LESSONS §6) ----------------------
