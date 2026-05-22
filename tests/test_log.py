@@ -83,3 +83,52 @@ def test_restore_logging_idempotent(tmp_path):
 def test_restore_logging_noop_before_setup():
     """restore_logging() is safe before setup_logging() (idempotent)."""
     tlog.restore_logging()  # MUST NOT raise
+
+
+def test_defensive_zero_arg_setup_preserves_file_handler(tmp_path):
+    """L1 follow-on (2026-05-22): an 8-hour soak revealed that
+    ``OpenCTIClient.__init__`` was calling ``setup_logging()`` with no
+    args as a defensive "make sure handlers exist" measure — but the
+    zero-arg call resolved to ``log_file=None`` and wiped the cached
+    file_handler config that main.py had carefully set up.  Result:
+    every subsequent ``restore_logging()`` had nothing to rebuild, and
+    durable file logs were silently broken for the entire process
+    lifetime (only the 2-line startup banner reached disk; 8 hours of
+    cycle telemetry stayed in docker-json only).
+
+    This test pins the contract: a zero-arg ``setup_logging()`` call
+    AFTER a real init MUST preserve the file_handler config, so a
+    later ``restore_logging()`` continues to drive file writes.
+    """
+    import json
+    import logging as _logging
+    log_path = tmp_path / "preserve.log"
+
+    # Step 1: real init from main.py
+    tlog.setup_logging(log_level="INFO", log_file=str(log_path), connector_name="t")
+    log = _logging.getLogger("preserve.test")
+    log.info("before-defensive-call")
+
+    # Step 2: defensive zero-arg call (the buggy pattern)
+    tlog.setup_logging()
+
+    # Step 3: simulate pycti's basicConfig
+    _logging.basicConfig(level=_logging.WARNING)
+    for h in list(_logging.getLogger().handlers):
+        try:
+            h.close()
+        except Exception:
+            pass
+
+    # Step 4: restore — MUST rebuild file handler from preserved cache
+    tlog.restore_logging()
+    log.info("after-restore")
+
+    # Verify both lines reached the file
+    lines = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
+    msgs = [ln["message"] for ln in lines]
+    assert "before-defensive-call" in msgs, "pre-defensive-call line lost"
+    assert "after-restore" in msgs, (
+        "post-restore line lost — the defensive zero-arg setup_logging() "
+        "wiped the file-handler config (regression of L1 follow-on bug)"
+    )

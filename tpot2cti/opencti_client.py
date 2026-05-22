@@ -91,11 +91,15 @@ class OpenCTIClient:
         self.connector_id = connector_id
 
         # --- LESSONS §8.1 — handler hijack defense -------------------------
-        # Make sure our handlers exist BEFORE pycti's basicConfig() clobbers
-        # them. setup_logging() is idempotent: if main.py already ran it,
-        # this is a no-op (the cached handler list stays the same).
-        tpot2cti_log.setup_logging()
-
+        # main.py / selftest.py is expected to have called setup_logging()
+        # already; we only need restore_logging() AFTER pycti runs to
+        # rebuild the file handler.  We deliberately do NOT re-call
+        # setup_logging() here — per 2026-05-22 audit L1 follow-on, a
+        # zero-arg setup_logging() call wiped the file_handler config
+        # main.py had set, silently breaking durable file logs for the
+        # entire process lifetime.  setup_logging() is now self-defending
+        # against that footgun (preserves cached file config on a no-arg
+        # call), but the cleanest fix is to not call it twice.
         factory = client_factory or _default_client_factory()
         logger.info(
             f"Instantiating OpenCTIApiClient: url={cfg.url} "
