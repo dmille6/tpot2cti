@@ -165,8 +165,29 @@ def setup_logging(
         )
         if file_handler is not None:
             handlers.append(file_handler)
-    else:
-        _cached_file_config = None
+    elif _cached_file_config is not None:
+        # 2026-05-22 audit L1 follow-on: defensive callers (e.g.
+        # ``OpenCTIClient.__init__``) re-invoke ``setup_logging()`` with
+        # no ``log_file`` arg to make sure handlers exist.  Pre-fix this
+        # wiped the file-handler config that main.py had carefully set
+        # up — silently breaking durable JSON logs.  Now we preserve the
+        # already-cached file config so the second call is truly a
+        # safe-to-re-run no-op (still re-binds stdout, still resets the
+        # root level, but keeps the file handler alive).
+        file_handler = _make_file_handler(
+            _cached_file_config["path"],
+            _cached_file_config["retention_days"],
+            level,
+            formatter,
+        )
+        if file_handler is not None:
+            # Update cached config to the latest level/formatter so a
+            # genuinely-different call (e.g. raising LOG_LEVEL at runtime)
+            # actually takes effect on the next restore_logging.
+            _cached_file_config["level"] = level
+            _cached_file_config["formatter"] = formatter
+            handlers.append(file_handler)
+    # else: no log_file requested AND no prior cached config — stdout only.
 
     root = logging.getLogger()
     root.setLevel(level)
