@@ -64,6 +64,13 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    # Bound the json-file log so a long-running tunnel doesn't fill the
+    # host disk. autossh is mostly silent — 5MB × 3 = 15MB is plenty.
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ---------------------------------------------------------------------------
   # Core importer (V1_SPEC §3 cycle).
@@ -72,6 +79,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Build-time git SHA surfaces in the startup banner. setup.sh and
+        # update.sh export TPOT2CTI_GIT_SHA from `git rev-parse HEAD` so
+        # `docker compose build` reads it from the host env via this arg.
+        TPOT2CTI_GIT_SHA: ${TPOT2CTI_GIT_SHA:-unknown}
     image: tpot2cti/core:local
     container_name: tpot2cti-core
     restart: unless-stopped
@@ -86,6 +98,15 @@ services:
       - ./logs:/var/log/tpot2cti
     networks:
       - opencti_default
+    # Per 2026-05-22 logging audit #L2: cap docker-json log size so a
+    # multi-week soak can't fill the host disk. 20MB × 5 = 100MB cap;
+    # combined with the in-process rotating file handler at /var/log,
+    # operators have ~30 days of structured history available.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     # NO host port mapping.  /health is internal only.
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]

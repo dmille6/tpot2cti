@@ -34,11 +34,25 @@ from typing import Optional
 
 __all__ = ["setup_logging", "restore_logging", "JsonFormatter"]
 
-# Cached handlers attached by setup_logging(). restore_logging() re-attaches
-# these to the root logger after pycti clobbers it. Kept at module scope
-# (not on a class) so it survives across import boundaries.
-_cached_handlers: list[logging.Handler] = []
+# Cached *config* attached by setup_logging(). restore_logging() rebuilds
+# the file handler from scratch (rather than reusing the cached instance)
+# because pycti's basicConfig() closes the file handle, and re-attaching
+# the same TimedRotatingFileHandler object to root.handlers does NOT
+# reopen the file — leading to a silent "all subsequent file writes are
+# dropped" failure (per 2026-05-22 logging audit #L1).
+_cached_stdout_handler: Optional[logging.Handler] = None
+_cached_file_config: Optional[dict] = None  # {"path", "retention_days", "level", "formatter"}
 _cached_level: int = logging.INFO
+
+#: Logger names whose INFO chatter we silence after restore_logging().
+#: Per logging audit L3 + L8: pycti's ``api`` logger emits ~12 lines per
+#: STIX object created and elastic_transport's retry chatter duplicates
+#: errors we log with better context.  Setting them to WARNING cuts
+#: docker-log volume roughly 4× and keeps the remaining lines actually
+#: scannable.  Operators wanting the chatter back can set
+#: ``LOG_LEVEL=DEBUG`` to override.
+_NOISY_LOGGERS = ("api", "pycti", "elastic_transport", "elastic_transport.transport",
+                  "elastic_transport.node_pool")
 
 
 class JsonFormatter(logging.Formatter):
@@ -62,9 +76,18 @@ class JsonFormatter(logging.Formatter):
         self.connector_name = connector_name
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: D401
-        """Render ``record`` as a single-line JSON string."""
+        """Render ``record`` as a single-line JSON string.
+
+        Timestamp is strict ISO-8601 with milliseconds and ``+00:00``
+        separator (not ``+0000``) so picky parsers — ``datetime.fromisoformat``
+        pre-3.11, some Go and Rust libraries — accept it.  Millisecond
+        precision avoids non-deterministic ordering during publish bursts
+        (per logging audit #L11).
+        """
+        from datetime import datetime, timezone
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(timespec="milliseconds")
         payload: dict[str, object] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "ts": ts,
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -110,31 +133,40 @@ def setup_logging(
         function logs a warning to stdout and continues with stdout
         only. Logging is never allowed to fail the process.
     """
-    global _cached_handlers, _cached_level
+    global _cached_stdout_handler, _cached_file_config, _cached_level
 
     level = getattr(logging, log_level.upper(), logging.INFO)
     _cached_level = level
 
     formatter = JsonFormatter(connector_name=connector_name)
 
-    handlers: list[logging.Handler] = []
-
-    # Always-on stdout handler.
+    # Always-on stdout handler.  Cached as an instance because stdout
+    # never closes underneath us (unlike a file handle pycti might cycle).
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(level)
     stdout_handler.setFormatter(formatter)
-    handlers.append(stdout_handler)
+    _cached_stdout_handler = stdout_handler
 
-    # Optional rotating file handler.
+    handlers: list[logging.Handler] = [stdout_handler]
+
+    # Optional rotating file handler — config-cached (not instance-cached)
+    # so restore_logging() can rebuild from scratch.  See _NOISY_LOGGERS
+    # comment + audit #L1 for the rationale.
     resolved_path = _resolve_log_file(log_file, connector_name)
     if resolved_path is not None:
+        _cached_file_config = {
+            "path": resolved_path,
+            "retention_days": log_retention_days,
+            "level": level,
+            "formatter": formatter,
+        }
         file_handler = _make_file_handler(
             resolved_path, log_retention_days, level, formatter
         )
         if file_handler is not None:
             handlers.append(file_handler)
-
-    _cached_handlers = handlers
+    else:
+        _cached_file_config = None
 
     root = logging.getLogger()
     root.setLevel(level)
@@ -153,24 +185,57 @@ def restore_logging() -> None:
 
     Necessary because :class:`OpenCTIConnectorHelper.__init__` calls
     :func:`logging.basicConfig`, which adds its own handler and (in
-    some pycti versions) removes ours. We blow away whatever pycti
-    left behind and reinstall our cached set.
+    some pycti versions) removes ours.  Per 2026-05-22 audit #L1: the
+    file handler in particular has to be REBUILT from cached config —
+    pycti closes the underlying file descriptor, and re-adding the
+    same handler instance doesn't reopen the file (silent write-drop
+    failure since project inception until this fix).
+
+    We also turn down a handful of third-party loggers whose INFO chatter
+    drowns out the operator-actionable lines (per audit L3 + L8).
+    Operators wanting the noise back can run with ``LOG_LEVEL=DEBUG``.
 
     Idempotent: safe to call multiple times, and a no-op if
     :func:`setup_logging` was never called.
     """
-    if not _cached_handlers:
+    if _cached_stdout_handler is None:
         return
 
     root = logging.getLogger()
     root.setLevel(_cached_level)
+
+    # Strip every handler — including any pycti-installed ones AND any
+    # stale instances of our own.  We rebuild fresh below.
     for existing in list(root.handlers):
-        # If the handler is one of ours, leave it; otherwise drop it.
-        if existing not in _cached_handlers:
-            root.removeHandler(existing)
-    for handler in _cached_handlers:
-        if handler not in root.handlers:
-            root.addHandler(handler)
+        root.removeHandler(existing)
+        # Close file handles we owned so the OS frees them; stdout
+        # handlers don't need closing.
+        if not isinstance(existing, logging.StreamHandler) or hasattr(existing, "baseFilename"):
+            try:
+                existing.close()
+            except Exception:
+                pass
+
+    # Re-add stdout (instance is stable — sys.stdout doesn't go away).
+    root.addHandler(_cached_stdout_handler)
+
+    # REBUILD the file handler from cached config rather than reusing
+    # the (potentially-closed) instance from setup_logging().
+    if _cached_file_config is not None:
+        fh = _make_file_handler(
+            _cached_file_config["path"],
+            _cached_file_config["retention_days"],
+            _cached_file_config["level"],
+            _cached_file_config["formatter"],
+        )
+        if fh is not None:
+            root.addHandler(fh)
+
+    # Mute noisy third-party loggers (audit L3, L8). Only if our own
+    # level is > DEBUG — at DEBUG we want everything.
+    if _cached_level > logging.DEBUG:
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _resolve_log_file(

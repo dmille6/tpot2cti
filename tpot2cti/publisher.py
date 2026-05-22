@@ -207,7 +207,17 @@ class Publisher:
         if cycle_id is None:
             cycle_id = datetime.now(timezone.utc).strftime("cycle-%Y%m%dT%H%M%SZ")
 
-        bundle_id = f"bundle--{uuid.uuid4()}"
+        # Bundle id: derived from cycle_id so two publishes of the same
+        # cycle produce identical bundle envelopes.  Per 2026-05-22 audit
+        # #12: bundle id was previously ``uuid.uuid4()``, the only non-
+        # deterministic id in the codebase.  OpenCTI dedups by member id
+        # in practice so this is mostly cosmetic, but deterministic ids
+        # make replay-and-diff debugging tractable and align with the
+        # ``stix_ids.py`` UUID5 discipline everywhere else.  We import
+        # locally to avoid a top-of-module circular (stix_ids → config
+        # → publisher in some test paths).
+        from tpot2cti.stix_ids import sdo_id
+        bundle_id = sdo_id("bundle", "bundle", "cycle", str(cycle_id))
         errors: list[str] = []
 
         # --- Step 0: cross-cycle state merge ----------------------------
