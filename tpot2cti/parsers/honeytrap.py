@@ -7,7 +7,7 @@ a banner grab, an empty UDP packet — but occasionally an attacker
 actually sends an exploit payload to a non-honeypotted port and that
 payload is worth preserving.
 
-Per PoC LESSONS §32, this parser stays pure (model-only):
+Per the V0 parser-vs-builder separation rule, this parser stays pure (model-only):
 parse() + has_substance() only.  The per-protocol STIX shape lives in
 ``STIXBuilder.build_honeytrap_probe``.
 
@@ -337,12 +337,12 @@ if __name__ == "__main__":
     for t, n in sorted(subs_counts.items(), key=lambda x: -x[1]):
         print(f"  {t:25s} {n}")
 
-    # Per LESSONS_LEARNED §7.1 (post-refactor): Honeytrap no longer emits
+    # Per LESSONS §7.1 (post-refactor): Honeytrap no longer emits
     # a per-probe Note. The per-probe summary now lives on the Sighting's
     # `description` field. Verify both ends of the contract.
     assert not any(o["type"] == "note" for o in subs_objs), (
         "Honeytrap should NOT emit Notes anymore — summary goes in "
-        "Sighting.description per LESSONS_LEARNED §7.1"
+        "Sighting.description per LESSONS §7.1"
     )
     sightings = [o for o in subs_objs if o["type"] == "sighting"]
     assert sightings, "substantive bundle missing Sighting"

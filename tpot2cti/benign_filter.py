@@ -55,10 +55,21 @@ class FilterStats:
     by_vendor: Counter[str] = field(default_factory=Counter)
 
     def record(self, vendor: str) -> None:
+        """Increment the total-filtered counter and per-vendor breakdown.
+
+        Called once per event the filter drops; the caller passes the
+        matched vendor slug (``"censys"``, ``"shadowserver"``, etc.).
+        """
         self.total_filtered += 1
         self.by_vendor[vendor] += 1
 
     def to_log_dict(self) -> dict:
+        """Render counters in the shape the cycle summary log expects.
+
+        Returns ``{"total": int, "by_vendor": {vendor: count}}``. The
+        per-vendor map is a plain dict (not Counter) for JSON-friendly
+        emission via the structured-log formatter.
+        """
         return {
             "total": self.total_filtered,
             "by_vendor": dict(self.by_vendor),

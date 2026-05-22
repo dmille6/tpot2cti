@@ -89,7 +89,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Note bodies are capped per LESSONS_LEARNED §13 to keep bundles under
+# Note bodies are capped per LESSONS §13 to keep bundles under
 # OpenCTI's ~1 MB worker limit.  64 KB is generous for any reasonable
 # session summary.
 MAX_NOTE_BODY_BYTES = 64 * 1024
@@ -1031,7 +1031,7 @@ class STIXBuilder:
     ) -> Optional[dict]:
         """Per-session Note SDO.
 
-        WARNING: per LESSONS_LEARNED §7.1 we do NOT emit a per-IP per-cycle
+        WARNING: per LESSONS §7.1 we do NOT emit a per-IP per-cycle
         Activity Report.  Use this only for genuinely-per-session content
         (a Cowrie command transcript, a Honeytrap payload hexdump that's
         worth preserving).  For aggregated content use
@@ -1141,7 +1141,7 @@ class STIXBuilder:
         threads through to :func:`generate_sighting_id` so the two
         Sightings get distinct deterministic IDs.
 
-        Per LESSONS_LEARNED §7.1: putting per-session activity summaries
+        Per LESSONS §7.1: putting per-session activity summaries
         in the Sighting `description` is the preferred place for
         low-signal-per-event protocols (Honeytrap probe payload, Fallback
         unknown-type blurb). Beats spewing 50k+ Notes/day that nobody
@@ -1224,7 +1224,7 @@ class STIXBuilder:
     # ──────────────────────────────────────────────────────────────────
 
     # ──────────────────────────────────────────────────────────────────
-    # Per-parser session builders (PoC LESSONS §32 — STIX-shape decisions
+    # Per-parser session builders (the V0 parser-vs-builder separation rule — STIX-shape decisions
     # live here, not in parsers).  Each method consumes one AttackSession
     # and returns the full per-protocol STIX object list.  The orchestrator
     # (main.run_cycle) dispatches to the right method via _PARSER_DISPATCH.
@@ -1370,7 +1370,7 @@ class STIXBuilder:
         # Per-session Notes replaced by attacker-profile Notes emitted from
         # main.run_cycle (see tpot2cti/attacker_profile.py); per-session
         # command transcripts are preserved in the Process SDO's
-        # command_line field. Per PoC LESSONS §7.1 + the 2026-05-21 user
+        # command_line field. Per the V0 "don't emit 50K Notes/day" finding + the 2026-05-21 user
         # decision: ONE rolling Note per attacker IP scales; 50 per-session
         # Notes per attacker do not.
         _ = process_id  # referenced above; kept for future per-session links
@@ -1563,7 +1563,7 @@ class STIXBuilder:
         missing.  When ``src_ip`` is present, emits IPv4-Addr +
         IP-Indicator + Sighting + sensor context with the per-event
         summary on the Sighting.description (no Note — per
-        LESSONS_LEARNED §7.1).
+        LESSONS §7.1).
         """
         out: list[dict] = []
         if not session.events:
@@ -1598,7 +1598,7 @@ class STIXBuilder:
 
                 # Dual sighting on Indicator + IPv4 observable — per-event
                 # summary (unknown_type + dst_port) lives on the Sighting
-                # `description` field. Per LESSONS_LEARNED §7.1 we do NOT
+                # `description` field. Per LESSONS §7.1 we do NOT
                 # emit a separate Note per event for high-volume / low-
                 # signal protocols. If a maintainer wants per-event
                 # forensics, the raw doc is preserved on T-Pot's ES.
@@ -1612,7 +1612,7 @@ class STIXBuilder:
             # there is no Sighting to attach a description to — emit a
             # single free-floating Note so the event isn't silently lost.
             # This is the ONE remaining Note-emission path in the fallback
-            # builder (LESSONS_LEARNED §7.1 carve-out: per-event Notes for
+            # builder (LESSONS §7.1 carve-out: per-event Notes for
             # the IP-bearing common case are dropped; the rare no-IP case
             # keeps a Note as the only signal we can surface).
             body = render_fallback_no_ip_note_body(first, unknown_type)

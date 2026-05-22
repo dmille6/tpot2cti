@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Parser → builder-method dispatch (PoC LESSONS §32)
+# Parser → builder-method dispatch (the V0 parser-vs-builder separation rule)
 # ---------------------------------------------------------------------------
 # Parsers stay pure (parse + correlate + has_substance). The per-parser
 # STIX shape lives in STIXBuilder.build_<x>_session methods. The
@@ -79,74 +79,8 @@ _PARSER_DISPATCH: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Phase 5 imports — defensive stubs so this module is importable even when
-# Phase 5 hasn't landed yet (sibling agent is writing it in parallel).
-# The stubs are NEVER used in production — `main()` will fail loudly at
-# startup if pycti / publisher.py is missing.  But `from tpot2cti.main
-# import run_cycle` works in unit tests on a clean tree.
-# ---------------------------------------------------------------------------
-
-try:
-    from tpot2cti.publisher import Publisher  # type: ignore[import-not-found]
-    from tpot2cti.publisher import PublishResult  # type: ignore[import-not-found]
-    _HAVE_PUBLISHER = True
-except Exception:  # pragma: no cover — Phase 5 not landed yet
-    _HAVE_PUBLISHER = False
-
-    class PublishResult:  # type: ignore[no-redef]
-        """Stub PublishResult; replaced by Phase 5's real class on import."""
-
-        def __init__(self, **kwargs: Any) -> None:
-            self.__dict__.update(kwargs)
-
-        def __repr__(self) -> str:
-            return f"PublishResult({self.__dict__})"
-
-    class Publisher:  # type: ignore[no-redef]
-        """Stub Publisher — Phase 5 hasn't landed.  Logs and drops the bundle."""
-
-        def __init__(self, opencti_client: Any, *, state: Any = None) -> None:
-            self.opencti_client = opencti_client
-            self.state = state
-            logger.warning(
-                "Publisher stub in use — Phase 5 hasn't landed yet. "
-                "STIX objects will be logged and discarded."
-            )
-
-        def publish(
-            self, objects: list[dict], cycle_id: Optional[str] = None
-        ) -> PublishResult:
-            logger.info(
-                f"[stub publisher] would publish {len(objects)} STIX objects "
-                f"(cycle_id={cycle_id})"
-            )
-            return PublishResult(
-                ok=True, total=len(objects), foundation=0, entities=0,
-                relationships=0, errors=[], duration_seconds=0.0,
-            )
-
-try:
-    from tpot2cti.opencti_client import OpenCTIClient  # type: ignore[import-not-found]
-    _HAVE_OPENCTI_CLIENT = True
-except Exception:  # pragma: no cover
-    _HAVE_OPENCTI_CLIENT = False
-
-    class OpenCTIClient:  # type: ignore[no-redef]
-        """Stub OpenCTIClient — Phase 5 hasn't landed."""
-
-        def __init__(self, cfg: Any, connector_id: str = "") -> None:
-            self.cfg = cfg
-            self.connector_id = connector_id
-            logger.warning(
-                "OpenCTIClient stub in use — Phase 5 hasn't landed yet."
-            )
-
-        def send_bundle(self, objects: list[dict], update: bool = False) -> dict:
-            return {"ok": True, "stub": True, "count": len(objects)}
-
-        def health_check(self) -> bool:
-            return False
+from tpot2cti.publisher import Publisher, PublishResult
+from tpot2cti.opencti_client import OpenCTIClient
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +100,11 @@ class _Shutdown:
         self._event = threading.Event()
 
     def request(self, signum: int, *_: Any) -> None:
+        """Signal handler: politely ask the cycle loop to exit after the
+        current cycle finishes. Idempotent — a second signal logs but
+        doesn't escalate (partial publish corrupts OpenCTI state, so we
+        always let the in-flight cycle complete).
+        """
         if self.requested:
             # Second signal — operator is impatient.  Still don't kill the
             # current cycle (a partial publish corrupts OpenCTI's state),
@@ -400,7 +339,7 @@ def run_cycle(
                     f"raised (ignored): {e}"
                 )
             try:
-                # Per PoC LESSONS §32: parsers are pure data; STIX-shape
+                # Per the V0 parser-vs-builder separation rule: parsers are pure data; STIX-shape
                 # decisions live on the builder. We dispatch by the
                 # PARSER's type_name (not session.event_type — which
                 # carries the raw T-Pot type even when the fallback
@@ -461,7 +400,7 @@ def run_cycle(
     # ── Step 5b: attacker-profile Notes (live + daily + weekly) ───────
     # Replaces the per-session Cowrie Notes formerly emitted by
     # STIXBuilder.build_cowrie_session. See tpot2cti/attacker_profile.py
-    # and the 2026-05-21 user decision (PoC LESSONS §7.1).
+    # and the 2026-05-21 user decision (the V0 "don't emit 50K Notes/day" finding).
     try:
         live_objs = attacker_profile.emit_live_profile_notes(
             state, builder, profile_active_ips,
@@ -580,7 +519,7 @@ def run_cycle(
     except Exception as e:
         logger.warning(f"cycle {cycle_id}: state-db hygiene failed (non-fatal): {e}")
 
-    # Surface bundle-dedup % per PoC LESSONS §6 + our LESSONS §6:
+    # Surface bundle-dedup % per LESSONS §6 (bundle dedup with label-union):
     # the label-union pass should be cutting ~20-25% before send. If our
     # ratio drops to ~0% it likely means parsers aren't emitting labels
     # (each cycle starts clean — no dedup hits); if it spikes above ~40%
@@ -616,7 +555,7 @@ def main() -> int:
     # 1) Load config — fail fast on missing required env vars.
     cfg = load_config()
 
-    # 2) Configure JSON logging.  Per LESSONS_LEARNED §8.1 we set up
+    # 2) Configure JSON logging.  Per LESSONS §8.1 we set up
     #    BEFORE constructing pycti-using clients and restore AFTER.
     setup_logging(
         log_level=cfg.logging.level,
@@ -715,7 +654,7 @@ def main() -> int:
         verify_certs=cfg.es.verify_certs,
         request_timeout=cfg.es.request_timeout,
     )
-    # Per LESSONS_LEARNED §8.2: OpenCTIClient requires both the platform
+    # Per LESSONS §8.2: OpenCTIClient requires both the platform
     # config AND a non-empty connector_id (pycti accepts an empty one
     # then fails asynchronously with BAD_USER_INPUT).  We pass the core
     # connector UUID from setup.sh's generation.
@@ -733,6 +672,13 @@ def main() -> int:
 
     # Builder is per-cycle (bundle-scoped dedup); pass a factory.
     def builder_factory() -> STIXBuilder:
+        """Return a fresh ``STIXBuilder`` for one cycle.
+
+        Each cycle gets its own builder instance so the per-bundle
+        dedup state (which Identity / Location / AS objects have
+        already been emitted in *this* bundle) doesn't leak between
+        cycles. Used by ``run_cycle()`` once per cycle.
+        """
         return STIXBuilder(cfg)
 
     # 4) Health endpoint — start before the first cycle so docker-compose

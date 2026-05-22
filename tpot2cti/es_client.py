@@ -16,7 +16,7 @@ Error-handling policy per V1_SPEC.md §7:
     - Connection drop       → log + raise (caller backs off)
     - Don't swallow errors silently.
 
-Sync-only (no asyncio) per LESSONS_LEARNED §2.4 / V2_HANDOFF §2.4.
+Sync-only (no asyncio) per LESSONS §2.4 / V2_HANDOFF §2.4.
 """
 
 from __future__ import annotations
@@ -212,7 +212,7 @@ class TpotESClient:
             # "p0f". Confirmed against the live ES on 2026-05-21: the
             # `type` filter let 5,132 P0f docs through per 15-min window
             # despite TPOT2CTI_IGNORE_TYPES=P0f; switching to type.keyword
-            # filters them correctly. See LESSONS_LEARNED §8.5 (added in
+            # filters them correctly. See LESSONS §8.5 (added in
             # this commit) for the broader pattern.
             must_not.append({"terms": {"type.keyword": list(ignore_types)}})
 

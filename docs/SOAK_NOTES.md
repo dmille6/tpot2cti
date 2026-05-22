@@ -137,7 +137,7 @@ Validated during the live soak:
 - ✅ **No own-server attribution** (live-install postmortem). `TPOT_HONEYPOT_IPS` self-filter drops events where src_ip is our public IP.
 - ✅ **No Google/Censys/Shodan flagged as malicious** (live-install postmortem). Benign-scanner allowlist filters at parse time.
 - ✅ **No 30-Notes-per-attacker bug** (live-install postmortem). LESSONS §7.1 refactor moved per-probe summaries to Sighting.description.
-- ✅ **No score drift on re-emission** (PoC LESSONS §29 + score-plateau smoke). Same session = same score across cycles.
+- ✅ **No score drift on re-emission** (the V0 finding on pycti UPSERT overwriting scalar fields + score-plateau smoke). Same session = same score across cycles.
 
 ---
 

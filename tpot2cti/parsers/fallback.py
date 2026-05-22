@@ -1,6 +1,6 @@
 """Fallback parser — handles any T-Pot honeypot type without a dedicated parser.
 
-Per PoC LESSONS §32, this parser stays pure (model-only):
+Per the V0 parser-vs-builder separation rule, this parser stays pure (model-only):
 parse() + has_substance() only.  The per-protocol STIX shape lives in
 ``STIXBuilder.build_fallback_event``.
 
@@ -15,7 +15,7 @@ Per V1_SPEC.md §5.24 (Fallback parser):
     STIX emitted (by the builder):
       IPv4-Addr (if src_ip present), Sighting (with description), and
       a Note ONLY when src_ip is missing (so the event isn't silently
-      lost — per LESSONS_LEARNED §7.1 we no longer emit per-event Notes
+      lost — per LESSONS §7.1 we no longer emit per-event Notes
       when an IP is available).
 
     The fallback parser also emits a `WARNING` log line on every
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     assert "ipv4-addr" in types1, "case 1: IPv4-Addr expected when src_ip present"
     assert "indicator" in types1, "case 1: IP Indicator expected"
     assert "sighting" in types1, "case 1: Sighting expected"
-    # Post-refactor (LESSONS_LEARNED §7.1): no Note when src_ip present —
+    # Post-refactor (LESSONS §7.1): no Note when src_ip present —
     # the per-event summary lives in the Sighting.description instead.
     assert "note" not in types1, (
         "case 1: Note should NOT be emitted when src_ip present "

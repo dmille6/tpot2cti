@@ -1,6 +1,6 @@
 """tpot2cti — STIX text-rendering helpers.
 
-Per PoC LESSONS §32 ("Honeypot-specific IoC extraction belongs in the
+Per the V0 parser-vs-builder separation rule ("Honeypot-specific IoC extraction belongs in the
 STIX builder, not the parser"), parsers stay pure (model-only). They
 convert raw ES docs into typed Python objects; STIX-shape decisions and
 text rendering for Notes / Sighting descriptions live here.
@@ -33,7 +33,7 @@ _MAX_COMMAND_BYTES = 8000
 # ---------------------------------------------------------------------------
 
 #: Cap on payload_printable bytes preserved in the Sighting.description.
-#: Per LESSONS_LEARNED §7.1 we no longer emit a separate Note per probe.
+#: Per LESSONS §7.1 we no longer emit a separate Note per probe.
 #: Keep this short — the description is a one-line summary, not a hex dump.
 SIGHTING_DESC_PREVIEW_CAP = 160
 
@@ -196,7 +196,7 @@ def render_honeytrap_sighting_description(
     """One-line summary baked into the Sighting's `description` field.
 
     Replaces the per-probe Note that V0 emitted (and the bare port-scan
-    approach the PoC used). Per LESSONS_LEARNED §7.1: this is the
+    approach the PoC used). Per LESSONS §7.1: this is the
     right place for low-signal-per-event protocol summaries — the
     analyst sees it in OpenCTI's Sighting context without flooding
     the Notes tab.

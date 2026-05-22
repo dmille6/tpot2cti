@@ -6,7 +6,7 @@ the three ordered passes mandated by V1_SPEC §3 (lines 278-294):
 1. **Foundation** — Identity, Marking-Definition, AttackPattern,
    Location, Autonomous-System. The objects everything else references.
 2. **Sleep 30s** — let OpenCTI's eventually-consistent ES index the
-   foundation objects so the entity pass doesn't tripping
+   foundation objects so the entity pass doesn't trip
    ``MISSING_REFERENCE_ERROR``.
 3. **Entities** — IPv4-Addr, IPv6-Addr, File, URL, Domain-Name, Process,
    Cryptographic-Key, Indicator, Note, Vulnerability.
@@ -221,7 +221,7 @@ class Publisher:
         errors: list[str] = []
 
         # --- Step 0: cross-cycle state merge ----------------------------
-        # Per PoC LESSONS §29 + the 2026-05-21 live-find: pycti's UPSERT
+        # Per the V0 finding on pycti UPSERT overwriting scalar fields + the 2026-05-21 live-find: pycti's UPSERT
         # overwrites scalar fields on Indicators/SCOs across cycles. To
         # preserve the highest-signal observation of each id, we merge
         # this cycle's emission against `object_max_state` in our DB:

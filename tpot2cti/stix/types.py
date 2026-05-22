@@ -109,7 +109,7 @@ def hint_for(type_name: str) -> str:
     return (
         f"Add to KNOWN_STIX_TYPES in tpot2cti/stix/types.py if intentional, "
         f"or fix the parser.  Unknown types are silently dropped by "
-        f"OpenCTI's worker — see LESSONS_LEARNED §8.4."
+        f"OpenCTI's worker — see LESSONS §8.4."
     )
 
 

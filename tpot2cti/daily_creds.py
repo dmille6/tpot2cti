@@ -26,7 +26,7 @@ Per the user-confirmed design (Phase 6 spec):
   - We DO NOT record (sensor, date) into the log table until AFTER
     the publisher round succeeds.  See `main.run_cycle()`.
 
-LESSONS_LEARNED_FROM_V0.md §13 (Note size budget): we cap the Note
+LESSONS §13 (Note size budget): we cap the Note
 body well under OpenCTI's worker bundle limit — the table is
 guaranteed to fit because 100 rows × ~120 bytes ≈ 12 KB max.
 """

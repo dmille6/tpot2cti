@@ -4,7 +4,7 @@ Per V1_SPEC §4 + LESSONS §3: the three attacker-profile Note ids
 (live/daily/weekly) are deterministic from (ip, cadence, period).
 Re-emission in a later cycle MUST produce the same id so OpenCTI
 upserts in place rather than spawning a Note per cycle (which is the
-50k-Notes-per-day anti-pattern from PoC LESSONS §7.1).
+50k-Notes-per-day anti-pattern from the V0 "don't emit 50K Notes/day" finding).
 """
 
 from __future__ import annotations

@@ -38,6 +38,20 @@ from tpot2cti.stix.builder import STIXBuilder
 
 
 def main() -> int:
+    """Container entry-point: ``python3 -m tpot2cti.selftest``.
+
+    Runs a tiny end-to-end smoke test of the pipeline against a live
+    OpenCTI: emits a minimal foundation bundle (one Identity, one
+    Marking-Definition) and verifies it lands cleanly. Used by
+    ``setup.sh`` step 10 to catch pycti-version-vs-OpenCTI-version
+    mismatches at install time rather than at the first scheduled cycle.
+
+    Returns:
+        ``0`` on success, ``1`` on any failure (config load, pycti
+        instantiation, bundle publish, or post-emit verification). The
+        process exit code is the only signal — stdout/stderr carry
+        diagnostic JSON via the standard tpot2cti logger.
+    """
     cfg = load_config()
     setup_logging(
         log_level=cfg.logging.level,

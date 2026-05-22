@@ -1,7 +1,7 @@
 """Robust env-var parsing helpers.
 
 Ported from tsec-tpot-connectors/shared/tsec_env.py — see
-PoC LESSONS_LEARNED §38 (the "docker --env-file inline-comment footgun")
+the V0 docker --env-file inline-comment footgun (the "docker --env-file inline-comment footgun")
 for the motivating bug.
 
 Why this exists
@@ -85,7 +85,7 @@ def truthy_str(raw: Optional[str], default: bool) -> bool:
     """
     if raw is None:
         return default
-    # Strip inline `# comment` (PoC LESSONS §38 footgun).
+    # Strip inline `# comment` (the V0 docker --env-file inline-comment footgun footgun).
     s = raw.split("#", 1)[0].strip().lower()
     if s in _TRUTHY:
         return True
