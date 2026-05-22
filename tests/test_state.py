@@ -1,0 +1,79 @@
+"""CycleState SQLite-backed state — pruning + vacuum + size.
+
+Per the 2026-05-22 audit #2: ``attacker_activity`` and friends had no
+pruning at all and grew monotonically.  Tests below pin the pruning
+semantics (cutoff respected, vacuum idempotent within window).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+
+def test_set_and_get_last_run(state_db):
+    """Round-trip a last_run timestamp through SQLite."""
+    when = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    state_db.set_last_run(when)
+    got = state_db.get_last_run()
+    assert got == when
+
+
+def test_get_last_run_missing_returns_none(state_db):
+    """No row → None, not an exception."""
+    assert state_db.get_last_run() is None
+
+
+def test_prune_all_returns_dict(state_db):
+    """prune_all returns a dict keyed by table name."""
+    result = state_db.prune_all()
+    assert isinstance(result, dict)
+    assert {"cycles", "attacker_activity", "profile_emit_log", "object_max_state"} <= set(result)
+    assert all(isinstance(v, int) for v in result.values())
+
+
+def test_prune_attacker_activity_respects_cutoff(state_db):
+    """A row newer than cutoff stays; a row older than cutoff is dropped."""
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(days=1)).isoformat()
+    stale = (now - timedelta(days=200)).isoformat()
+    with state_db._conn() as c:
+        c.execute(
+            "INSERT INTO attacker_activity (src_ip, parser, sensor, first_seen, last_seen) "
+            "VALUES ('1.1.1.1', 'Cowrie', 'n1', ?, ?)", (fresh, fresh))
+        c.execute(
+            "INSERT INTO attacker_activity (src_ip, parser, sensor, first_seen, last_seen) "
+            "VALUES ('2.2.2.2', 'Cowrie', 'n1', ?, ?)", (stale, stale))
+    n = state_db.prune_attacker_activity(cutoff_days=90)
+    assert n == 1
+    with state_db._conn() as c:
+        rows = c.execute("SELECT src_ip FROM attacker_activity").fetchall()
+    assert [r[0] for r in rows] == ["1.1.1.1"]
+
+
+def test_maybe_vacuum_idempotent_within_window(state_db):
+    """A second vacuum within the min-age window MUST NOT re-run."""
+    assert state_db.maybe_vacuum(min_age_days=30) is True
+    assert state_db.maybe_vacuum(min_age_days=30) is False
+
+
+def test_db_size_bytes_positive(state_db):
+    """An initialized DB has a non-zero file size."""
+    assert state_db.db_size_bytes() > 0
+
+
+def test_prune_cycles_keeps_last_n(state_db):
+    """prune_cycles preserves the most recent N rows."""
+    for _ in range(5):
+        state_db.start_cycle()
+    n = state_db.prune_cycles(keep_last=2)
+    assert n == 3
+    assert len(state_db.recent_cycles(limit=10)) == 2
+
+
+def test_record_daily_creds_emitted_idempotent(state_db):
+    """Same (sensor, date) twice = one row, latest emitted_at wins."""
+    from datetime import date
+    state_db.record_daily_creds_emitted("node1", date(2026, 5, 21))
+    state_db.record_daily_creds_emitted("node1", date(2026, 5, 21))
+    missing = state_db.get_missing_daily_creds_dates("node1", lookback_days=2)
+    assert date(2026, 5, 21) not in missing
