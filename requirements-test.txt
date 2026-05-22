@@ -1,0 +1,6 @@
+# tpot2cti test dependencies.
+#
+# Keep this list MINIMAL: stdlib unittest.mock is preferred over pytest-mock,
+# and we deliberately avoid heavy plugins so CI start-up stays fast.
+
+pytest>=8,<10
