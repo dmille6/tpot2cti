@@ -116,7 +116,7 @@ class MiniprintParser(BaseParser):
             return None
 
         # Miniprint default port is 9100; respect the doc's value if set.
-        dst_port = self._safe_int(doc.get("dst_port")) or 9100
+        dst_port = self._safe_int((doc.get("dest_port") or doc.get("dst_port"))) or 9100
 
         event = ParsedEvent(
             src_ip=str(src_ip),
@@ -129,7 +129,7 @@ class MiniprintParser(BaseParser):
             event_type="Miniprint",
             src_port=self._safe_int(doc.get("src_port")),
             dst_port=dst_port,
-            dst_ip=doc.get("dst_ip"),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
             protocol="raw-print",
             raw_doc=doc,
         )

@@ -117,7 +117,7 @@ class AdbhoneyParser(BaseParser):
 
         # ADBhoney is single-port: 5555.  T-Pot may still populate
         # dst_port, so we respect it but default to 5555 in meta.
-        dst_port = self._safe_int(doc.get("dst_port")) or 5555
+        dst_port = self._safe_int((doc.get("dest_port") or doc.get("dst_port"))) or 5555
 
         event = ParsedEvent(
             src_ip=str(src_ip),
@@ -131,7 +131,7 @@ class AdbhoneyParser(BaseParser):
             session_id=doc.get("session") or doc.get("session_id"),
             src_port=self._safe_int(doc.get("src_port")),
             dst_port=dst_port,
-            dst_ip=doc.get("dst_ip"),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
             protocol="adb",
             raw_doc=doc,
         )

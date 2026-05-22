@@ -85,7 +85,23 @@ class HoneytrapParser(BaseParser):
         if ts is None:
             return None
 
-        dst_port = self._safe_int(doc.get("dst_port") or ac.get("dst_port"))
+        # T-Pot Honeytrap docs use `dest_port` / `dest_ip` (live ES sample
+        # 2026-05-22), NOT `dst_port` / `dst_ip`. Earlier parser code
+        # missed this and Sighting descriptions showed `tcp/?` for every
+        # Honeytrap probe. Accept both spellings + the nested
+        # `attack_connection.*` shape for cross-version safety.
+        dst_port = self._safe_int(
+            doc.get("dest_port")
+            or doc.get("dst_port")
+            or ac.get("dest_port")
+            or ac.get("dst_port")
+        )
+        dst_ip = (
+            doc.get("dest_ip")
+            or doc.get("dst_ip")
+            or ac.get("dest_ip")
+            or ac.get("dst_ip")
+        )
         proto = (doc.get("proto") or ac.get("protocol") or "").lower() or None
 
         event = ParsedEvent(
@@ -99,7 +115,7 @@ class HoneytrapParser(BaseParser):
             event_type="Honeytrap",
             src_port=self._safe_int(doc.get("src_port") or ac.get("src_port")),
             dst_port=dst_port,
-            dst_ip=doc.get("dst_ip") or ac.get("dst_ip"),
+            dst_ip=dst_ip,
             protocol=proto,
             raw_doc=doc,
         )

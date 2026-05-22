@@ -85,9 +85,9 @@ class CowrieParser(BaseParser):
             event_type="Cowrie",
             session_id=doc.get("session"),
             src_port=self._safe_int(doc.get("src_port")),
-            dst_port=self._safe_int(doc.get("dst_port")),
-            dst_ip=doc.get("dst_ip"),
-            protocol="ssh" if (doc.get("dst_port") in (22, 2222)) else "telnet",
+            dst_port=self._safe_int((doc.get("dest_port") or doc.get("dst_port"))),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
+            protocol="ssh" if ((doc.get("dest_port") or doc.get("dst_port")) in (22, 2222)) else "telnet",
             raw_doc=doc,
         )
         self._populate_geoip(doc, event)

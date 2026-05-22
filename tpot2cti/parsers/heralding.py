@@ -98,8 +98,8 @@ class HeraldingParser(BaseParser):
             event_type="Heralding",
             session_id=doc.get("session_id"),
             src_port=self._safe_int(doc.get("src_port")),
-            dst_port=self._safe_int(doc.get("dst_port")),
-            dst_ip=doc.get("dst_ip"),
+            dst_port=self._safe_int((doc.get("dest_port") or doc.get("dst_port"))),
+            dst_ip=(doc.get("dest_ip") or doc.get("dst_ip")),
             protocol=protocol,
             raw_doc=doc,
         )
