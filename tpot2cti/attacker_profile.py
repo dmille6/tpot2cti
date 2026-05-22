@@ -1,6 +1,6 @@
 """tpot2cti — attacker-profile Note emitter.
 
-Per PoC LESSONS §7.1 ("don't emit 50K Notes/day"), per-session Notes
+Per the V0 post-mortem finding: "do not emit 50K Notes/day", per-session Notes
 do not scale: an attacker that hits us 50 times a day produces 50
 Notes on their Indicator page, which an analyst will never read.
 

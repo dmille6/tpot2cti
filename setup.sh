@@ -356,7 +356,7 @@ generate_secrets() {
     info "ELASTIC_MEMORY_SIZE auto-set to $GEN_ELASTIC_MEMORY_SIZE (detected ${ram_gb}G host RAM)"
 
     # Discover every CONNECTOR_*_ID in opencti/.env.sample and generate a fresh UUID
-    # for each. Per LESSONS_LEARNED §8.2: empty connector IDs cause BAD_USER_INPUT.
+    # for each. Per LESSONS §8.2: empty connector IDs cause BAD_USER_INPUT.
     GEN_CONNECTOR_UUID_MAP=()
     while IFS='=' read -r key _value; do
         if [[ "$key" == CONNECTOR_*_ID ]] || [[ "$key" == XTM_COMPOSER_ID ]]; then
@@ -450,7 +450,7 @@ TPOT2CTI_DEFAULT_CONFIDENCE=75
 # === Cycle behavior ===
 TPOT2CTI_INTERVAL=PT15M
 TPOT2CTI_INITIAL_LOOKBACK_HOURS=0
-# P0f default-ignored per PoC LESSONS §31 (the "two-question rule"):
+# P0f default-ignored per the V0 "two-question rule" (slowly-evolving enrichment data belongs in a separate cadence, not the bulk-import loop) (the "two-question rule"):
 # P0f is enrichment-shaped passive fingerprint data, not actionable
 # attack-event data. ~2.3M events/day fleet-wide if ingested.
 TPOT2CTI_IGNORE_TYPES=P0f

@@ -129,7 +129,7 @@ def generate_cryptographic_key_id(value: str) -> str:
     """Cryptographic-Key SCO id. Seed: ``cryptographic-key:<value>``.
 
     Note: the correct STIX type is ``cryptographic-key``, NOT
-    ``x-opencti-cryptographic-key`` (see LESSONS_LEARNED §8.4 for the
+    ``x-opencti-cryptographic-key`` (see LESSONS §8.4 for the
     silent-drop bug this prevents).
     """
     return sdo_id("cryptographic-key", "cryptographic-key", value)
@@ -175,7 +175,7 @@ def generate_daily_creds_note_id(sensor: str, utc_date: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Attacker-profile Note ids (per-IP rolling profile + daily/weekly snapshots).
-# See ``tpot2cti/attacker_profile.py`` for the consumer and PoC LESSONS §7.1
+# See ``tpot2cti/attacker_profile.py`` for the consumer and the V0 "don't emit 50K Notes/day" finding
 # for the rationale (one rolling Note per attacker IP rather than 50 per-
 # session Notes that nobody reads).
 # ---------------------------------------------------------------------------

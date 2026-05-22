@@ -6,7 +6,7 @@ ports 22, 23, 2222.  It emits multiple event types per session
 all sharing a `session` field.  We correlate by that field and
 build per-session STIX that captures the full attacker interaction.
 
-Per PoC LESSONS §32 ("Honeypot-specific IoC extraction belongs in the
+Per the V0 parser-vs-builder separation rule ("Honeypot-specific IoC extraction belongs in the
 STIX builder, not the parser"), this parser stays pure (model-only):
 parse() + correlate() + has_substance() only.  The per-protocol STIX
 shape lives in ``STIXBuilder.build_cowrie_session`` — see

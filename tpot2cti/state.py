@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS daily_creds_log (
 CREATE INDEX IF NOT EXISTS idx_daily_creds_log_utc_date
     ON daily_creds_log(utc_date);
 
--- Cross-cycle label/score preservation per PoC LESSONS §29 + the
+-- Cross-cycle label/score preservation per the V0 finding on pycti UPSERT overwriting scalar fields + the
 -- 2026-05-21 live-find: pycti's UPSERT silently overwrites scalar
 -- fields on Indicators/SCOs across cycles. A high-signal Cowrie
 -- indicator (score 100, labels [cowrie, honeypot, ssh-telnet]) could
@@ -519,7 +519,7 @@ class CycleState:
         }
 
     # ----------------------------------------------------------------------
-    # Cross-cycle label/score preservation (PoC LESSONS §29 + the
+    # Cross-cycle label/score preservation (the V0 finding on pycti UPSERT overwriting scalar fields + the
     # 2026-05-21 live-find: pycti UPSERT silently overwrites scalar fields
     # across cycles; need connector-side memory of the highest-signal
     # emission to preserve it through low-signal re-emissions).

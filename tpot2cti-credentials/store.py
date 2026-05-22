@@ -83,7 +83,7 @@ class CredentialsStore:
 
     DuckDB's file format is single-writer; we keep one connection open
     for the lifetime of the process. The wrapper is intentionally
-    sync — sidecars are not asyncio (per LESSONS_LEARNED §2.4).
+    sync — sidecars are not asyncio (per LESSONS §2.4).
     """
 
     def __init__(self, db_path: str) -> None:

@@ -87,7 +87,7 @@ class CycleConfig:
     ignore_types: list[str] = field(default_factory=list)
     batch_size: int = 1000
     cycle_anchor_hour_utc: Optional[int] = None  # None = no anchor sleep
-    transient_retry_seconds: int = 60       # per LESSONS_LEARNED §5
+    transient_retry_seconds: int = 60       # per LESSONS §5
     #: Seconds to sleep between the publisher's three passes. Per PoC
     #: HP_CONNECTOR_HANDOFF §4 ("the single most impactful tuning
     #: parameter") and V1_SPEC §3. Default 60s tuned conservatively for
@@ -195,7 +195,7 @@ def _env_bool(env: dict, key: str, default: bool) -> bool:
     """Truthy-env helper.
 
     Delegates to :func:`tpot2cti.env.truthy_str` so the parsing matches
-    everywhere in the project (and is robust to the PoC LESSONS §38
+    everywhere in the project (and is robust to the the V0 docker --env-file inline-comment footgun
     "docker --env-file inline-comment footgun"). For a value that comes
     from anywhere other than the env dict, use ``tpot2cti.env.truthy_str``
     directly.

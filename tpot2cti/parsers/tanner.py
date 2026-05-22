@@ -72,7 +72,7 @@ _TANNER_TO_MITRE: dict[str, tuple[str, str]] = {
 }
 
 #: TANNER verdicts that are explicitly "no attack" — these get the
-#: drive-by code path.  Per V1_SPEC §5.17 and LESSONS_LEARNED §2.
+#: drive-by code path.  Per V1_SPEC §5.17 and LESSONS §2.
 _TANNER_NO_ATTACK: frozenset[str] = frozenset({"", "unknown", "none"})
 
 

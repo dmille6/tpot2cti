@@ -26,7 +26,7 @@ Implementation notes:
   - We DO NOT call `opencti.health_check()` on every /health hit —
     that would make our liveness probe transitively depend on
     OpenCTI's liveness, which is the wrong dependency direction
-    (per LESSONS_LEARNED §11: "container restart loop because the
+    (per LESSONS §11: "container restart loop because the
     health probe blocked on a downstream platform that itself relied
     on this container being up").  We only call it on startup, log
     the result, and surface it as a `last_opencti_check` field.
@@ -110,13 +110,20 @@ class _HealthHandler(BaseHTTPRequestHandler):
     instances (each request gets a fresh handler).
     """
 
-    # Silence the default stderr access log — we have JSON logs already.
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        # Route through the module logger at DEBUG so operators can
-        # opt into access logs via LOG_LEVEL=DEBUG.
+        """Override ``BaseHTTPRequestHandler.log_message`` to silence the
+        default stderr access log (we ship JSON logs via the module
+        logger instead). Access logs are emitted at DEBUG so operators
+        can opt in with ``LOG_LEVEL=DEBUG``.
+        """
         logger.debug("health: %s - - %s" % (self.address_string(), format % args))
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib API
+        """Serve ``GET /health`` with the JSON status from
+        :meth:`HealthServer.compute_status` (200 on healthy / 503 on
+        stale). Any other path returns 404. The healthcheck contract
+        per V1_SPEC §3 is intentionally narrow: one endpoint, two states.
+        """
         if self.path != "/health":
             self._write_json(404, {"status": "not found", "path": self.path})
             return
