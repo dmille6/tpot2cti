@@ -271,13 +271,28 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     cycle = CycleConfig(
         interval_iso=_env_str(env, "TPOT2CTI_INTERVAL", default="PT15M") or "PT15M",
         initial_lookback_hours=_env_int(env, "TPOT2CTI_INITIAL_LOOKBACK_HOURS", default=0),
-        # Default ignore list: P0f (passive OS-fingerprint enrichment, not attacks)
-        # and ssh-rsa (Cowrie public-key sub-events re-typed by T-Pot's logstash —
-        # the actual session data is already captured by the Cowrie parser via
-        # type=Cowrie). Per 2026-05-22 audit #8: 492 ssh-rsa docs/cycle were
-        # falling through to the Fallback parser as "Honeypot Activity (unknown
-        # type)" before this default landed.
-        ignore_types=_env_list(env, "TPOT2CTI_IGNORE_TYPES", default=["P0f", "ssh-rsa"]),
+        # Default ignore list — types T-Pot's logstash emits that don't
+        # represent attack events on their own:
+        #
+        #   P0f       — passive OS-fingerprint enrichment, ~2.3M events/day
+        #               at fleet scale; not attack data.
+        #   ssh-rsa   — Cowrie `cowrie.client.fingerprint` sub-events that
+        #               T-Pot's logstash re-types as `ssh-rsa` (the key
+        #               family name). The actual SSH session data is
+        #               already captured by the Cowrie parser via
+        #               type=Cowrie. Per 2026-05-22 audit #8: 492 docs/cycle
+        #               were falling through to the Fallback parser as
+        #               "Honeypot Activity (unknown type)" before this
+        #               default landed.
+        #   ssh-ed25519 — same shape as ssh-rsa above, but for Ed25519
+        #               keys. Added 2026-05-23 after a fallback-warning
+        #               fired in production (operators using modern
+        #               Ed25519 keys produce these instead of the older
+        #               RSA-typed sub-events).
+        ignore_types=_env_list(
+            env, "TPOT2CTI_IGNORE_TYPES",
+            default=["P0f", "ssh-rsa", "ssh-ed25519"],
+        ),
         batch_size=_env_int(env, "TPOT2CTI_BATCH_SIZE", default=1000),
         cycle_anchor_hour_utc=(
             _env_int(env, "TPOT2CTI_CYCLE_ANCHOR_HOUR_UTC", default=-1)
