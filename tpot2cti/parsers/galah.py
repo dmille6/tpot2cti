@@ -385,8 +385,33 @@ class GalahParser(BaseParser):
         return node if node not in (None, "") else None
 
 
-# Register on import
+# Register on import.
 register(GalahParser())
+
+# Galah emits a top-level `type` field in its event log for events
+# where the LLM pipeline did anything (success, error, timeout, etc.).
+# T-Pot's logstash sets `type => "Galah"` on the file input, but the
+# `codec => json` parser overwrites that with whatever the JSON's own
+# `type` key holds — so Galah events arrive in ES with type=
+# "contentGenerationError" (the most common case — LLM timed out),
+# "emptyLLMResponse", etc., instead of "Galah". Static-rule responses
+# don't have a `type` field and survive correctly as "Galah".
+#
+# We register GalahParser under each known internal type so the
+# dispatcher routes those events to us. parse() unconditionally sets
+# event.event_type = "Galah" so downstream vocab/template lookups
+# produce proper labels regardless of which alias was hit.
+_GALAH_INTERNAL_TYPES = (
+    "contentGenerationError",   # observed in real T-Pot ES: LLM call canceled
+    "emptyLLMResponse",         # LLM returned empty body
+    "failedResponse",           # generic LLM failure
+    "successfulResponse",       # speculative future case if Galah ever sets it
+    "cacheHit",                 # speculative future case
+)
+for _internal in _GALAH_INTERNAL_TYPES:
+    _aliased = GalahParser()
+    _aliased.type_name = _internal
+    register(_aliased)
 
 
 # ---------------------------------------------------------------------------

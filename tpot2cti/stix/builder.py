@@ -183,6 +183,17 @@ _PARSER_LABEL_VOCAB: dict[str, tuple[str, str]] = {
     "Honeyaml":      ("honeyaml",      "iac-config"),
     "Router":        ("router",        "telnet"),
     "H0neytr4p":     ("h0neytr4p",     "web-app"),
+    "Beelzebub":     ("beelzebub",     "ssh-llm"),
+    "Galah":         ("galah",         "web-llm"),
+    # Galah internal-type aliases — see galah.py for the reason these
+    # exist. Same labels as "Galah" because event.event_type is set to
+    # "Galah" inside parse(); these entries only exist to satisfy the
+    # parser-registry parity check.
+    "contentGenerationError": ("galah", "web-llm"),
+    "emptyLLMResponse":       ("galah", "web-llm"),
+    "failedResponse":         ("galah", "web-llm"),
+    "successfulResponse":     ("galah", "web-llm"),
+    "cacheHit":               ("galah", "web-llm"),
     "__fallback__":  ("fallback",      "unknown-type"),
 }
 
@@ -231,6 +242,14 @@ _INDICATOR_NAME_TEMPLATES: dict[str, str] = {
     "Honeyaml":      "Honeyaml IaC Config Probe - {ip} ({n} probe{s})",
     "Router":        "Router Telnet Abuse - {ip} ({n} session{s})",
     "H0neytr4p":     "H0neytr4p Web Probe - {ip} ({n} probe{s})",
+    "Beelzebub":     "Beelzebub LLM SSH Session - {ip} ({n} session{s})",
+    "Galah":         "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    # Galah internal-type aliases — see galah.py.
+    "contentGenerationError": "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    "emptyLLMResponse":       "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    "failedResponse":         "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    "successfulResponse":     "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    "cacheHit":               "Galah LLM Web Probe - {ip} ({n} probe{s})",
     "__fallback__":  "Honeypot Activity (unknown type) - {ip} ({n} event{s})",
 }
 
