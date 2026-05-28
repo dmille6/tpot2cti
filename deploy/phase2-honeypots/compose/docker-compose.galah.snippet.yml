@@ -1,0 +1,31 @@
+  galah:
+    container_name: galah
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    networks:
+      - galah_local
+    ports:
+      - "80:80"
+      - "443:443"
+    image: ${TPOT_REPO}/galah:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    environment:
+      LLM_PROVIDER: ${GALAH_LLM_PROVIDER}
+      LLM_SERVER_URL: ${GALAH_LLM_SERVER_URL}
+      LLM_MODEL: ${GALAH_LLM_MODEL}
+    read_only: true
+    volumes:
+      - ${TPOT_DATA_PATH}/galah/cache:/opt/galah/config/cache
+      - ${TPOT_DATA_PATH}/galah/cert:/opt/galah/config/cert
+      - ${TPOT_DATA_PATH}/galah/log:/opt/galah/log
+      - ${TPOT_DATA_PATH}/galah/config.yaml:/opt/galah/config/config.yaml:ro
+      - ${TPOT_DATA_PATH}/galah/rules.yaml:/opt/galah/config/rules.yaml:ro
+      - ${TPOT_DATA_PATH}/galah/templates:/opt/galah/templates:ro
+
+# Heralding service
+  heralding:
+    container_name: heralding
+    restart: always
+    depends_on:

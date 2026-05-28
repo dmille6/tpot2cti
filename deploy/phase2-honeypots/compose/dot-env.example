@@ -1,0 +1,27 @@
+# Phase 2 AI-honeypot env additions — append to your tpotce/.env.
+#
+# These knobs are read by Beelzebub + Galah at container start. The
+# Ollama URLs below assume Ollama is reachable from the T-Pot host
+# (open the firewall accordingly — for our deployment the T-Pot sensor
+# is allowed by an "elkshare_access" alias on the Ollama box, with no
+# generic public exposure).
+
+# ---- Beelzebub (LLM-driven SSH honeypot) -----------------------------
+# BEELZEBUB_LLM_MODEL: "ollama" or "gpt4-o"
+BEELZEBUB_LLM_MODEL: "ollama"
+# Replace with your Ollama host (private LAN, VPN, or firewalled WAN)
+BEELZEBUB_LLM_HOST: "http://OLLAMA_HOST:11434/api/chat"
+# Model name as it appears in `ollama list` — we use qwen3:14b because
+# it was already loaded; any decently-sized chat model works
+BEELZEBUB_OLLAMA_MODEL: "qwen3:14b"
+
+# ---- Galah (LLM-driven HTTP honeypot) --------------------------------
+GALAH_LLM_PROVIDER: "ollama"
+GALAH_LLM_SERVER_URL: "http://OLLAMA_HOST:11434"
+GALAH_LLM_MODEL: "qwen3:14b"
+# Optional knobs (defaults shown):
+# GALAH_LLM_TEMPERATURE: "1"
+# GALAH_LLM_API_KEY: "sk-..." # for OpenAI providers, not needed for Ollama
+
+# ---- T-Pot data path (default) ---------------------------------------
+TPOT_DATA_PATH=./data

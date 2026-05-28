@@ -1,0 +1,31 @@
+  beelzebub:
+    container_name: beelzebub
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    networks:
+      - beelzebub_local
+    ports:
+      - "22:22"
+    image: ${TPOT_REPO}/beelzebub:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    environment:
+      LLM_MODEL: ${BEELZEBUB_LLM_MODEL}
+      LLM_HOST: ${BEELZEBUB_LLM_HOST}
+      OLLAMA_MODEL: ${BEELZEBUB_OLLAMA_MODEL}
+    read_only: true
+    volumes:
+      - ${TPOT_DATA_PATH}/beelzebub/key:/opt/beelzebub/configurations/key
+      - ${TPOT_DATA_PATH}/beelzebub/log:/opt/beelzebub/configurations/log
+      - ${TPOT_DATA_PATH}/beelzebub/services/ssh-22.yaml:/opt/beelzebub/configurations/services/ssh-22.yaml:ro
+
+# Ciscoasa service
+  ciscoasa:
+    container_name: ciscoasa
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    tmpfs:
+     - /tmp/ciscoasa:uid=2000,gid=2000
