@@ -1,0 +1,83 @@
+# ExampleCorp persona — Galah static rules.
+# Pre-baked because qwen3:14b cannot generate full HTML pages within
+# Galah's hardcoded 120s timeout. LLM stays as fallback for paths NOT
+# matched here (~3% of traffic by historical T-Pot tail-of-distribution).
+#
+# Match order: first match wins. Most-specific patterns first.
+rules:
+  # ---- credential capture ----
+  # We INTENTIONALLY DO NOT add a static rule for /dashboard/login.
+  # Galah's static-rule handler short-circuits without reading r.Body,
+  # so credentials POSTed against a static rule are NEVER logged.
+  # The LLM handler reads r.Body to feed the prompt — so we let
+  # /dashboard/login fall through to the LLM path, where
+  # request.body + request.bodySha256 are captured into galah.json
+  # and forwarded to T-Pot's ES. The trimmed system_prompt
+  # (config.yaml) keeps qwen3:14b under Galah's 120s ceiling.
+
+  # GET /dashboard, /login, /signin, /admin — show the sign-in form.
+  - name: "lt-signin-form"
+    enabled: true
+    http_request_regex: "^/(dashboard|login|signin|admin)/?$"
+    response:
+      type: "static"
+      template: "templates/signin.json"
+
+  # ---- recon decoys ----
+  - name: "lt-env-files"
+    enabled: true
+    http_request_regex: "^/(\\.env(\\..*)?|app/\\.env|backend/\\.env|api/\\.env|config/\\.env)$"
+    response:
+      type: "static"
+      template: "templates/env.json"
+
+  - name: "lt-wp-login"
+    enabled: true
+    http_request_regex: "^/(wp-login\\.php|blog/wp-login\\.php|wordpress/wp-login\\.php)$"
+    response:
+      type: "static"
+      template: "templates/wp-login.json"
+
+  - name: "lt-git-config"
+    enabled: true
+    http_request_regex: "^/\\.git/config$"
+    response:
+      type: "static"
+      template: "templates/git-config.json"
+
+  - name: "lt-robots"
+    enabled: true
+    http_request_regex: "^/robots\\.txt$"
+    response:
+      type: "static"
+      template: "templates/robots.json"
+
+  - name: "lt-api-login"
+    enabled: true
+    http_request_regex: "^/api/v[0-9]+/(login|auth|signin|token)$"
+    response:
+      type: "static"
+      template: "templates/api-login.json"
+
+  # ---- persona pages ----
+  - name: "lt-services"
+    enabled: true
+    http_request_regex: "^/services/?$"
+    response:
+      type: "static"
+      template: "templates/services.json"
+
+  - name: "lt-team"
+    enabled: true
+    http_request_regex: "^/team/?$"
+    response:
+      type: "static"
+      template: "templates/team.json"
+
+  # ---- landing ----
+  - name: "lt-landing"
+    enabled: true
+    http_request_regex: "^/$"
+    response:
+      type: "static"
+      template: "templates/root.json"

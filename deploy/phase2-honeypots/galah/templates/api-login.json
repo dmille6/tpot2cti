@@ -1,0 +1,8 @@
+{
+  "headers": {
+    "Server": "nginx/1.18.0 (Ubuntu)",
+    "Content-Type": "application/json; charset=utf-8",
+    "WWW-Authenticate": "Bearer realm=\"examplecorp-api\""
+  },
+  "body": "{\"error\":\"Invalid credentials\",\"code\":\"AUTH_FAILED\",\"request_id\":\"req_a4f1c8b9d2e7\"}\n"
+}
