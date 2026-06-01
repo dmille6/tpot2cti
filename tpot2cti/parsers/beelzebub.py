@@ -2,7 +2,7 @@
 
 Beelzebub is the LLM-powered honeypot ships with T-Pot's `ai` profile.
 We run it on port 22 with a hybrid pre-canned command set + LLM
-fallback (configured against an Ollama instance running qwen3:14b).
+fallback (configured against an Ollama instance running qwen2.5-coder:7b).
 
 Per V1_SPEC.md §5 (parser interface), the parser converts T-Pot ES
 docs into normalized `ParsedEvent`s + correlates per session.

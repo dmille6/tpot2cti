@@ -1,5 +1,5 @@
 # ExampleCorp persona — Galah static rules.
-# Pre-baked because qwen3:14b cannot generate full HTML pages within
+# Pre-baked because qwen2.5-coder:7b cannot generate full HTML pages within
 # Galah's hardcoded 120s timeout. LLM stays as fallback for paths NOT
 # matched here (~3% of traffic by historical T-Pot tail-of-distribution).
 #
@@ -13,7 +13,7 @@ rules:
   # /dashboard/login fall through to the LLM path, where
   # request.body + request.bodySha256 are captured into galah.json
   # and forwarded to T-Pot's ES. The trimmed system_prompt
-  # (config.yaml) keeps qwen3:14b under Galah's 120s ceiling.
+  # (config.yaml) keeps qwen2.5-coder:7b under Galah's 120s ceiling.
 
   # GET /dashboard, /login, /signin, /admin — show the sign-in form.
   - name: "lt-signin-form"
