@@ -1,6 +1,6 @@
 # Galah persona — LouisianaTech dev.louisianatech.io
 #
-# Trimmed (~800 bytes vs the original 4890) so qwen3:14b can finish
+# Trimmed (~800 bytes vs the original 4890) so qwen2.5-coder:7b can finish
 # generating an LLM-fallback response within Galah's hardcoded 120s
 # request timeout. The rich content (landing page, /.env body,
 # /.git/config, /robots.txt, /wp-login, sign-in form, services, team,

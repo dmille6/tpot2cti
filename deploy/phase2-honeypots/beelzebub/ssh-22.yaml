@@ -152,7 +152,7 @@ commands:
     handler: "bash: /bin/busybox: No such file or directory\n"
 
   # ── LLM FALLBACK for anything we didn't pre-can ──
-  # This will use qwen3:14b. The system prompt is configured globally
+  # This will use qwen2.5-coder:7b. The system prompt is configured globally
   # in beelzebub.yaml (added by our Phase 2 patch).
   - regex: "^(.+)$"
     plugin: "LLMHoneypot"
