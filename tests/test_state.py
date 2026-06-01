@@ -23,6 +23,29 @@ def test_get_last_run_missing_returns_none(state_db):
     assert state_db.get_last_run() is None
 
 
+def test_heartbeat_writes_parseable_utc_timestamp(state_db):
+    """heartbeat() records a fresh ISO-8601 UTC timestamp under the KV key
+    /health reads. Round-trips through SQLite and parses back to ~now."""
+    assert state_db.get("last_heartbeat_ts") is None
+    before = datetime.now(timezone.utc)
+    state_db.heartbeat()
+    raw = state_db.get("last_heartbeat_ts")
+    assert raw is not None
+    parsed = datetime.fromisoformat(raw)
+    assert parsed.tzinfo is not None  # tz-aware
+    # Within a few seconds of "now" on either side (clock + write latency).
+    assert abs((parsed - before).total_seconds()) < 5.0
+
+
+def test_heartbeat_advances_on_each_call(state_db):
+    """A later heartbeat() overwrites the earlier timestamp (monotonic)."""
+    state_db.heartbeat()
+    first = state_db.get("last_heartbeat_ts")
+    state_db.heartbeat()
+    second = state_db.get("last_heartbeat_ts")
+    assert second >= first
+
+
 def test_prune_all_returns_dict(state_db):
     """prune_all returns a dict keyed by table name."""
     result = state_db.prune_all()

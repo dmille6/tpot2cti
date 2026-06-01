@@ -136,6 +136,19 @@ def parser_docs(now_utc):
         "Suricata":      _suricata_doc(now_utc),
         "Tanner":        make_common_doc("Tanner", now=now_utc),
         "Wordpot":       make_common_doc("Wordpot", now=now_utc),
+        "Beelzebub":     make_common_doc("Beelzebub", now=now_utc),
+        "Galah":         make_common_doc("Galah", now=now_utc),
+        # Galah's internal `type` field clobbers logstash's type=Galah
+        # via the codec=json directive (see galah.py docstring); we
+        # register GalahParser under each known internal type so the
+        # dispatcher routes them correctly. Same fixture is fine for
+        # all five — parse() ignores doc["type"] and sets event.event_type
+        # to "Galah" unconditionally.
+        "contentGenerationError": make_common_doc("Galah", now=now_utc),
+        "emptyLLMResponse":       make_common_doc("Galah", now=now_utc),
+        "failedResponse":         make_common_doc("Galah", now=now_utc),
+        "successfulResponse":     make_common_doc("Galah", now=now_utc),
+        "cacheHit":               make_common_doc("Galah", now=now_utc),
         "__fallback__":  make_common_doc("BrandNewType", now=now_utc),
     }
 

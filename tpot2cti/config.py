@@ -69,6 +69,14 @@ class OpenCTIConfig:
     """OpenCTI platform connection settings."""
     url: str
     admin_token: str
+    #: Seconds the importer will wait for the OpenCTI platform to become
+    #: reachable at startup before giving up. After a full-stack restart
+    #: OpenCTI's GraphQL can take minutes to answer while ES / Redis /
+    #: migrations warm up. We poll + retry within this window instead of
+    #: crashing on the first probe (which produced a noisy container
+    #: restart loop). 0 = single attempt (legacy behavior). See
+    #: main._connect_opencti.
+    connect_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -258,6 +266,9 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     opencti = OpenCTIConfig(
         url=_env_str(env, "OPENCTI_URL", default="http://opencti:8080") or "http://opencti:8080",
         admin_token=_env_str(env, "OPENCTI_ADMIN_TOKEN", required=True),
+        connect_timeout_seconds=_env_int(
+            env, "TPOT2CTI_OPENCTI_CONNECT_TIMEOUT_SECONDS", default=300
+        ),
     )
 
     # --- Operator identity ---

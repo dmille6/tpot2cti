@@ -9,13 +9,21 @@
 FROM alpine:3.20
 
 # --- Packages ---------------------------------------------------------------
-# autossh        — auto-restarting ssh tunnel
-# openssh-client — ssh + ssh-keyscan
-# tini           — PID 1 signal/zombie handling (matches the core image)
+# autossh         — auto-restarting ssh tunnel
+# openssh-client  — ssh + ssh-keyscan
+# tini            — PID 1 signal/zombie handling (matches the core image)
+# netcat-openbsd  — used by HEALTHCHECK to verify the forwarded port
+#                   actually accepts connections.  The 2026-05 outage
+#                   surfaced a false-positive: pgrep-only healthcheck
+#                   reported `healthy` for 7h while T-Pot was offline,
+#                   so the importer kept thrashing ES queries into a
+#                   dead socket.  An end-to-end nc on the forward port
+#                   fails fast when the underlying SSH session dies.
 RUN apk add --no-cache \
         autossh \
         openssh-client \
-        tini
+        tini \
+        netcat-openbsd
 
 # --- Non-root user ----------------------------------------------------------
 # uid 1000 matches the typical host owner of the ssh-keys bind mount, so
@@ -37,11 +45,22 @@ RUN chmod +x /entrypoint.sh
 USER tunnel
 WORKDIR /home/tunnel
 
-# Healthcheck — if autossh isn't running we're not tunneling.  autossh
-# itself re-establishes the underlying ssh process on failure, so the
-# only thing the healthcheck can usefully detect is autossh itself
-# having died.
+# Healthcheck — verify the tunnel ACCEPTS connections on the forwarded
+# port, not just that autossh is alive.  `pgrep autossh` (the previous
+# check) stayed green during the 2026-05 T-Pot outage: autossh kept
+# restarting its child ssh forever while the remote was offline, the
+# child kept binding 64298 briefly between failures, and the importer
+# thrashed 30+ failed ES cycles before anyone noticed.
+#
+# `nc -z 127.0.0.1 64298` only completes the local handshake (so it
+# doesn't prove the remote side is healthy end-to-end), but it DOES
+# fail fast when the autossh child ssh has died and the listener is
+# torn down — which is the failure mode we missed before.
+#
+# Retries=3 + interval=30s tolerates a ~90s reconnect window without
+# flipping unhealthy, matching autossh's ServerAliveInterval=30 /
+# ServerAliveCountMax=3 in entrypoint.sh.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
-    CMD pgrep autossh >/dev/null || exit 1
+    CMD pgrep autossh >/dev/null && nc -z 127.0.0.1 64298 || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
