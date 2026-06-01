@@ -257,6 +257,22 @@ class CycleState:
             )
             return cur.lastrowid
 
+    def heartbeat(self) -> None:
+        """Record a liveness heartbeat for the /health endpoint.
+
+        Called from the cycle loop at start and at each long-running step
+        (ES stream complete, after every publisher pass) so /health can
+        tell a healthy long-running cycle apart from a hung/dead process.
+        A heavy cycle at hive scale can run longer than the staleness
+        window between *completed* cycles; without a heartbeat /health
+        would flip to 503 (and the container to "unhealthy") mid-cycle
+        even though work is actively progressing. See health.py.
+
+        Stored in the generic ``state`` KV table so no schema change is
+        needed; the value is an ISO-8601 UTC timestamp.
+        """
+        self.set("last_heartbeat_ts", datetime.now(timezone.utc).isoformat())
+
     def record_cycle(
         self,
         cycle_id: int,

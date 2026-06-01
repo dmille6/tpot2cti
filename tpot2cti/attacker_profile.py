@@ -96,7 +96,38 @@ _PROFILE_PARSERS: frozenset[str] = frozenset({
     "Dicompot", "Medpot", "Ipphoney", "ElasticPot", "Redishoneypot",
     "Ciscoasa", "Adbhoney", "Miniprint", "Tanner", "Wordpot", "Sentrypeer",
     "Fatt", "NGINX", "Honeyaml", "Router", "H0neytr4p", "Dionaea",
+    "Beelzebub", "Galah",
 })
+
+
+def _ip_is_substantive(rows: list[dict]) -> bool:
+    """Whether an IP's aggregated activity rows pass the substance gate
+    used by ``emit_daily_summary_notes``.
+
+    Mirrors the substance signal set in ``_signal_score()`` — an IP is
+    substantive if ANY parser-row for it recorded a successful auth, ≥1
+    executed command, ≥1 malware drop, OR ≥3 credential attempts (the
+    "this is more than a one-touch probe" threshold).
+
+    Why this matters: a soak audit on 2026-05-29 found 14,741 daily
+    attacker-snapshot Notes in 7 days, vs 9,881 rolling-profile Notes
+    that already carried the same content updated cross-cycle. The
+    daily snapshots for pure drive-by IPs are duplicated effort with
+    no analyst payoff — every drive-by daily Note re-states "this IP
+    touched the SSH port once" that the rolling profile already says.
+    Filtering daily snapshots to substantive IPs cuts the Note index
+    ~80% with zero loss of pivotable intel.
+    """
+    for r in rows:
+        if (r.get("auth_success_count") or 0) > 0:
+            return True
+        if (r.get("commands_count") or 0) > 0:
+            return True
+        if (r.get("malware_drop_count") or 0) > 0:
+            return True
+        if (r.get("credentials_count") or 0) >= 3:
+            return True
+    return False
 
 
 def _is_profile_parser(event_type: Optional[str]) -> bool:
@@ -262,6 +293,19 @@ def emit_daily_summary_notes(
             f"[{start}, {end})"
         )
         return out
+
+    # Substance gate — drop pure-drive-by IPs from the daily-snapshot
+    # path; their content is already captured by the rolling per-IP
+    # profile Note that updates every cycle. See _ip_is_substantive
+    # docstring for the audit rationale (2026-05-29).
+    pre_count = len(per_ip)
+    per_ip = {ip: rows for ip, rows in per_ip.items() if _ip_is_substantive(rows)}
+    skipped = pre_count - len(per_ip)
+    if skipped:
+        logger.info(
+            f"attacker_profile: daily emit — substance gate dropped {skipped} "
+            f"drive-by IP(s); {len(per_ip)} substantive IP(s) remain"
+        )
 
     for ip, rows in sorted(per_ip.items()):
         body = render_attacker_profile_body(

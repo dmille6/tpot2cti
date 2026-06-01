@@ -67,7 +67,7 @@ compose/
                           its WORKDIR /opt/galah).
   dot-env.example         BEELZEBUB_/GALAH_ knobs to append to tpotce/.env.
                           Replace OLLAMA_HOST with your reachable Ollama
-                          host:port. The model name (qwen3:14b) must
+                          host:port. The model name (qwen2.5-coder:7b) must
                           match a model already loaded in your Ollama.
 ```
 
