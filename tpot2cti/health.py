@@ -23,6 +23,14 @@ Implementation notes:
     the most recent successful cycle's `ended_at`.  We compare
     `now - ended_at` against `2 × cycle.interval_iso` in seconds.
 
+  - We ALSO treat an in-progress cycle as healthy via a heartbeat
+    (`state.heartbeat()`), updated at cycle start and after each
+    long-running step. A heavy hive-scale cycle (or the first big
+    catch-up cycle after a restart) can run longer than the window
+    between completed cycles; the heartbeat keeps `/health` at 200
+    while it works, instead of flapping the container to "unhealthy".
+    A truly hung process stops beating and still goes stale.
+
   - We DO NOT call `opencti.health_check()` on every /health hit —
     that would make our liveness probe transitively depend on
     OpenCTI's liveness, which is the wrong dependency direction
@@ -234,14 +242,30 @@ class HealthServer(ThreadingHTTPServer):
     def compute_status(self) -> tuple[dict, int]:
         """Return (payload, http_status_code) for the /health response.
 
-        200 if a successful cycle ended within `STALENESS_MULTIPLIER ×
-        interval` seconds ago; 503 otherwise (including "never run").
+        Healthy (200) if EITHER:
+
+          * the last *completed* cycle succeeded within
+            ``STALENESS_MULTIPLIER × interval`` seconds (``liveness:
+            "fresh-cycle"``), OR
+          * a cycle is actively in progress — the cycle loop's heartbeat
+            (``state.heartbeat()``, bumped at cycle start, after the ES
+            stream, and after every publisher pass) is within the same
+            window (``liveness: "in-progress"``).
+
+        Otherwise stale (503). The heartbeat arm is what keeps a heavy
+        long-running cycle (a hive-scale publish, or the first big
+        catch-up cycle after a restart — both of which can run longer
+        than the gap the staleness window assumes) from flapping the
+        container to "unhealthy" while it is demonstrably working. A
+        genuinely hung/dead process stops beating, so it still goes
+        stale on schedule.
         """
         now = datetime.now(timezone.utc)
         uptime_s = time.monotonic() - self._started_at
         stale_after_s = self._cycle_interval_seconds * STALENESS_MULTIPLIER
 
         last_ts_iso, last_duration_s, last_success = self._last_successful_cycle()
+        heartbeat_iso, heartbeat_age_s = self._heartbeat_age(now)
 
         base: dict[str, Any] = {
             "uptime_s": round(uptime_s, 3),
@@ -250,37 +274,63 @@ class HealthServer(ThreadingHTTPServer):
             "pycti_version": self._pycti_version,
         }
 
-        if last_ts_iso is None or last_success is not True:
-            # Never run a successful cycle, OR the most recent cycle
-            # failed.  Either way: stale until we observe success.
-            payload = {
-                "status": "stale",
-                "last_cycle_ts": None,
-                "age_s": None,
-                "last_cycle_error": self._state.get("last_cycle_error"),
-                **base,
-            }
-            return payload, 503
+        # Freshness of the most recent *completed* successful cycle.
+        cycle_age_s = _age_seconds(last_ts_iso, now) if last_ts_iso else None
+        cycle_fresh = (
+            last_success is True
+            and cycle_age_s is not None
+            and cycle_age_s <= stale_after_s
+        )
 
-        age_s = _age_seconds(last_ts_iso, now)
-        if age_s is None or age_s > stale_after_s:
+        # Liveness of an in-progress cycle (heartbeat updated as work lands).
+        heartbeat_fresh = (
+            heartbeat_age_s is not None and heartbeat_age_s <= stale_after_s
+        )
+
+        if cycle_fresh or heartbeat_fresh:
             payload = {
-                "status": "stale",
+                "status": "ok",
+                "liveness": "fresh-cycle" if cycle_fresh else "in-progress",
                 "last_cycle_ts": last_ts_iso,
                 "last_cycle_duration_s": last_duration_s,
-                "age_s": age_s,
+                "age_s": cycle_age_s,
+                "heartbeat_age_s": heartbeat_age_s,
                 **base,
             }
-            return payload, 503
+            return payload, 200
 
+        # Stale: neither a fresh completed cycle nor a fresh heartbeat.
         payload = {
-            "status": "ok",
+            "status": "stale",
+            "liveness": "stale",
             "last_cycle_ts": last_ts_iso,
             "last_cycle_duration_s": last_duration_s,
-            "age_s": age_s,
+            "age_s": cycle_age_s,
+            "heartbeat_age_s": heartbeat_age_s,
             **base,
         }
-        return payload, 200
+        if last_ts_iso is None or last_success is not True:
+            # Never run a successful cycle, OR the most recent cycle
+            # failed — surface the last error to aid debugging.
+            payload["last_cycle_error"] = self._state.get("last_cycle_error")
+        return payload, 503
+
+    def _heartbeat_age(
+        self, now: datetime
+    ) -> tuple[Optional[str], Optional[float]]:
+        """Return ``(heartbeat_iso, age_seconds)`` from the state KV.
+
+        Both fields are None if no heartbeat has been recorded yet or the
+        state read fails — health is best-effort and never raises.
+        """
+        try:
+            iso = self._state.get("last_heartbeat_ts")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: heartbeat read failed: {e}")
+            return None, None
+        if not iso:
+            return None, None
+        return iso, _age_seconds(iso, now)
 
     def _last_successful_cycle(
         self,

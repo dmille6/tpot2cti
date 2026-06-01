@@ -336,6 +336,16 @@ class Publisher:
                 logger.warning(f"[{cycle_id}] {msg}")
                 errors.append(msg)
 
+            # Liveness heartbeat — each pass can take minutes at hive
+            # scale; bump after every one (success OR partial failure) so
+            # /health stays at 200 through a long publish. Best-effort;
+            # never let a state write abort the publish. See health.py.
+            if self.state is not None:
+                try:
+                    self.state.heartbeat()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"[{cycle_id}] heartbeat failed (ignored): {exc}")
+
             # Sleep between non-empty passes only. No need to sleep after
             # the last one — there's nothing waiting on it to be indexed.
             is_last_non_empty = (

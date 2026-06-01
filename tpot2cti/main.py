@@ -48,8 +48,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from tpot2cti import attacker_profile, daily_creds
-from tpot2cti.config import Config, load_config
+from tpot2cti.config import Config, ConfigError, load_config
 from tpot2cti.es_client import TpotESClient
+from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.benign_filter import BenignScannerFilter, FilterStats
@@ -81,6 +82,77 @@ _PARSER_DISPATCH: dict[str, str] = {
 
 from tpot2cti.publisher import Publisher, PublishResult
 from tpot2cti.opencti_client import OpenCTIClient
+
+
+# ---------------------------------------------------------------------------
+# OpenCTI connect — patient startup so a cold platform doesn't crash-loop us
+# ---------------------------------------------------------------------------
+
+def _connect_opencti(cfg: Config, *, connector_id: str) -> OpenCTIClient:
+    """Construct an :class:`OpenCTIClient`, waiting for the platform.
+
+    pycti's client constructor does a synchronous GraphQL health check and
+    raises if OpenCTI isn't answering yet. After a full-stack restart the
+    platform can take minutes to come up (ES / Redis / migrations), so the
+    naive ``OpenCTIClient(...)`` call used to raise on the first probe,
+    crash ``main()``, and rely on the container restart policy — producing
+    a noisy crash loop (an ERROR traceback every ~20s, inflated restart
+    count) until OpenCTI was finally ready.
+
+    Instead we poll the TCP port first (cheap, no pycti import / no ERROR
+    log), then retry client construction with capped backoff until
+    ``cfg.opencti.connect_timeout_seconds`` elapses. Only then do we give
+    up and re-raise (container restart = genuine last resort). A real
+    misconfiguration (:class:`ConfigError`, e.g. empty connector id) is
+    NOT retried — it can never succeed — so it propagates immediately.
+
+    This mirrors the existing :func:`tpot2cti.net.wait_for_host` cold-start
+    handling for the SSH tunnel (LESSONS §10) and the health endpoint's
+    deliberate refusal to couple our liveness to OpenCTI's (health.py).
+    """
+    from urllib.parse import urlparse
+
+    deadline_s = max(0, int(cfg.opencti.connect_timeout_seconds))
+    parsed = urlparse(cfg.opencti.url)
+    host = parsed.hostname or "opencti"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    deadline = time.monotonic() + deadline_s
+    backoff = 5.0
+    attempt = 0
+    while True:
+        attempt += 1
+        # TCP reachability first — absorbs the common "port not open yet"
+        # window without paying pycti's ValueError + traceback.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            wait_for_host(
+                host, port,
+                timeout=int(min(remaining, 30)),
+                interval=2.0,
+            )
+        try:
+            return OpenCTIClient(cfg.opencti, connector_id=connector_id)
+        except ConfigError:
+            # Misconfiguration — retrying can't help. Fail fast.
+            raise
+        except Exception as e:  # noqa: BLE001 — pycti raises ValueError etc.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    f"OpenCTI not reachable at {cfg.opencti.url} after "
+                    f"{attempt} attempt(s) / {deadline_s}s — giving up "
+                    f"(container restart policy takes over): "
+                    f"{type(e).__name__}: {e}"
+                )
+                raise
+            logger.warning(
+                f"OpenCTI not ready at {cfg.opencti.url} "
+                f"(attempt {attempt}, {remaining:.0f}s left): "
+                f"{type(e).__name__}: {e}. Retrying in {backoff:.0f}s."
+            )
+            time.sleep(min(backoff, max(0.0, remaining)))
+            backoff = min(backoff * 1.5, 30.0)
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +268,11 @@ def run_cycle(
     cycle_id = state.start_cycle()
     started_monotonic = time.monotonic()
     now = now or datetime.now(timezone.utc)
+    # Liveness heartbeat — a cycle is now in progress. Bumped again after
+    # the ES stream and after each publisher pass so /health stays at 200
+    # for a long-running cycle instead of flapping the container to
+    # "unhealthy". See state.heartbeat() / health.compute_status().
+    state.heartbeat()
 
     window_start, window_end = _compute_window(state, cfg, now)
 
@@ -289,6 +366,7 @@ def run_cycle(
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"types={sorted(parsed_by_type.keys())}"
     )
+    state.heartbeat()  # ES stream done — still alive before build/publish.
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
     builder = builder_factory()
@@ -658,7 +736,11 @@ def main() -> int:
     # config AND a non-empty connector_id (pycti accepts an empty one
     # then fails asynchronously with BAD_USER_INPUT).  We pass the core
     # connector UUID from setup.sh's generation.
-    opencti = OpenCTIClient(cfg.opencti, connector_id=cfg.connector_ids.core)
+    #
+    # _connect_opencti waits for a cold platform instead of crashing on
+    # the first probe (the old behavior crash-looped the container after
+    # a stack restart until OpenCTI warmed up). See _connect_opencti.
+    opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
     restore_logging()      # pycti's __init__ may have clobbered handlers
     publisher = Publisher(
         opencti, state=state,
