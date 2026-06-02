@@ -6,10 +6,11 @@ See docs/parsers/honeytrap.md for protocol/ES-field/STIX/substance notes.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Iterable, Optional
 
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
+from tpot2cti.session import correlate_by_window
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,17 @@ logger = logging.getLogger(__name__)
 #: is treated as "substantive" and gets the full STIX graph including a
 #: Sighting with payload preview in its description.  Per V1_SPEC §5.4.
 SUBSTANCE_PAYLOAD_THRESHOLD = 8
+
+#: A vertical-scan threshold: an attacker burst that hits this many distinct
+#: destination ports is itself substantive intel (a port sweep), even when
+#: every probe carried an empty payload — which is the common case.
+SUBSTANCE_PORT_THRESHOLD = 3
+
+#: Burst window (seconds) for `correlate_by_window`. A single attacker's port
+#: sweep arrives as dozens of separate TCP connects within a few seconds; we
+#: glue them into ONE session so the indicator/sighting reflects the *scan*
+#: (its full port set) instead of emitting one thin indicator-touch per port.
+HONEYTRAP_WINDOW_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +156,25 @@ class HoneytrapParser(BaseParser):
         if ac:
             event.meta["attack_connection"] = ac
 
+        # ── T-Pot / Suricata enrichment tags ───────────────────────────
+        # The logstash pipeline decorates docs with a `tags` list (CVE ids,
+        # category markers, etc.). Cheap, high-signal context for the
+        # indicator — carry it through for the aggregator to dedupe.
+        tags = doc.get("tags")
+        if isinstance(tags, list) and tags:
+            event.meta["tags"] = [str(t) for t in tags if t]
+
+        # ── Captured follow-up downloads ───────────────────────────────
+        # Honeytrap can pull a binary the probe pointed at; T-Pot records it
+        # under `downloads` (+ counters). Rare but pure gold when present —
+        # route any sha256/url through the session download chain so the
+        # builder emits a File observable + URL→File edge.
+        downloads = doc.get("downloads")
+        if isinstance(downloads, list) and downloads:
+            event.meta["downloads_raw"] = downloads
+        if (dl_count := self._safe_int(doc.get("download_count"))):
+            event.meta["download_count"] = dl_count
+
         return event
 
     @staticmethod
@@ -166,31 +197,109 @@ class HoneytrapParser(BaseParser):
         )
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — we use the default (one event per session)
+    # correlate() — group an attacker's burst into ONE scan session
     # ──────────────────────────────────────────────────────────────────
-    # Each TCP connection / UDP datagram is a Honeytrap event in its own
-    # right; the inherited BaseParser.correlate() wraps each event in a
-    # one-event AttackSession, which is exactly what V1_SPEC §5.4 asks
-    # for.  No override needed.
+
+    def correlate(self, events: Iterable[ParsedEvent]) -> list[AttackSession]:
+        """Glue an attacker's probe burst into a single port-scan session.
+
+        Honeytrap emits one event per TCP connect / UDP datagram and ships
+        no session id, so the same IP sweeping 40 ports used to become 40
+        one-event sessions → 40 indicator-touches + 40 Sightings, each
+        carrying a single port. `correlate_by_window(300s)` collapses the
+        burst into one session whose `dst_ports` set *is* the scan, letting
+        the builder surface "swept tcp/2082,2086,2087 → cPanel" on a single
+        indicator. Mirrors the FATT / Router parsers (V1_SPEC §5.4).
+        """
+        return correlate_by_window(
+            list(events),
+            window_seconds=HONEYTRAP_WINDOW_SECONDS,
+            aggregator=self._aggregate_session,
+        )
+
+    @staticmethod
+    def _aggregate_session(
+        session: AttackSession, events: list[ParsedEvent],
+    ) -> None:
+        """Promote burst-level Honeytrap signals onto the session.
+
+        `dst_ports` / `protocols` are already populated by the correlator;
+        here we keep the single most-informative payload across the burst,
+        union the enrichment tags, and route any captured download to the
+        session download chain so the builder can emit a File observable.
+        """
+        best_printable, best_hex = "", ""
+        md5 = sha512 = None
+        payload_length = 0
+        tags: list[str] = []
+        for e in events:
+            printable = str(e.meta.get("payload_printable") or "")
+            hex_str = str(e.meta.get("payload_hex") or "")
+            # "Best" = richest payload: prefer longer printable, then hex.
+            if len(printable) > len(best_printable) or (
+                printable and not best_printable
+            ):
+                best_printable = printable
+                best_hex = hex_str
+                md5 = e.meta.get("payload_md5")
+                sha512 = e.meta.get("payload_sha512")
+                payload_length = int(e.meta.get("payload_length") or 0)
+
+            for t in (e.meta.get("tags") or []):
+                if t not in tags:
+                    tags.append(t)
+
+            # Captured follow-up binary (rare). Accept common hash/url keys.
+            for dl in (e.meta.get("downloads_raw") or []):
+                if not isinstance(dl, dict):
+                    continue
+                sha = (dl.get("sha256") or dl.get("sha256_hash") or "").lower() or None
+                url = dl.get("url") or dl.get("download_url") or None
+                if sha and sha not in session.malware_hashes:
+                    session.malware_hashes.append(sha)
+                if sha or url:
+                    session.downloads.append({"sha256": sha, "url": url})
+                if url and url not in session.urls:
+                    session.urls.append(url)
+
+        if best_printable or best_hex:
+            session.meta["payload_printable"] = best_printable
+            session.meta["payload_hex"] = best_hex
+            if payload_length:
+                session.meta["payload_length"] = payload_length
+            if md5:
+                session.meta["payload_md5"] = md5
+            if sha512:
+                session.meta["payload_sha512"] = sha512
+        if tags:
+            session.meta["tags"] = tags
 
     # ──────────────────────────────────────────────────────────────────
     # has_substance() — substance filter per V1_SPEC §5.4
     # ──────────────────────────────────────────────────────────────────
 
     def has_substance(self, session: AttackSession) -> bool:
-        """A Honeytrap session is substantive iff its single event
-        captured more than `SUBSTANCE_PAYLOAD_THRESHOLD` bytes of
-        printable payload.
+        """A Honeytrap burst is substantive iff it either captured a
+        non-trivial payload (> ``SUBSTANCE_PAYLOAD_THRESHOLD`` bytes), swept
+        enough distinct ports to count as a port scan
+        (>= ``SUBSTANCE_PORT_THRESHOLD``), or pulled a follow-up download.
 
-        Empty-payload probes (SYN scans, single-packet UDP touches,
-        banner-grab opens with no follow-up) fall through to the
-        drive-by code path: IPv4-Addr + GeoIP + AS + IP Indicator +
-        Sighting, no payload preview.
+        Single empty-payload touches on one port remain drive-by noise; the
+        builder still records the IPv4-Addr + Sighting, just without the
+        richer scan/payload context.
         """
         if not session.events:
             return False
-        payload = session.events[0].meta.get("payload_printable") or ""
-        return len(payload) > SUBSTANCE_PAYLOAD_THRESHOLD
+        payload = (
+            session.meta.get("payload_printable")
+            or session.events[0].meta.get("payload_printable")
+            or ""
+        )
+        if len(payload) > SUBSTANCE_PAYLOAD_THRESHOLD:
+            return True
+        if len(session.dst_ports) >= SUBSTANCE_PORT_THRESHOLD:
+            return True
+        return bool(session.malware_hashes)
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers
