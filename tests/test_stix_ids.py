@@ -33,7 +33,6 @@ CASES = [
     ("generate_country_location_id",          ("US",)),
     ("generate_city_location_id",             ("US", "Reno")),
     ("generate_session_note_id",              ("node1", "sess001")),
-    ("generate_daily_creds_note_id",          ("node1", "2026-05-22")),
     ("generate_attacker_profile_note_id",     ("1.2.3.4",)),
     ("generate_attacker_daily_note_id",       ("1.2.3.4", "2026-05-22")),
     ("generate_attacker_weekly_note_id",      ("1.2.3.4", 2026, 21)),

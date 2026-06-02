@@ -9,7 +9,8 @@ This module wires together every Phase 1-5 piece:
   - `parsers.dispatch()`          — type → parser dispatch
   - `parsers.<P>.correlate()`     — events → sessions
   - `parsers.<P>.build()`         — sessions → STIX (substance-filtered)
-  - `daily_creds.maybe_emit_pending()` — V1_SPEC §6 daily Note
+  - `credential_store` + `build_ip_credential_note()` — bruteforce pairs to
+    the local store; one per-IP summary Note to OpenCTI
   - `publisher.Publisher.publish()` (Phase 5)  — three-pass send to OpenCTI
   - `opencti_client.OpenCTIClient` (Phase 5)
   - `health.HealthServer`         — /health endpoint
@@ -21,7 +22,7 @@ Per V1_SPEC.md §3 (cycle behavior) the loop is:
         2. dispatch each doc → ParsedEvent
         3. group by parser type_name → correlate → AttackSessions
         4. parser.build(session, builder) → STIX objects
-        5. daily_creds.maybe_emit_pending() → +Notes
+        5. credentials → store (bulk) + one per-IP summary Note
         6. publisher.publish(objects)
         7. state.set_last_run(window_end)
         8. log + record cycle summary
@@ -47,7 +48,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from tpot2cti import attacker_profile, daily_creds
+from tpot2cti import attacker_profile
 from tpot2cti.config import Config, ConfigError, load_config
 from tpot2cti.credential_store import CredentialStore
 from tpot2cti.es_client import TpotESClient
@@ -375,7 +376,6 @@ def run_cycle(
     events_dropped = 0
     events_self_filtered = 0  # src_ip matched our own honeypot's IP set
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
-    sensors_seen: set[str] = set()
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
 
@@ -419,8 +419,6 @@ def run_cycle(
                     continue
             events_parsed += 1
             parsed_by_type[event.event_type].append(event)
-            if event.sensor_hostname:
-                sensors_seen.add(event.sensor_hostname)
     except Exception as e:
         # ES query failed — record cycle failure and bail (the main loop
         # will sleep and retry the next interval per V1_SPEC §7).
@@ -536,18 +534,12 @@ def run_cycle(
                 )
                 logger.debug(traceback.format_exc())
 
-    # Remember which sensors we've seen, so the catch-up scan has a
-    # list to iterate over even before any cycle has succeeded.
-    if sensors_seen:
-        daily_creds.remember_sensors(state, sensors_seen)
-
     # ── Step 5: credentials → store (bulk) + one Note per attacker IP ──
     # Bruteforce runs are tens of thousands of pairs; we keep them OUT of
     # OpenCTI (credential_store) and emit only a per-IP summary Note with
     # the pairs tried + which was accepted. Replaces the old daily
     # top-100-per-sensor Note (per the 2026-06-02 user decision). The bulk
     # detail stays queryable in the local store / can feed exports.
-    creds_pairs: list[tuple] = []     # retained (empty) for the cycle summary
     if credential_store is not None:
         try:
             n_written = credential_store.record_attempts(cred_attempts)
@@ -633,20 +625,10 @@ def run_cycle(
     # ── Step 7: persist state (only on a successful publish) ──────────
     if publish_ok:
         state.set_last_run(window_end)
-        # Record daily-creds emissions ONLY after a successful publish,
-        # so a failed publish doesn't poison the log (next cycle retries).
-        for sensor, utc_date in creds_pairs:
-            try:
-                state.record_daily_creds_emitted(sensor, utc_date)
-            except Exception as e:  # pragma: no cover — sqlite is reliable
-                logger.warning(
-                    f"cycle {cycle_id}: record_daily_creds_emitted({sensor}, "
-                    f"{utc_date}) failed: {e}"
-                )
     else:
         logger.warning(
             f"cycle {cycle_id}: publish failed; NOT advancing last_run "
-            f"or daily_creds_log (next cycle will retry the same window)"
+            f"(next cycle will retry the same window)"
         )
 
     # ── Step 8: cycle summary ─────────────────────────────────────────
@@ -661,7 +643,6 @@ def run_cycle(
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),
-        "daily_creds_pairs": [(s, d.isoformat()) for s, d in creds_pairs],
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),
