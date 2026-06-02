@@ -313,6 +313,47 @@ clone_opencti() {
     ok "OpenCTI cloned to $target"
 }
 
+# Inject a generous `start_period` into the opencti platform healthcheck so the
+# first (~3.5 min) cold boot doesn't exhaust the healthcheck retries and trip
+# `depends_on: service_healthy` for the workers/connectors. Best-effort and
+# idempotent: a parse miss or upstream layout change must never fail install
+# (start_opencti's poll-then-restart logic is the real safety net). See the
+# NOTE in start_opencti() for the full failure-mode write-up.
+patch_opencti_compose() {
+    local compose="${SCRIPT_DIR}/opencti/docker-compose.yml"
+    local period="${OPENCTI_HEALTHCHECK_START_PERIOD:-240s}"
+    [[ -f "$compose" ]] || return 0
+
+    # Already patched? (our marker comment) — nothing to do.
+    if grep -q 'tpot2cti: start_period for slow first boot' "$compose"; then
+        info "OpenCTI healthcheck start_period already patched — skipping"
+        return 0
+    fi
+
+    # Insert `start_period` immediately after the opencti healthcheck's
+    # `retries:` line. The opencti healthcheck is uniquely identified by its
+    # `health?health_access_key` wget test, so we arm on that test line and
+    # patch the first `retries:` that follows.
+    local tmp
+    tmp="$(mktemp 2>/dev/null)" || return 0
+    if awk -v period="$period" '
+        /health\?health_access_key/ { armed=1 }
+        {
+            print
+            if (armed && $1 == "retries:") {
+                match($0, /^[ \t]*/); indent=substr($0,1,RLENGTH)
+                print indent "start_period: " period "  # tpot2cti: start_period for slow first boot"
+                armed=0
+            }
+        }
+    ' "$compose" > "$tmp" 2>/dev/null && grep -q 'tpot2cti: start_period for slow first boot' "$tmp"; then
+        cat "$tmp" > "$compose" 2>/dev/null && ok "Patched OpenCTI healthcheck with start_period=$period"
+    else
+        warn "Could not auto-patch OpenCTI healthcheck start_period (non-fatal — start_opencti will recover)."
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+}
+
 # -----------------------------------------------------------------------------
 # Step 4: Generate secrets
 # Per V1_SPEC §9 step 4. Populates the GEN_* env vars used in step 5.
@@ -712,10 +753,19 @@ start_opencti() {
         return 0
     fi
 
+    # NOTE: OpenCTI's first boot takes ~3.5 min. The platform's healthcheck
+    # (retries:20 x 10s = 200s, no start_period) can mark it 'unhealthy' a few
+    # seconds BEFORE it finishes booting (~208s). Worker/connector services use
+    # `depends_on: opencti condition: service_healthy`, so a single blocking
+    # `up -d` aborts with "dependency failed to start" and — under set -e —
+    # kills the whole installer. We therefore: (1) tolerate a non-zero first
+    # `up -d` (the deferred dependents just don't get created yet), (2) poll
+    # localhost:8080 until the platform actually answers, then (3) re-run
+    # `up -d` to bring up the dependents now that opencti is genuinely healthy.
     (
         cd "${SCRIPT_DIR}/opencti"
         docker compose --env-file .env -p "$OPENCTI_PROJECT" up -d >&2
-    )
+    ) || warn "Initial 'compose up' returned non-zero (expected on slow first boot — dependents will be (re)started once OpenCTI is healthy)."
 
     info "Polling for OpenCTI containers to become healthy (max 600s)"
     local waited=0
@@ -747,6 +797,15 @@ start_opencti() {
         warn "  docker compose -p $OPENCTI_PROJECT logs --tail=200"
         fail "OpenCTI startup timeout"
     fi
+
+    # OpenCTI is now answering, so its healthcheck will pass. Re-run `up -d` to
+    # create any worker/connector services that the first (slow-boot) pass
+    # skipped when their `service_healthy` dependency wasn't yet satisfied.
+    info "OpenCTI healthy — (re)starting any deferred worker/connector services"
+    (
+        cd "${SCRIPT_DIR}/opencti"
+        docker compose --env-file .env -p "$OPENCTI_PROJECT" up -d >&2
+    ) || warn "Second 'compose up' returned non-zero; check 'docker compose -p $OPENCTI_PROJECT ps'."
 
     if ! docker network inspect opencti_default >/dev/null 2>&1; then
         # OpenCTI's compose may name the network based on COMPOSE_PROJECT_NAME (xtm by default).
@@ -914,6 +973,7 @@ main() {
     check_prereqs
     interactive_prompts
     clone_opencti
+    patch_opencti_compose
     generate_secrets
     populate_env_files
     setup_ssh_key

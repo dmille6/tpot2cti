@@ -113,12 +113,55 @@ def test_honeytrap_smoke():
     )
     sightings = [o for o in subs_objs if o["type"] == "sighting"]
     assert sightings, "substantive bundle missing Sighting"
-    assert sightings[0].get("description"), \
-        "Sighting must carry a per-probe description string"
-    assert "Honeytrap probe" in sightings[0]["description"], \
-        f"unexpected sighting description: {sightings[0]['description']!r}"
+    sdesc = sightings[0].get("description") or ""
+    assert sdesc, "Sighting must carry a per-burst description string"
+    # New (full-squeeze) format: burst-level scan summary with the port
+    # surfaced and an HTTP fingerprint for this payload.
+    assert "Honeytrap" in sdesc, f"unexpected sighting description: {sdesc!r}"
+    assert "tcp/8081" in sdesc, f"port not surfaced in sighting: {sdesc!r}"
+    assert "HTTP" in sdesc, f"HTTP fingerprint missing: {sdesc!r}"
     # Drive-by bundle still has no Note (unchanged from before)
     assert not any(o["type"] == "note" for o in drive_objs), \
         "drive-by bundle should have no Note"
+
+    # ── Case 3: vertical port scan — the headline behavior ─────────────
+    # One IP sweeping the cPanel/WHM port range in a burst must collapse to
+    # ONE session whose indicator advertises the scan shape + target family.
+    cpanel_ports = [2082, 2083, 2086, 2087, 2095, 2096]
+    scan_events = []
+    for i, p in enumerate(cpanel_ports):
+        ev = parser.parse({
+            "@timestamp": now.isoformat(),
+            "type": "Honeytrap",
+            "src_ip": "203.0.113.99",
+            "src_port": 40000 + i,
+            "dest_port": p,
+            "proto": "tcp",
+            "t-pot_hostname": "node1",
+            "attack_connection": {"payload": {"data_hex": "", "length": 0}, "protocol": "tcp"},
+        })
+        assert ev is not None
+        scan_events.append(ev)
+
+    scan_sessions = parser.correlate(scan_events)
+    assert len(scan_sessions) == 1, \
+        f"burst should collapse to 1 session, got {len(scan_sessions)}"
+    scan_session = scan_sessions[0]
+    assert scan_session.dst_ports == set(cpanel_ports)
+    # Empty payloads but a real sweep → substantive via the port threshold.
+    assert parser.has_substance(scan_session) is True
+
+    builder3 = STIXBuilder(cfg)
+    scan_objs = builder3.build_honeytrap_probe(scan_session)
+    inds = [o for o in scan_objs if o["type"] == "indicator"]
+    assert inds, "scan bundle missing indicator"
+    ind = inds[0]
+    assert "scan:vertical" in ind["labels"], ind["labels"]
+    assert "target:cpanel" in ind["labels"], ind["labels"]
+    assert "Honeytrap scan" in ind["name"] and "6 ports" in ind["name"], ind["name"]
+    assert "cPanel" in (ind.get("description") or ""), ind.get("description")
+    # One indicator for the whole sweep, not six.
+    assert len(inds) == 1, f"expected 1 indicator for the burst, got {len(inds)}"
+    print(f"\nvertical-scan indicator: {ind['name']!r} labels={ind['labels']}")
 
     print("\nSmoke test passed.")

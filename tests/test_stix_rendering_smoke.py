@@ -50,8 +50,12 @@ def test_rendering_smoke():
     ht_ev.meta["payload_hex"] = "474554"
     ht_s = AttackSession.from_event(ht_ev)
     ht_desc = render_honeytrap_sighting_description(ht_s, ht_ev)
-    assert "Honeytrap probe tcp/4444" in ht_desc, ht_desc
+    # Full-squeeze format: burst-level scan summary, port surfaced + service,
+    # HTTP fingerprint on the payload.
+    assert "Honeytrap" in ht_desc, ht_desc
+    assert "tcp/4444" in ht_desc, ht_desc
     assert "payload" in ht_desc, ht_desc
+    assert "HTTP" in ht_desc, ht_desc
     print(f"render_honeytrap_sighting_description: {ht_desc!r}")
 
     # Fallback event with src_ip
