@@ -4,7 +4,7 @@ Parses T-Pot Medpot docs (HL7 v2 MLLP clinical messages) into ParsedEvents
 and one-event-per-session AttackSessions; every probe is substantive. STIX
 is built downstream in tpot2cti/stix/builder.py from session.meta.
 
-See docs/PARSERS.md (Medpot) for protocol background, ES fields, the emitted
+See docs/parsers/medpot.md for protocol background, ES fields, the emitted
 STIX graph, and substance rationale.
 """
 
@@ -125,7 +125,7 @@ class MedpotParser(BaseParser):
     def has_substance(self, session: AttackSession) -> bool:
         """Always True — internet HL7 traffic is anomalous by definition.
 
-        See docs/PARSERS.md (Medpot).
+        See docs/parsers/medpot.md.
         """
         return True
 
