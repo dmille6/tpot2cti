@@ -204,6 +204,10 @@ class DionaeaParser(BaseParser):
             if (url := meta.get("download_url")):
                 if url not in session.urls:
                     session.urls.append(url)
+                # Pair file ↔ source URL as they appeared in THIS download
+                # event, for the builder's "downloaded-from" edge.
+                if primary:
+                    session.downloads.append({"sha256": primary, "url": url})
                 try:
                     host = urlparse(url).hostname
                 except Exception as ex:
