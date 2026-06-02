@@ -77,6 +77,15 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Cowrie":       "build_cowrie_session",
     "Suricata":     "build_suricata_alert",
     "Honeytrap":    "build_honeytrap_probe",
+    # Web / HTTP honeypot family → build_<type>_session (shared _build_web_session)
+    "Galah":        "build_galah_session",
+    "Tanner":       "build_tanner_session",
+    "H0neytr4p":    "build_h0neytr4p_session",
+    "ElasticPot":   "build_elasticpot_session",
+    "Ciscoasa":     "build_ciscoasa_session",
+    "Wordpot":      "build_wordpot_session",
+    "NGINX":        "build_nginx_session",
+    "Honeyaml":     "build_honeyaml_session",
     "__fallback__": "build_fallback_event",
 }
 
