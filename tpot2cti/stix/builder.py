@@ -64,6 +64,9 @@ logger = logging.getLogger(__name__)
 # OpenCTI's ~1 MB worker limit.  64 KB is generous for any reasonable
 # session summary.
 MAX_NOTE_BODY_BYTES = 64 * 1024
+#: Max distinct URL observables emitted per web session (a scanner can
+#: hit hundreds of paths; cap so one session can't balloon the bundle).
+_MAX_WEB_URLS = 25
 
 # Process command_line cap (matches PoC convention)
 MAX_COMMANDS_PER_PROCESS = 50
@@ -1792,3 +1795,119 @@ class STIXBuilder:
             ))
 
         return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Web / HTTP honeypot family
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_web_session(self, session: AttackSession) -> list[dict]:
+        """Rich builder for HTTP/web honeypots.
+
+        Base attacker graph (IP + geo + AS + Indicator + Sighting) PLUS:
+          - URL observables for the paths the attacker requested, each
+            `related-to` the attacker IP;
+          - an AttackPattern when the parser flagged a technique
+            (`attack_type` / `mitre_technique`) or a CVE, with the IP
+            Indicator `indicates` it;
+          - a Vulnerability for each `matched_cve`, likewise `indicates`-d.
+
+        Object-graph only — no per-event Notes (LESSONS §7.1). Shared by the
+        dedicated build_<web>_session dispatch entries.
+        """
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        ind_id = generate_ip_indicator_id(session.src_ip)
+
+        # URL observables (parser-validated full URLs), capped.
+        seen: set[str] = set()
+        for url in session.urls:
+            if len(seen) >= _MAX_WEB_URLS:
+                break
+            if url in seen:
+                continue
+            seen.add(url)
+            u = self.build_url(url, session=session)
+            if not u:
+                continue
+            out.append(u)
+            if rel := self.build_relationship(
+                ipv4_id, "related-to", u["id"],
+                description=f"{session.src_ip} requested {url}",
+            ):
+                out.append(rel)
+
+        # Aggregate exploit signals across the session's events.
+        cves: set[str] = set()
+        attack_types: set[str] = set()
+        mitre: set[str] = set()
+        for ev in session.events:
+            m = ev.meta
+            if c := m.get("matched_cve"):
+                cves.add(str(c))
+            if a := m.get("attack_type"):
+                attack_types.add(str(a))
+            if t := m.get("mitre_technique"):
+                mitre.add(str(t))
+
+        # AttackPattern — only when a real technique/CVE was seen (no AP for
+        # a bare probe, to avoid flooding OpenCTI with empty patterns).
+        mitre_id = next(iter(sorted(mitre)), None)
+        ap_names = set(attack_types)
+        if not ap_names and (cves or mitre):
+            ap_names = {"Web application exploit attempt"}
+        for name in sorted(ap_names):
+            ap = self.build_attack_pattern(name, mitre_id, session=session)
+            if not ap:
+                continue
+            out.append(ap)
+            if ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", ap["id"],
+                description=f"{session.event_type} technique from {session.src_ip}",
+            )):
+                out.append(rel)
+
+        # Vulnerability per matched CVE signature.
+        for cve in sorted(cves):
+            v = self.build_vulnerability(
+                cve,
+                description=(
+                    f"Exploit attempt observed via {session.event_type} "
+                    f"from {session.src_ip}."
+                ),
+            )
+            if not v:
+                continue
+            out.append(v)
+            if ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", v["id"],
+                description=f"{session.src_ip} attempted to exploit {cve}",
+            )):
+                out.append(rel)
+        return out
+
+    # Dedicated per-type entries (registered in main._PARSER_DISPATCH).
+    def build_galah_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_tanner_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_h0neytr4p_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_elasticpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_ciscoasa_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_wordpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_nginx_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_honeyaml_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
