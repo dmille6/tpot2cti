@@ -1911,3 +1911,176 @@ class STIXBuilder:
 
     def build_honeyaml_session(self, session: AttackSession) -> list[dict]:
         return self._build_web_session(session)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Malware-drop family (file captures + downloads)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_malware_session(self, session: AttackSession) -> list[dict]:
+        """Base attacker graph + dropped files (File + File-Indicator
+        `based-on` it), download URLs/domains, and a command Process —
+        mirroring the Cowrie malware path. Each extra is gated on its
+        signal, so a bare connection degrades to the base graph."""
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+
+        if session.commands:
+            proc = self.build_process(session, session.commands)
+            if proc:
+                out.append(proc)
+                if rel := self.build_relationship(
+                    proc["id"], "related-to", ipv4_id,
+                    description=f"Commands executed by {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        for sha256 in session.malware_hashes:
+            f = self.build_file(sha256, session=session)
+            if not f:
+                continue
+            out.append(f)
+            if rel := self.build_relationship(
+                f["id"], "related-to", ipv4_id,
+                description=f"File dropped by {session.src_ip}",
+            ):
+                out.append(rel)
+            f_ind = self.build_file_indicator(sha256, session=session)
+            if f_ind:
+                out.append(f_ind)
+                if rel := self.build_relationship(
+                    f_ind["id"], "based-on", f["id"],
+                    description=f"Indicator for file {sha256[:16]}…",
+                ):
+                    out.append(rel)
+
+        for url in session.urls:
+            u = self.build_url(url, session=session)
+            if u:
+                out.append(u)
+                if rel := self.build_relationship(
+                    u["id"], "related-to", ipv4_id,
+                    description=f"Download URL from {session.src_ip}",
+                ):
+                    out.append(rel)
+        for dom in session.domains:
+            d = self.build_domain(dom, session=session)
+            if d:
+                out.append(d)
+                if rel := self.build_relationship(
+                    d["id"], "related-to", ipv4_id,
+                    description=f"Domain referenced by {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
+
+    def build_adbhoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_malware_session(session)
+
+    def build_dionaea_session(self, session: AttackSession) -> list[dict]:
+        return self._build_malware_session(session)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Fingerprint family (passive TLS/SSH client fingerprints)
+    # ──────────────────────────────────────────────────────────────────
+
+    def build_fatt_session(self, session: AttackSession) -> list[dict]:
+        """Base attacker graph + the attacker's CLIENT fingerprints (HASSH
+        SSH-client hash, JA3 TLS-client hash) as Cryptographic-Key SCOs
+        `related-to` the IP — so the same tool seen from different IPs
+        links onto one SCO in OpenCTI. (ja3s is the server's — skipped.)"""
+        out = self.build_driveby_session(session)
+        if not session.src_ip:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        for fp in (session.hassh, session.ja3):
+            if not fp:
+                continue
+            ck = self.build_cryptographic_key(fp, session=session)
+            if ck:
+                out.append(ck)
+                if rel := self.build_relationship(
+                    ck["id"], "related-to", ipv4_id,
+                    description=f"Client fingerprint observed from {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Protocol / ICS / VoIP / shell family
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_protocol_session(self, session: AttackSession, ap_name: str) -> list[dict]:
+        """Base attacker graph + a protocol-targeting AttackPattern (deduped;
+        IP Indicator `indicates` it) + a command Process when present.
+
+        The AttackPattern is emitted only when the session shows real
+        interaction (commands, parser-populated event meta, or >2 events),
+        so a bare connect stays at the base graph and we don't mint patterns
+        for noise. Credential pairs for these types are handled separately
+        as the per-IP credential Note (see run_cycle), not here."""
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        ind_id = generate_ip_indicator_id(session.src_ip)
+
+        interacted = (
+            bool(session.commands)
+            or bool(session.credentials_tried)
+            or any(e.meta for e in session.events)
+            or session.event_count > 2
+        )
+        if interacted:
+            ap = self.build_attack_pattern(ap_name, session=session)
+            if ap:
+                out.append(ap)
+                if ind_id and (rel := self.build_relationship(
+                    ind_id, "indicates", ap["id"],
+                    description=f"{session.event_type} activity from {session.src_ip}",
+                )):
+                    out.append(rel)
+        if session.commands:
+            proc = self.build_process(session, session.commands)
+            if proc:
+                out.append(proc)
+                if rel := self.build_relationship(
+                    proc["id"], "related-to", ipv4_id,
+                    description=f"Commands from {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
+
+    def build_conpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "ICS/SCADA protocol interaction")
+
+    def build_dicompot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "DICOM medical-imaging probe")
+
+    def build_ipphoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "IPP printer-service probe")
+
+    def build_redishoneypot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Redis unauthorized-access attempt")
+
+    def build_sentrypeer_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "SIP/VoIP fraud probe")
+
+    def build_miniprint_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Printer PJL/raw-port probe")
+
+    def build_medpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "HL7 medical-messaging probe")
+
+    def build_router_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Router/Telnet console interaction")
+
+    def build_heralding_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Credential brute-force attempt")
+
+    def build_mailoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "SMTP abuse / relay probe")
+
+    def build_beelzebub_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Interactive shell session (LLM honeypot)")

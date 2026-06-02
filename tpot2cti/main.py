@@ -79,6 +79,12 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Honeytrap":    "build_honeytrap_probe",
     # Web / HTTP honeypot family → build_<type>_session (shared _build_web_session)
     "Galah":        "build_galah_session",
+    # Galah's LLM-response subtypes (separate parser instances) → same builder
+    "cacheHit":            "build_galah_session",
+    "successfulResponse":  "build_galah_session",
+    "failedResponse":      "build_galah_session",
+    "emptyLLMResponse":    "build_galah_session",
+    "contentGenerationError": "build_galah_session",
     "Tanner":       "build_tanner_session",
     "H0neytr4p":    "build_h0neytr4p_session",
     "ElasticPot":   "build_elasticpot_session",
@@ -86,6 +92,23 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Wordpot":      "build_wordpot_session",
     "NGINX":        "build_nginx_session",
     "Honeyaml":     "build_honeyaml_session",
+    # Malware-drop family → File + indicator + download URL/domain + drops
+    "Adbhoney":     "build_adbhoney_session",
+    "Dionaea":      "build_dionaea_session",
+    # Fingerprint family → HASSH/JA3 Cryptographic-Key
+    "Fatt":         "build_fatt_session",
+    # Protocol / ICS / VoIP / shell family → protocol AttackPattern + Process
+    "ConPot":       "build_conpot_session",
+    "Dicompot":     "build_dicompot_session",
+    "Ipphoney":     "build_ipphoney_session",
+    "Redishoneypot": "build_redishoneypot_session",
+    "Sentrypeer":   "build_sentrypeer_session",
+    "Miniprint":    "build_miniprint_session",
+    "Medpot":       "build_medpot_session",
+    "Router":       "build_router_session",
+    "Heralding":    "build_heralding_session",
+    "Mailoney":     "build_mailoney_session",
+    "Beelzebub":    "build_beelzebub_session",
     "__fallback__": "build_fallback_event",
 }
 
