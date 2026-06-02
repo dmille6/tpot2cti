@@ -29,13 +29,15 @@ into the Note.
 `run_cycle()` collects every session's credential attempts, batch-writes them
 with `record_attempts()` (one transaction per cycle), then emits one
 `build_ip_credential_note()` per attacker IP that had credential activity.
-This **replaced** the old daily top-100-per-sensor Note (`daily_creds.py`,
-now uncalled). Config: `TPOT2CTI_CREDENTIAL_DB` (default `/data/credentials.db`).
+This **replaced** the old daily top-100-per-sensor Note (the former
+`daily_creds.py`, since removed). Config: `TPOT2CTI_CREDENTIAL_DB` (default
+`/data/credentials.db`).
 
-## TODO
+## Notes / possible future work
 
-- **Pruning.** Add retention so the store stays bounded (mirror the
-  `state.py` prune pattern).
+- **Retention is intentional.** The store is the bulk archive (the whole
+  point of keeping pairs out of OpenCTI is to retain them queryably, like
+  prod's DuckDB). It's indexed by `attacker_ip`, so growth doesn't slow the
+  per-IP Note query. Add age-based pruning only if disk becomes a concern.
 - **Default-credential tagging.** Prod seeds a `default_credentials` table
   (known IoT/device defaults) and flags matches; not yet ported.
-- Remove the now-unused `daily_creds.py` once nothing references it.

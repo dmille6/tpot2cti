@@ -77,9 +77,8 @@ CADENCE_WEEKLY = "weekly"
 
 
 # ---------------------------------------------------------------------------
-# State keys for boundary detection (mirrors daily_creds.maybe_emit_pending's
-# "last successful run" key but per cadence so the two cron clocks are
-# independent).
+# State keys for boundary detection — a per-cadence "last successful run"
+# key so each cadence's clock is independent.
 # ---------------------------------------------------------------------------
 _STATE_KEY_LAST_DAILY = "last_daily_attacker_emit_utc_date"
 _STATE_KEY_LAST_WEEKLY = "last_weekly_attacker_emit_iso_yearweek"
@@ -423,7 +422,7 @@ def emit_weekly_summary_notes(
 
 
 # ---------------------------------------------------------------------------
-# Boundary detection — mirrors daily_creds.maybe_emit_pending's pattern.
+# Boundary detection — per-cadence "last run" state key + boundary check.
 # ---------------------------------------------------------------------------
 
 def maybe_emit_daily_and_weekly(

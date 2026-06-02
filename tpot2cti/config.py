@@ -130,9 +130,9 @@ class LoggingConfig:
 class RuntimeConfig:
     """Runtime knobs that don't fit a specific subsystem.
 
-    Previously these three were read via ``os.environ`` directly from
-    main.py + daily_creds.py, bypassing the config validation layer.
-    Per the 2026-05-22 audit #4 they live here now so the dataclass is
+    Previously some of these were read via ``os.environ`` directly from
+    main.py, bypassing the config validation layer. Per the 2026-05-22
+    audit #4 they live here now so the dataclass is
     the single source of truth and tests can override them via the
     ``env_dict`` parameter to :func:`load_config`.
     """
@@ -146,10 +146,6 @@ class RuntimeConfig:
     #: ``host:port`` for the lightweight health endpoint.  Empty string
     #: disables the health server entirely.
     health_bind: str = "0.0.0.0:8080"
-    #: How many calendar days back ``daily_creds.maybe_emit_pending`` will
-    #: look for unsent (sensor, day) pairs.  Larger = more backfill on
-    #: container restart; smaller = more risk of dropping a missed day.
-    daily_creds_lookback_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -337,7 +333,6 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         state_db_path=_env_str(env, "TPOT2CTI_STATE_DB", default="/data/state.db") or "/data/state.db",
         credential_db_path=_env_str(env, "TPOT2CTI_CREDENTIAL_DB", default="/data/credentials.db") or "/data/credentials.db",
         health_bind=_env_str(env, "TPOT2CTI_HEALTH_BIND", default="0.0.0.0:8080") or "0.0.0.0:8080",
-        daily_creds_lookback_days=_env_int(env, "TPOT2CTI_CREDS_LOOKBACK_DAYS", default=7),
     )
 
     cfg = Config(

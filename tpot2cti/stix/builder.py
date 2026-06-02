@@ -34,7 +34,6 @@ from tpot2cti.stix_ids import (
     generate_country_location_id,
     generate_credential_note_id,
     generate_cryptographic_key_id,
-    generate_daily_creds_note_id,
     generate_domain_id,
     generate_file_id,
     generate_file_indicator_id,
@@ -1027,9 +1026,9 @@ class STIXBuilder:
         WARNING: per LESSONS §7.1 we do NOT emit a per-IP per-cycle
         Activity Report.  Use this only for genuinely-per-session content
         (a Cowrie command transcript, a Honeytrap payload hexdump that's
-        worth preserving).  For aggregated content use
-        `build_daily_credentials_note()` or skip the Note entirely and
-        let the per-event Sighting carry the signal.
+        worth preserving).  For aggregated content prefer a rolling per-IP
+        Note (e.g. `build_ip_credential_note()`) or skip the Note entirely
+        and let the per-event Sighting carry the signal.
         """
         if not body_md:
             return None
@@ -1042,30 +1041,6 @@ class STIXBuilder:
             "abstract": abstract or f"Session {session.session_id[:16]}… from {session.src_ip}",
             "content": body_md,
             "object_refs": object_refs or [],
-        }
-        return self._dedup(self._stamp(obj))
-
-    def build_daily_credentials_note(
-        self,
-        sensor_hostname: str,
-        utc_date: str,        # YYYY-MM-DD
-        body_md: str,
-        object_refs: Optional[list[str]] = None,
-    ) -> Optional[dict]:
-        """Per V1_SPEC §6 — one Note per sensor per UTC day with top-100 creds.
-
-        Idempotent: same (sensor, utc_date) → same UUID, OpenCTI upserts.
-        """
-        if not body_md:
-            return None
-        if len(body_md.encode("utf-8")) > MAX_NOTE_BODY_BYTES:
-            body_md = body_md[:MAX_NOTE_BODY_BYTES] + "\n... [truncated]"
-        obj = {
-            "type": "note",
-            "id": generate_daily_creds_note_id(sensor_hostname, utc_date),
-            "abstract": f"Top 100 credential attempts — {utc_date} (UTC) — sensor: {sensor_hostname}",
-            "content": body_md,
-            "object_refs": object_refs or [generate_sensor_id(sensor_hostname)],
         }
         return self._dedup(self._stamp(obj))
 

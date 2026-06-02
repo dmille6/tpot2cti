@@ -36,3 +36,4 @@ Thumbs.db
 
 # Local override files
 docker-compose.override.yml
+.claude/
