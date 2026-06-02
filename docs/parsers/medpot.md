@@ -1,28 +1,4 @@
-# Parser design notes
-
-Per-honeypot reference and rationale for the parsers in `tpot2cti/parsers/`.
-
-This file holds the **narrative** documentation — protocol background, the
-T-Pot ES fields each parser reads, the STIX graph emitted per session, and the
-substance-filter rationale — that used to live in long module docstrings. The
-parser source keeps only a concise summary docstring plus a pointer to the
-relevant section here. Tests for each parser live in `tests/` (run by CI), not
-in `if __name__ == "__main__"` blocks.
-
-Conventions referenced below:
-
-- **Substance filter** (`has_substance()`): per-parser, per-protocol decision
-  about whether a correlated session is worth a full STIX SDO graph. Drive-by
-  probes with no real signal are dropped. See `LESSONS_LEARNED_FROM_V0.md` §2.
-- **STIX build**: parsers only `parse()` + `correlate()` + `has_substance()`.
-  The STIX bundle is built downstream in `tpot2cti/stix/builder.py`. Parsers
-  populate `session.meta` with whatever the builder needs.
-
----
-
-## Medpot
-
-HL7 medical-messaging honeypot.
+# Medpot — HL7 medical-messaging honeypot
 
 Medpot emulates a Health Level 7 (HL7) v2 messaging endpoint — the MLLP-framed
 text protocol that hospital information systems use to exchange ADT
