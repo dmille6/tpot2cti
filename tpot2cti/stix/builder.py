@@ -1268,6 +1268,56 @@ class STIXBuilder:
     # (main.run_cycle) dispatches to the right method via _PARSER_DISPATCH.
     # ──────────────────────────────────────────────────────────────────
 
+    def _link_download_chain(self, session: AttackSession) -> list[dict]:
+        """Intra-session attack-chain edges so the full story is navigable.
+
+        Two edges, both referencing already-emitted objects by their
+        deterministic ids (no duplicate nodes):
+          - Process → `related-to` → File: the command session that ran the
+            attacker's commands also dropped these files ("what they ran →
+            what landed").
+          - URL → `related-to` → File: the file was downloaded from this URL,
+            paired per `session.downloads` (the exact sha↔url from one
+            download event), so the source is explicit, not guessed.
+
+        Without these, File / URL / Process all hang off the IP separately and
+        the analyst can't see that command X pulled file Y from URL Z.
+        """
+        out: list[dict] = []
+        if not session.src_ip:
+            return out
+        file_ids = {
+            sha.lower(): generate_file_id(sha)
+            for sha in session.malware_hashes if sha
+        }
+        # Process → File (command session dropped these files)
+        if session.commands and file_ids:
+            proc_id = generate_process_id(session.sensor_hostname, session.session_id)
+            for sha, fid in file_ids.items():
+                if rel := self.build_relationship(
+                    proc_id, "related-to", fid,
+                    description=f"Command session dropped file sha256:{sha[:16]}…",
+                ):
+                    out.append(rel)
+        # URL → File (downloaded-from, explicit per-download pairing)
+        seen_pairs: set[tuple] = set()
+        for dl in session.downloads:
+            sha = (dl.get("sha256") or "").lower()
+            url = dl.get("url")
+            if not (sha and url) or (url, sha) in seen_pairs:
+                continue
+            seen_pairs.add((url, sha))
+            # Ensure the URL observable exists (dedup-safe); the relationship
+            # references its deterministic id either way.
+            if u := self.build_url(url, session=session):
+                out.append(u)
+            if rel := self.build_relationship(
+                generate_url_id(url), "related-to", generate_file_id(sha),
+                description=f"File sha256:{sha[:16]}… downloaded from {url[:80]}",
+            ):
+                out.append(rel)
+        return out
+
     def build_cowrie_session(self, session: AttackSession) -> list[dict]:
         """Build the full Cowrie session STIX graph.
 
@@ -1412,6 +1462,10 @@ class STIXBuilder:
         # decision: ONE rolling Note per attacker IP scales; 50 per-session
         # Notes per attacker do not.
         _ = process_id  # referenced above; kept for future per-session links
+
+        # Intra-session attack chain: Process→File (dropped) + URL→File
+        # (downloaded-from). Makes the command→malware→source story navigable.
+        out.extend(self._link_download_chain(session))
 
         return out
 
@@ -1950,6 +2004,9 @@ class STIXBuilder:
                     description=f"Domain referenced by {session.src_ip}",
                 ):
                     out.append(rel)
+        # Intra-session attack chain: URL→File (downloaded-from) +
+        # Process→File where commands are present (e.g. adbhoney).
+        out.extend(self._link_download_chain(session))
         return out
 
     def build_adbhoney_session(self, session: AttackSession) -> list[dict]:

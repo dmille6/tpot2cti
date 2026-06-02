@@ -119,6 +119,11 @@ class AttackSession:
     #: Lets the per-IP credential Note flag which login worked. Populated
     #: by parsers that observe a successful auth (Cowrie, Heralding).
     successful_credential: Optional[tuple[str, str]] = None
+    #: Per-download (sha256, source-URL) pairs as they appeared TOGETHER in
+    #: a single download event — preserves the link that the flat
+    #: malware_hashes / urls lists lose. Drives the builder's URL→File
+    #: "downloaded-from" edge. Each entry: ``{"sha256": str, "url": str|None}``.
+    downloads: list[dict] = field(default_factory=list)
 
     # Fingerprints
     hassh: Optional[str] = None
