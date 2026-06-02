@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
+from tpot2cti import port_intel
 
 
 # ---------------------------------------------------------------------------
@@ -186,33 +187,59 @@ def render_cowrie_session_note_body(session: AttackSession) -> str:
 def render_honeytrap_sighting_description(
     session: AttackSession, event: ParsedEvent
 ) -> str:
-    """One-line summary baked into the Sighting's `description` field.
+    """Burst-level summary baked into the Sighting's `description` field.
 
-    Replaces the per-probe Note that V0 emitted (and the bare port-scan
-    approach the PoC used). Per LESSONS §7.1: this is the
-    right place for low-signal-per-event protocol summaries — the
-    analyst sees it in OpenCTI's Sighting context without flooding
-    the Notes tab.
+    The session is a whole attacker burst (see ``HoneytrapParser.correlate``),
+    so this summarizes the *scan*: how many ports were swept, which services
+    they map to, the scan shape, and — when bytes were captured — the richest
+    payload's fingerprint + preview. Per LESSONS §7.1 this condenses what used
+    to be one Note per probe into a single Sighting line analysts actually see.
 
     Example output:
-      "Honeytrap probe tcp/22 — payload 187B printable, leads
-      'GET / HTTP/1.1\\r\\nHost: ...' (hex 8 bytes shown)"
+      "Honeytrap vertical port scan (7 ports) targeting cpanel — ports
+      tcp/2082 (cPanel), tcp/2086 (WHM), … +3 more — payload: HTTP GET /
+      — ZGrab scanner"
     """
-    payload_printable = str(event.meta.get("payload_printable") or "")
-    payload_hex = str(event.meta.get("payload_hex") or "")
-    proto = (event.protocol or "tcp").lower()
-    dst_port = event.dst_port if event.dst_port is not None else "?"
+    ports = session.dst_ports or (
+        {event.dst_port} if event and event.dst_port is not None else set()
+    )
+    _scan_labels, scan_phrase = port_intel.classify_scan(ports)
 
-    bits: list[str] = [f"Honeytrap probe {proto}/{dst_port}"]
+    payload_printable = str(
+        session.meta.get("payload_printable")
+        or (event.meta.get("payload_printable") if event else "")
+        or ""
+    )
+    payload_hex = str(
+        session.meta.get("payload_hex")
+        or (event.meta.get("payload_hex") if event else "")
+        or ""
+    )
+    fp = port_intel.fingerprint_payload(payload_printable, payload_hex)
+
+    bits: list[str] = [f"Honeytrap {scan_phrase}"]
+
+    port_summary = port_intel.summarize_ports(ports)
+    if port_summary:
+        bits.append(f"ports {port_summary}")
+
     if payload_printable:
         preview = payload_printable[:SIGHTING_DESC_PREVIEW_CAP]
         preview = preview.replace("\n", "\\n").replace("\r", "\\r")
         suffix = " [truncated]" if len(payload_printable) > SIGHTING_DESC_PREVIEW_CAP else ""
-        bits.append(
-            f"payload {len(payload_printable)}B printable, leads {preview!r}{suffix}"
-        )
+        pay = f"payload {len(payload_printable)}B {preview!r}{suffix}"
+        if fp and fp.get("summary"):
+            pay = f"{pay} — {fp['summary']}"
+        bits.append(pay)
+    elif fp and fp.get("summary"):
+        bits.append(f"payload: {fp['summary']}")
     elif payload_hex:
         bits.append(f"payload hex {len(payload_hex) // 2}B")
+
+    tags = session.meta.get("tags") or []
+    if tags:
+        bits.append("tags: " + ", ".join(str(t) for t in tags[:6]))
+
     return " — ".join(bits)
 
 

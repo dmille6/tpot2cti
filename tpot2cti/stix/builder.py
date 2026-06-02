@@ -13,6 +13,7 @@ from typing import Optional
 
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
+from tpot2cti import port_intel
 from tpot2cti.stix.rendering import (
     render_cowrie_session_note_body,
     render_cowrie_sighting_description,
@@ -1606,13 +1607,17 @@ class STIXBuilder:
         return out
 
     def build_honeytrap_probe(self, session: AttackSession) -> list[dict]:
-        """Build the STIX graph for a substantive Honeytrap session.
+        """Build the STIX graph for a Honeytrap port-scan / probe session.
 
-        The caller (orchestrator) is expected to have already checked
-        `has_substance()` and routed drive-by sessions to
-        `self.build_driveby_session()` instead.  This method assumes
-        substance and always emits a Sighting with the captured payload
-        summary in its `description`.
+        The session is a whole attacker burst (see
+        ``HoneytrapParser.correlate``), so its ``dst_ports`` set *is* the
+        scan. We surface that on the indicator: which ports were swept, the
+        service family they map to (cPanel / Telnet / SMB / …), the scan
+        shape (single / multi-port / vertical), and — for the valuable
+        minority that carried a payload — a fingerprint (HTTP probe, TLS
+        ClientHello, known scanner/botnet/exploit signature). The per-burst
+        summary lives on the Sighting `description` (LESSONS §7.1: per-event
+        Notes at hive scale produce 50k+/day nobody reads).
         """
         out: list[dict] = []
         if not session.events:
@@ -1626,9 +1631,21 @@ class STIXBuilder:
 
         ipv4_id = generate_ipv4_id(session.src_ip)
 
+        # Scan classification + payload fingerprint — computed once, reused
+        # for both the indicator labels/description and the Sighting text.
+        scan_labels, scan_phrase = port_intel.classify_scan(session.dst_ports)
+        printable = session.meta.get("payload_printable") or (
+            event.meta.get("payload_printable") if event else None
+        )
+        hex_str = session.meta.get("payload_hex") or (
+            event.meta.get("payload_hex") if event else None
+        )
+        fp = port_intel.fingerprint_payload(printable, hex_str)
+
         # IP Indicator + based-on → IPv4 observable
         ip_ind = self.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
+            self._enrich_honeytrap_indicator(ip_ind, session, scan_labels, scan_phrase, fp)
             out.append(ip_ind)
             if rel := self.build_relationship(
                 ip_ind["id"], "based-on", ipv4_id,
@@ -1636,17 +1653,67 @@ class STIXBuilder:
             ):
                 out.append(rel)
 
-            # Dual sighting (Indicator + IPv4 observable) — per-probe
-            # summary lives on the Sighting `description` (LESSONS_LEARNED
-            # §7.1: per-session Notes at hive scale produce 50k+/day that
-            # nobody reads; condense into the Sighting).
+            # Dual sighting (Indicator + IPv4 observable).
             out.extend(self.build_dual_sighting(
                 ip_ind["id"], ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_honeytrap_sighting_description(session, event),
             ))
 
+        # Rare but valuable: a captured follow-up binary. Emit the File
+        # observable + URL→File / probe→File edges via the shared chain.
+        out.extend(self._link_download_chain(session))
+
         return out
+
+    @staticmethod
+    def _enrich_honeytrap_indicator(
+        ip_ind: dict,
+        session: AttackSession,
+        scan_labels: list[str],
+        scan_phrase: str,
+        fp: Optional[dict],
+    ) -> None:
+        """Mutate a generic IP indicator into a port-scan indicator.
+
+        Adds scan-shape + ``target:<family>`` + fingerprint labels, rewrites
+        the name to reflect the sweep, and appends a scan-profile paragraph
+        (port list + service annotations + payload fingerprint) to the
+        description. Keeps the generic indicator's pattern / score / refs.
+        """
+        labels = list(ip_ind.get("labels") or [])
+        for lbl in scan_labels:
+            if lbl not in labels:
+                labels.append(lbl)
+        if fp and fp.get("label") and fp["label"] not in labels:
+            labels.append(fp["label"])
+        ip_ind["labels"] = labels
+
+        nports = len(session.dst_ports)
+        if nports:
+            ip_ind["name"] = (
+                f"Honeytrap scan - {session.src_ip} "
+                f"({nports} port{'s' if nports != 1 else ''})"
+            )
+
+        port_summary = port_intel.summarize_ports(session.dst_ports)
+        profile_bits = [f"Scan profile: {scan_phrase}."]
+        if port_summary:
+            profile_bits.append(f"Ports: {port_summary}.")
+        if fp and fp.get("summary"):
+            profile_bits.append(f"Payload fingerprint: {fp['summary']}.")
+        if session.malware_hashes:
+            profile_bits.append(
+                f"{len(session.malware_hashes)} file(s) captured during the burst."
+            )
+        tags = session.meta.get("tags") or []
+        if tags:
+            profile_bits.append("Sensor tags: " + ", ".join(str(t) for t in tags[:8]) + ".")
+        profile = " ".join(profile_bits)
+        ip_ind["description"] = (
+            f"{ip_ind['description']}\n\n{profile}"
+            if ip_ind.get("description") else profile
+        )
 
     def build_fallback_event(self, session: AttackSession) -> list[dict]:
         """Build STIX for one unknown-type (fallback) session.
