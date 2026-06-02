@@ -49,6 +49,7 @@ from typing import Any, Optional
 
 from tpot2cti import attacker_profile, daily_creds
 from tpot2cti.config import Config, ConfigError, load_config
+from tpot2cti.credential_store import CredentialStore
 from tpot2cti.es_client import TpotESClient
 from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
@@ -248,6 +249,44 @@ def _compute_window(
 # run_cycle — one iteration of the main loop
 # ---------------------------------------------------------------------------
 
+def _session_credential_attempts(session) -> list[dict]:
+    """Flatten a session's credential attempts into credential-store rows.
+
+    The pair the honeypot accepted (``session.successful_credential``) is
+    marked ``success=True``. service/port come from the session's protocol
+    + dst_port; geo from the first event. These rows go to the credential
+    store (bulk), NOT to OpenCTI — only a per-IP summary Note does.
+    """
+    first = session.events[0] if session.events else None
+    service = (
+        (sorted(session.protocols)[0] if session.protocols else None)
+        or (first.protocol if first else None)
+        or session.event_type.lower()
+    )
+    port = (
+        (sorted(session.dst_ports)[0] if session.dst_ports else None)
+        or (first.dst_port if first else None)
+        or 0
+    )
+    succ = session.successful_credential
+    rows: list[dict] = []
+    for pair in session.credentials_tried:
+        u, p = pair
+        rows.append({
+            "username": u, "password": p,
+            "attacker_ip": session.src_ip,
+            "honeypot_name": session.sensor_hostname,
+            "honeypot_type": session.event_type,
+            "service": str(service), "port": int(port) if port else 0,
+            "when": session.last_seen,
+            "success": succ is not None and tuple(pair) == tuple(succ),
+            "country": getattr(first, "src_country_code", None) if first else None,
+            "asn": getattr(first, "src_asn", None) if first else None,
+            "org": getattr(first, "src_as_org", None) if first else None,
+        })
+    return rows
+
+
 def run_cycle(
     cfg: Config,
     state: CycleState,
@@ -257,6 +296,7 @@ def run_cycle(
     *,
     now: Optional[datetime] = None,
     benign_filter: Optional[BenignScannerFilter] = None,
+    credential_store=None,  # Optional[CredentialStore]
 ) -> dict:
     """Run ONE importer cycle and return a summary dict.
 
@@ -376,6 +416,11 @@ def run_cycle(
     # to a profile-emitting parser. Drives emit_live_profile_notes() at
     # the end of the cycle (see tpot2cti/attacker_profile.py).
     profile_active_ips: set[str] = set()
+    # Per-cycle credential capture — bulk pairs go to the credential store
+    # (NOT OpenCTI); one Note per attacker IP summarises them. See
+    # tpot2cti/credential_store.py + docs/credential-store.md.
+    cred_attempts: list[dict] = []
+    cred_ips: set[str] = set()
 
     # Foundation objects — emitted once per bundle.  Per V1_SPEC §4
     # the operator Identity + TLP marking are always-present.
@@ -416,6 +461,15 @@ def run_cycle(
                     f"cycle {cycle_id}: attacker_profile.update_activity_from_session "
                     f"raised (ignored): {e}"
                 )
+            # Credential capture — accumulate for the store + per-IP Note.
+            # Done before the STIX build so a build-time error doesn't cost
+            # us the credential record.
+            if credential_store is not None and session.credentials_tried and session.src_ip:
+                try:
+                    cred_attempts.extend(_session_credential_attempts(session))
+                    cred_ips.add(session.src_ip)
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.debug(f"cycle {cycle_id}: credential capture raised (ignored): {e}")
             try:
                 # Per the V0 parser-vs-builder separation rule: parsers are pure data; STIX-shape
                 # decisions live on the builder. We dispatch by the
@@ -455,25 +509,37 @@ def run_cycle(
     if sensors_seen:
         daily_creds.remember_sensors(state, sensors_seen)
 
-    # ── Step 5: daily creds Notes ─────────────────────────────────────
-    creds_pairs: list[tuple] = []
-    try:
-        creds_result = daily_creds.maybe_emit_pending(
-            state, es, builder, cfg,
-            index_pattern=cfg.es.index_pattern,
-        )
-        if creds_result.stix_objects:
-            all_objects.extend(creds_result.stix_objects)
-            creds_pairs = creds_result.pairs
-            logger.info(
-                f"cycle {cycle_id}: daily_creds added "
-                f"{len(creds_result.stix_objects)} objects "
-                f"for {len(creds_result.pairs)} (sensor, date) pair(s)"
+    # ── Step 5: credentials → store (bulk) + one Note per attacker IP ──
+    # Bruteforce runs are tens of thousands of pairs; we keep them OUT of
+    # OpenCTI (credential_store) and emit only a per-IP summary Note with
+    # the pairs tried + which was accepted. Replaces the old daily
+    # top-100-per-sensor Note (per the 2026-06-02 user decision). The bulk
+    # detail stays queryable in the local store / can feed exports.
+    creds_pairs: list[tuple] = []     # retained (empty) for the cycle summary
+    if credential_store is not None:
+        try:
+            n_written = credential_store.record_attempts(cred_attempts)
+            n_notes = 0
+            for ip in sorted(cred_ips):
+                try:
+                    rows = credential_store.get_ip_credentials(ip)
+                    note = builder.build_ip_credential_note(ip, rows)
+                    if note:
+                        all_objects.append(note)
+                        n_notes += 1
+                except Exception as e:
+                    logger.warning(
+                        f"cycle {cycle_id}: credential Note for {ip} failed: {e}"
+                    )
+            if n_written or n_notes:
+                logger.info(
+                    f"cycle {cycle_id}: credentials — {n_written} attempt(s) "
+                    f"stored, {n_notes} per-IP Note(s) emitted"
+                )
+        except Exception as e:
+            logger.exception(
+                f"cycle {cycle_id}: credential store/note emission failed: {e}"
             )
-    except Exception as e:
-        logger.exception(
-            f"cycle {cycle_id}: daily_creds.maybe_emit_pending failed: {e}"
-        )
 
     # ── Step 5b: attacker-profile Notes (live + daily + weekly) ───────
     # Replaces the per-session Cowrie Notes formerly emitted by
@@ -723,6 +789,14 @@ def main() -> int:
 
     # 3) State + ES + OpenCTI + Publisher.
     state = CycleState(db_path=cfg.runtime.state_db_path)
+    # Credential store — bulk bruteforce pairs live here (SQLite), NOT in
+    # OpenCTI; the cycle emits only a per-IP summary Note. Best-effort: a
+    # store failure must not stop ingestion.
+    credential_store = None
+    try:
+        credential_store = CredentialStore(db_path=cfg.runtime.credential_db_path)
+    except Exception as e:
+        logger.warning(f"credential store unavailable (continuing without it): {e}")
     es = TpotESClient(
         host=cfg.es.host,
         port=cfg.es.port,
@@ -786,7 +860,8 @@ def main() -> int:
             cycle_started = time.monotonic()
             try:
                 run_cycle(cfg, state, es, builder_factory, publisher,
-                          benign_filter=benign_filter)
+                          benign_filter=benign_filter,
+                          credential_store=credential_store)
             except Exception as e:
                 # Cycle failed (ES error, publisher crashed, etc.).  Per
                 # V1_SPEC §7: log, record, sleep, continue.  Don't crash
@@ -836,6 +911,11 @@ def main() -> int:
             es.close()
         except Exception as e:
             logger.debug(f"es.close() raised (ignored): {e}")
+        if credential_store is not None:
+            try:
+                credential_store.close()
+            except Exception as e:
+                logger.debug(f"credential_store.close() raised (ignored): {e}")
 
     return exit_code
 
