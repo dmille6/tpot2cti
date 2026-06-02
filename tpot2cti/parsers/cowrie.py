@@ -201,6 +201,10 @@ class CowrieParser(BaseParser):
             if url := meta.get("file_url"):
                 if url not in session.urls:
                     session.urls.append(url)
+            # Pair the dropped file with its source URL as they appeared
+            # together in THIS download event (preserves the chain link).
+            if sha:
+                session.downloads.append({"sha256": sha, "url": url or None})
 
             # fingerprints
             if hassh := meta.get("hassh"):
