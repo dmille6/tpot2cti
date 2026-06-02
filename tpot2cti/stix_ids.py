@@ -191,6 +191,18 @@ def generate_attacker_profile_note_id(ip: str) -> str:
     return sdo_id("note", "note", "attacker-profile", ip)
 
 
+def generate_credential_note_id(ip: str) -> str:
+    """Per-IP credential-summary Note id.
+
+    Seed: ``note:credentials:<ip>``. One rolling Note per attacker IP
+    summarising the (username, password) pairs it tried and which was
+    accepted. Idempotent via UUID5 so OpenCTI upserts in place as the
+    attacker's credential activity accumulates across cycles — the bulk
+    pairs live in the local credential store, not OpenCTI.
+    """
+    return sdo_id("note", "note", "credentials", ip)
+
+
 def generate_attacker_daily_note_id(ip: str, utc_date: str) -> str:
     """Daily attacker-profile snapshot Note id.
 

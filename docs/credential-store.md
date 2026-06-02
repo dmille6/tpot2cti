@@ -24,10 +24,18 @@ uses for `state.db`, to avoid adding a dependency to the lean core.
 `get_ip_credentials(ip)` returns the per-IP summary the publisher renders
 into the Note.
 
-## TODO (wiring step)
+## Cycle wiring
 
-- **Batch writes.** `record_attempt()` commits per call; at bruteforce scale
-  the cycle should write all of a cycle's attempts in one transaction (add a
-  `record_attempts(iterable)` batch method) to avoid an fsync per attempt.
+`run_cycle()` collects every session's credential attempts, batch-writes them
+with `record_attempts()` (one transaction per cycle), then emits one
+`build_ip_credential_note()` per attacker IP that had credential activity.
+This **replaced** the old daily top-100-per-sensor Note (`daily_creds.py`,
+now uncalled). Config: `TPOT2CTI_CREDENTIAL_DB` (default `/data/credentials.db`).
+
+## TODO
+
 - **Pruning.** Add retention so the store stays bounded (mirror the
   `state.py` prune pattern).
+- **Default-credential tagging.** Prod seeds a `default_credentials` table
+  (known IoT/device defaults) and flags matches; not yet ported.
+- Remove the now-unused `daily_creds.py` once nothing references it.

@@ -108,6 +108,51 @@ class CredentialStore:
     # write path
     # ------------------------------------------------------------------
 
+    def _upsert(
+        self, c: sqlite3.Connection, *,
+        username, password, attacker_ip, honeypot_name, honeypot_type,
+        service, port, ts, success, country, asn, org,
+    ) -> int:
+        """UPSERT one attempt using an open connection/transaction `c`."""
+        username = "" if username is None else str(username)
+        password = "" if password is None else str(password)
+        ph = _sha256(password)
+        c.execute(
+            """
+            INSERT INTO credential_pairs
+                (username, password, password_sha256, password_length,
+                 is_empty_pass, first_seen, last_seen, total_attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(username, password_sha256) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                total_attempts = total_attempts + 1
+            """,
+            (username, password, ph, len(password),
+             1 if password == "" else 0, ts, ts),
+        )
+        cid = c.execute(
+            "SELECT credential_id FROM credential_pairs "
+            "WHERE username = ? AND password_sha256 = ?",
+            (username, ph),
+        ).fetchone()[0]
+        c.execute(
+            """
+            INSERT INTO credential_usage
+                (credential_id, attacker_ip, honeypot_name, honeypot_type,
+                 service, port, first_seen, last_seen, attempt_count,
+                 success_count, attacker_country, attacker_asn, attacker_org)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(credential_id, attacker_ip, honeypot_name, service, port)
+            DO UPDATE SET
+                last_seen = excluded.last_seen,
+                attempt_count = attempt_count + 1,
+                success_count = success_count + excluded.success_count
+            """,
+            (cid, attacker_ip, honeypot_name, honeypot_type, service, port,
+             ts, ts, 1 if success else 0, country, asn, org),
+        )
+        return cid
+
     def record_attempt(
         self,
         username: str,
@@ -126,51 +171,45 @@ class CredentialStore:
     ) -> int:
         """Record one credential attempt; UPSERT pair + usage. Returns credential_id.
 
-        Tens of thousands of attempts collapse onto a bounded set of rows:
-        repeat (username, password) pairs increment counters rather than
-        inserting new rows, and per-(ip, honeypot, service, port) usage is
-        aggregated the same way.
+        Repeat (username, password) pairs increment counters rather than
+        inserting new rows. For bulk writes use :meth:`record_attempts`,
+        which batches a whole cycle into one transaction.
         """
-        username = "" if username is None else str(username)
-        password = "" if password is None else str(password)
-        ph = _sha256(password)
         ts = (when or datetime.now(timezone.utc)).isoformat()
         with self._conn() as c:
-            c.execute(
-                """
-                INSERT INTO credential_pairs
-                    (username, password, password_sha256, password_length,
-                     is_empty_pass, first_seen, last_seen, total_attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(username, password_sha256) DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    total_attempts = total_attempts + 1
-                """,
-                (username, password, ph, len(password),
-                 1 if password == "" else 0, ts, ts),
+            return self._upsert(
+                c, username=username, password=password, attacker_ip=attacker_ip,
+                honeypot_name=honeypot_name, honeypot_type=honeypot_type,
+                service=service, port=port, ts=ts, success=success,
+                country=country, asn=asn, org=org,
             )
-            cid = c.execute(
-                "SELECT credential_id FROM credential_pairs "
-                "WHERE username = ? AND password_sha256 = ?",
-                (username, ph),
-            ).fetchone()[0]
-            c.execute(
-                """
-                INSERT INTO credential_usage
-                    (credential_id, attacker_ip, honeypot_name, honeypot_type,
-                     service, port, first_seen, last_seen, attempt_count,
-                     success_count, attacker_country, attacker_asn, attacker_org)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                ON CONFLICT(credential_id, attacker_ip, honeypot_name, service, port)
-                DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    attempt_count = attempt_count + 1,
-                    success_count = success_count + excluded.success_count
-                """,
-                (cid, attacker_ip, honeypot_name, honeypot_type, service, port,
-                 ts, ts, 1 if success else 0, country, asn, org),
-            )
-        return cid
+
+    def record_attempts(self, attempts: list[dict]) -> int:
+        """Record many attempts in ONE transaction. Returns the count written.
+
+        Each dict needs `username, password, attacker_ip, honeypot_name,
+        honeypot_type, service, port` and may include `when` (datetime),
+        `success` (bool), `country`, `asn`, `org`. Batching avoids an fsync
+        per attempt — important at bruteforce scale (the cycle records a
+        whole window's worth at once).
+        """
+        if not attempts:
+            return 0
+        now_iso = _now_iso()
+        with self._conn() as c:
+            for a in attempts:
+                when = a.get("when")
+                self._upsert(
+                    c,
+                    username=a.get("username"), password=a.get("password"),
+                    attacker_ip=a["attacker_ip"], honeypot_name=a["honeypot_name"],
+                    honeypot_type=a["honeypot_type"], service=a["service"],
+                    port=a["port"],
+                    ts=when.isoformat() if hasattr(when, "isoformat") else now_iso,
+                    success=bool(a.get("success", False)),
+                    country=a.get("country"), asn=a.get("asn"), org=a.get("org"),
+                )
+        return len(attempts)
 
     # ------------------------------------------------------------------
     # read path (for the per-IP Note)

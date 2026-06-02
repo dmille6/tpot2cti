@@ -139,6 +139,10 @@ class RuntimeConfig:
     #: SQLite path for ``CycleState``.  Defaults to ``/data/state.db``
     #: which matches the bind-mount in docker-compose.yml.
     state_db_path: str = "/data/state.db"
+    #: SQLite path for the credential store (bulk bruteforce pairs kept OUT
+    #: of OpenCTI; only a per-IP summary Note is emitted). See
+    #: tpot2cti/credential_store.py.
+    credential_db_path: str = "/data/credentials.db"
     #: ``host:port`` for the lightweight health endpoint.  Empty string
     #: disables the health server entirely.
     health_bind: str = "0.0.0.0:8080"
@@ -331,6 +335,7 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     # --- Runtime (was three direct os.environ reads pre-audit #4) ---
     runtime_cfg = RuntimeConfig(
         state_db_path=_env_str(env, "TPOT2CTI_STATE_DB", default="/data/state.db") or "/data/state.db",
+        credential_db_path=_env_str(env, "TPOT2CTI_CREDENTIAL_DB", default="/data/credentials.db") or "/data/credentials.db",
         health_bind=_env_str(env, "TPOT2CTI_HEALTH_BIND", default="0.0.0.0:8080") or "0.0.0.0:8080",
         daily_creds_lookback_days=_env_int(env, "TPOT2CTI_CREDS_LOOKBACK_DAYS", default=7),
     )

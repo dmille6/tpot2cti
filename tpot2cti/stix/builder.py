@@ -32,6 +32,7 @@ from tpot2cti.stix_ids import (
     generate_autonomous_system_id,
     generate_city_location_id,
     generate_country_location_id,
+    generate_credential_note_id,
     generate_cryptographic_key_id,
     generate_daily_creds_note_id,
     generate_domain_id,
@@ -1062,6 +1063,74 @@ class STIXBuilder:
             "abstract": f"Top 100 credential attempts — {utc_date} (UTC) — sensor: {sensor_hostname}",
             "content": body_md,
             "object_refs": object_refs or [generate_sensor_id(sensor_hostname)],
+        }
+        return self._dedup(self._stamp(obj))
+
+    def build_ip_credential_note(
+        self,
+        ip: str,
+        credentials: list[dict],
+        *,
+        max_rows: int = 200,
+    ) -> Optional[dict]:
+        """One rolling Note per attacker IP summarising credential attempts.
+
+        `credentials` is the per-IP summary from the credential store
+        (each: username, password, attempts, succeeded, service, port). A
+        bruteforce of tens of thousands of pairs becomes ONE Note here — the
+        bulk lives in the store, not OpenCTI. Idempotent id → OpenCTI upserts
+        the same Note as the attacker's activity grows. Attached to the IP
+        observable via object_refs.
+
+        Rows are capped (`max_rows`, accepted creds always shown first) so a
+        spray with a huge unique-pair count can't blow the Note body.
+        """
+        if not ip or not credentials:
+            return None
+        # Accepted logins first, then by attempt volume.
+        rows = sorted(
+            credentials,
+            key=lambda r: (not r.get("succeeded"), -int(r.get("attempts", 0))),
+        )
+        n_total = len(rows)
+        n_success = sum(1 for r in rows if r.get("succeeded"))
+        shown = rows[:max_rows]
+
+        def _cell(v: str) -> str:
+            # Escape pipes/newlines so the markdown table stays intact.
+            return str(v).replace("|", "\\|").replace("\n", " ")[:128] or "∅"
+
+        lines = [
+            f"# Credential attempts from {ip}",
+            "",
+            f"- **Unique pairs:** {n_total}"
+            + (f" (showing top {max_rows})" if n_total > max_rows else ""),
+            f"- **Accepted logins:** {n_success}",
+            "",
+            "| Username | Password | Attempts | Service:Port | Accepted |",
+            "|---|---|---:|---|:---:|",
+        ]
+        for r in shown:
+            lines.append(
+                f"| {_cell(r.get('username'))} | {_cell(r.get('password'))} "
+                f"| {int(r.get('attempts', 0))} "
+                f"| {_cell(r.get('service'))}:{r.get('port')} "
+                f"| {'✅' if r.get('succeeded') else ''} |"
+            )
+        body_md = "\n".join(lines)
+        if len(body_md.encode("utf-8")) > MAX_NOTE_BODY_BYTES:
+            body_md = body_md[:MAX_NOTE_BODY_BYTES] + "\n... [truncated]"
+
+        abstract = (
+            f"Credentials from {ip}: {n_total} unique pair(s), "
+            f"{n_success} accepted."
+        )
+        obj = {
+            "type": "note",
+            "id": generate_credential_note_id(ip),
+            "abstract": abstract,
+            "content": body_md,
+            "object_refs": [generate_ipv4_id(ip)],
         }
         return self._dedup(self._stamp(obj))
 

@@ -173,12 +173,16 @@ class CowrieParser(BaseParser):
             eventid = meta.get("eventid", "")
 
             # auth_success — any success in the session counts
-            if meta.get("login_success") is True:
-                session.auth_success = True
-
-            # credentials tried — capture both successes and failures
             uname = meta.get("username")
             pwd = meta.get("password")
+            if meta.get("login_success") is True:
+                session.auth_success = True
+                # Remember WHICH pair the honeypot accepted, for the
+                # per-IP credential Note.
+                if uname is not None and pwd is not None:
+                    session.successful_credential = (str(uname), str(pwd))
+
+            # credentials tried — capture both successes and failures
             if uname is not None and pwd is not None:
                 session.credentials_tried.append((str(uname), str(pwd)))
 
