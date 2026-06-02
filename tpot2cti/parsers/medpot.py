@@ -1,32 +1,11 @@
 """Medpot parser — HL7 medical-messaging honeypot.
 
-Medpot emulates a Health Level 7 (HL7) v2 messaging endpoint —
-the MLLP-framed text protocol that hospital information systems use
-to exchange ADT (admit/discharge/transfer), ORM (order), ORU (result)
-and similar clinical messages.  Internet-exposed HL7 endpoints are
-not supposed to exist; every probe is worth recording in full.
+Parses T-Pot Medpot docs (HL7 v2 MLLP clinical messages) into ParsedEvents
+and one-event-per-session AttackSessions; every probe is substantive. STIX
+is built downstream in tpot2cti/stix/builder.py from session.meta.
 
-Per V1_SPEC.md §5.9:
-
-  T-Pot doc fields used:
-    src_ip, dst_port, msg_type
-
-  Event correlation:
-    each ES doc is a discrete HL7 message; default one-event-per-
-    session correlator applies.
-
-  STIX emitted per session (built downstream by the publisher):
-    IPv4-Addr, AutonomousSystem, Location (via build_attacker_context),
-    Indicator(ip), Sighting,
-    Note with the HL7 message type (ADT^A01, ORM^O01, ...).
-
-Per docs/LESSONS_LEARNED_FROM_V0.md §2 (substance filter):
-    HL7 traffic from random internet hosts is by definition
-    anomalous.  `has_substance()` always returns True.
-
-This parser only `parse()`s and `correlate()`s; the STIX bundle is
-built by the publisher (tpot2cti/stix/builder.py) using the metadata
-we populate on the session.
+See docs/parsers/medpot.md for protocol background, ES fields, the emitted
+STIX graph, and substance rationale.
 """
 
 from __future__ import annotations
@@ -144,15 +123,9 @@ class MedpotParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
 
     def has_substance(self, session: AttackSession) -> bool:
-        """Every Medpot probe is substantive.
+        """Always True — internet HL7 traffic is anomalous by definition.
 
-        Per V1_SPEC §5.9 and the Phase-4 instructions: HL7 traffic
-        from strangers on the internet is by definition anomalous,
-        so each Medpot doc warrants the full STIX SDO graph.
-
-        See docs/LESSONS_LEARNED_FROM_V0.md §2: per-parser substance
-        decisions, not a global rule.  For Medpot the answer is
-        always yes.
+        See docs/parsers/medpot.md.
         """
         return True
 
@@ -172,85 +145,3 @@ class MedpotParser(BaseParser):
 
 # Register on import
 register(MedpotParser())
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    from datetime import datetime, timezone
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    parser = MedpotParser()
-    now = datetime.now(timezone.utc)
-
-    # ── Case 1: ADT^A01 admit message ──────────────────────────────────
-    adt_doc = {
-        "@timestamp": now.isoformat(),
-        "type": "Medpot",
-        "src_ip": "203.0.113.77",
-        "src_port": 50050,
-        "dst_port": 2575,
-        "msg_type": "ADT^A01",
-        "t-pot_hostname": "node1",
-        "geoip": {
-            "country_iso_code": "DE",
-            "country_name": "Germany",
-            "asn": 3320,
-            "organization": "Deutsche Telekom AG",
-        },
-    }
-
-    # ── Case 2: ORM^O01 order message ──────────────────────────────────
-    orm_doc = {
-        "@timestamp": now.isoformat(),
-        "type": "Medpot",
-        "src_ip": "198.51.100.31",
-        "dst_port": 2575,
-        "msg_type": "ORM^O01",
-    }
-
-    # ── Case 3: no msg_type — still substantive ────────────────────────
-    bare_doc = {
-        "@timestamp": now.isoformat(),
-        "type": "Medpot",
-        "src_ip": "192.0.2.42",
-    }
-
-    docs = [adt_doc, orm_doc, bare_doc]
-    events = [parser.parse(d) for d in docs]
-    assert all(e is not None for e in events), "parse() returned None unexpectedly"
-    print(f"parsed {len(events)} Medpot events")
-    for e in events:
-        print(
-            f"  src_ip={e.src_ip:<16} dst_port={e.dst_port} "
-            f"msg_type={e.meta.get('msg_type')!r}"
-        )
-
-    sessions = parser.correlate(events)
-    assert len(sessions) == 3, f"expected 3 sessions, got {len(sessions)}"
-    print(f"\ncorrelated into {len(sessions)} session(s)")
-
-    for s in sessions:
-        sub = parser.has_substance(s)
-        print(
-            f"  session src_ip={s.src_ip:<16} "
-            f"msg_type={s.meta.get('msg_type')!r:<12} "
-            f"has_substance={sub}"
-        )
-        # Every Medpot session is substantive per V1_SPEC §5.9.
-        assert sub is True, f"Medpot session {s.src_ip} not substantive!"
-
-    # First session should carry msg_type on session.meta
-    assert sessions[0].meta.get("msg_type") == "ADT^A01"
-    assert sessions[1].meta.get("msg_type") == "ORM^O01"
-    # bare_doc has no msg_type — meta should not contain it
-    assert "msg_type" not in sessions[2].meta
-
-    # Malformed docs return None
-    assert parser.parse({}) is None
-    assert parser.parse({"src_ip": "1.2.3.4"}) is None
-
-    print("\nOK")

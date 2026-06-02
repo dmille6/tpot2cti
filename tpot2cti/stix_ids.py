@@ -161,18 +161,6 @@ def generate_session_note_id(sensor: str, session_id: str) -> str:
     return sdo_id("note", "note", "session", sensor, session_id)
 
 
-def generate_daily_creds_note_id(sensor: str, utc_date: str) -> str:
-    """Daily top-100 credentials Note id (V1_SPEC §6).
-
-    Seed: ``note:daily-creds:<sensor>:<utc-date>``.
-
-    ``utc_date`` is the ISO-8601 date string ``YYYY-MM-DD`` in UTC.
-    Idempotent: re-running the same cycle for the same UTC date
-    produces the same Note id, so OpenCTI upserts rather than duplicates.
-    """
-    return sdo_id("note", "note", "daily-creds", sensor, utc_date)
-
-
 # ---------------------------------------------------------------------------
 # Attacker-profile Note ids (per-IP rolling profile + daily/weekly snapshots).
 # See ``tpot2cti/attacker_profile.py`` for the consumer and the V0 "don't emit 50K Notes/day" finding
@@ -189,6 +177,18 @@ def generate_attacker_profile_note_id(ip: str) -> str:
     Note per cycle.
     """
     return sdo_id("note", "note", "attacker-profile", ip)
+
+
+def generate_credential_note_id(ip: str) -> str:
+    """Per-IP credential-summary Note id.
+
+    Seed: ``note:credentials:<ip>``. One rolling Note per attacker IP
+    summarising the (username, password) pairs it tried and which was
+    accepted. Idempotent via UUID5 so OpenCTI upserts in place as the
+    attacker's credential activity accumulates across cycles — the bulk
+    pairs live in the local credential store, not OpenCTI.
+    """
+    return sdo_id("note", "note", "credentials", ip)
 
 
 def generate_attacker_daily_note_id(ip: str, utc_date: str) -> str:

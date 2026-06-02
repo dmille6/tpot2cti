@@ -91,12 +91,3 @@ def test_prune_cycles_keeps_last_n(state_db):
     n = state_db.prune_cycles(keep_last=2)
     assert n == 3
     assert len(state_db.recent_cycles(limit=10)) == 2
-
-
-def test_record_daily_creds_emitted_idempotent(state_db):
-    """Same (sensor, date) twice = one row, latest emitted_at wins."""
-    from datetime import date
-    state_db.record_daily_creds_emitted("node1", date(2026, 5, 21))
-    state_db.record_daily_creds_emitted("node1", date(2026, 5, 21))
-    missing = state_db.get_missing_daily_creds_dates("node1", lookback_days=2)
-    assert date(2026, 5, 21) not in missing

