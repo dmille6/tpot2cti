@@ -358,6 +358,7 @@ _GALAH_INTERNAL_TYPES = (
     "contentGenerationError",   # observed in real T-Pot ES: LLM call canceled
     "emptyLLMResponse",         # LLM returned empty body
     "failedResponse",           # generic LLM failure
+    "invalidJSONResponse",      # observed 2026-06-02: LLM returned unparseable JSON
     "successfulResponse",       # speculative future case if Galah ever sets it
     "cacheHit",                 # speculative future case
 )

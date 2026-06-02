@@ -147,6 +147,7 @@ def parser_docs(now_utc):
         "contentGenerationError": make_common_doc("Galah", now=now_utc),
         "emptyLLMResponse":       make_common_doc("Galah", now=now_utc),
         "failedResponse":         make_common_doc("Galah", now=now_utc),
+        "invalidJSONResponse":    make_common_doc("Galah", now=now_utc),
         "successfulResponse":     make_common_doc("Galah", now=now_utc),
         "cacheHit":               make_common_doc("Galah", now=now_utc),
         "__fallback__":  make_common_doc("BrandNewType", now=now_utc),

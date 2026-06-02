@@ -85,6 +85,7 @@ _PARSER_DISPATCH: dict[str, str] = {
     "successfulResponse":  "build_galah_session",
     "failedResponse":      "build_galah_session",
     "emptyLLMResponse":    "build_galah_session",
+    "invalidJSONResponse": "build_galah_session",
     "contentGenerationError": "build_galah_session",
     "Tanner":       "build_tanner_session",
     "H0neytr4p":    "build_h0neytr4p_session",
