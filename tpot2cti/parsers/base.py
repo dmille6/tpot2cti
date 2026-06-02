@@ -115,6 +115,10 @@ class AttackSession:
     urls: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
     credentials_tried: list[tuple[str, str]] = field(default_factory=list)
+    #: The specific (username, password) the honeypot ACCEPTED, if any.
+    #: Lets the per-IP credential Note flag which login worked. Populated
+    #: by parsers that observe a successful auth (Cowrie, Heralding).
+    successful_credential: Optional[tuple[str, str]] = None
 
     # Fingerprints
     hassh: Optional[str] = None

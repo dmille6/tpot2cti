@@ -1,24 +1,6 @@
 """tpot2cti — STIX 2.1 type allowlist.
 
-Per docs/LESSONS_LEARNED_FROM_V0.md §8.4:
-
-    Silent drop of unknown STIX types.  If you emit an object with a
-    STIX `type` field that OpenCTI's worker doesn't recognize, it's
-    silently dropped.  No error, no warning.
-
-    The PoC's defense: maintain a `KNOWN_STIX_TYPES` allowlist. Before
-    sending a bundle, check every object's type against the allowlist.
-    Anything unknown logs a WARNING.
-
-This module is that allowlist plus the validation helper the publisher
-calls before send.  Keep it CURRENT — when V1_SPEC §5 adds support for
-a new STIX type, add it here too or the publisher will silently
-warn-spam the logs and the new type will be dropped.
-
-The set below is EXACTLY what we intend to emit per V1_SPEC §4
-("STIX object model" table).  We deliberately keep it tight — adding
-a type should require a deliberate change here, not slip in from a
-typo in a parser.
+See docs/stix/types.md for design notes.
 """
 
 from __future__ import annotations
@@ -120,20 +102,3 @@ def log_unknown_types(unknown: Counter) -> None:
             f"SILENT-DROP RISK: emitted {count} object(s) with unrecognized "
             f"STIX type {t!r}.  {hint_for(t)}"
         )
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    sample = [
-        {"type": "ipv4-addr", "value": "1.2.3.4"},
-        {"type": "indicator", "pattern": "[ipv4-addr:value = '1.2.3.4']"},
-        {"type": "x-opencti-cryptographic-key", "value": "abc"},  # bad — should warn
-        {"type": "user-account", "user_id": "root"},               # bad — should warn
-        {"type": "frobnicator"},                                    # unknown
-        {},                                                         # missing type
-    ]
-    unknown = validate_types(sample)
-    print(f"unknown types found: {dict(unknown)}")
-    log_unknown_types(unknown)
-    print(f"\nallowlist has {len(KNOWN_STIX_TYPES)} types")

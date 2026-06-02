@@ -9,7 +9,8 @@ This module wires together every Phase 1-5 piece:
   - `parsers.dispatch()`          — type → parser dispatch
   - `parsers.<P>.correlate()`     — events → sessions
   - `parsers.<P>.build()`         — sessions → STIX (substance-filtered)
-  - `daily_creds.maybe_emit_pending()` — V1_SPEC §6 daily Note
+  - `credential_store` + `build_ip_credential_note()` — bruteforce pairs to
+    the local store; one per-IP summary Note to OpenCTI
   - `publisher.Publisher.publish()` (Phase 5)  — three-pass send to OpenCTI
   - `opencti_client.OpenCTIClient` (Phase 5)
   - `health.HealthServer`         — /health endpoint
@@ -21,7 +22,7 @@ Per V1_SPEC.md §3 (cycle behavior) the loop is:
         2. dispatch each doc → ParsedEvent
         3. group by parser type_name → correlate → AttackSessions
         4. parser.build(session, builder) → STIX objects
-        5. daily_creds.maybe_emit_pending() → +Notes
+        5. credentials → store (bulk) + one per-IP summary Note
         6. publisher.publish(objects)
         7. state.set_last_run(window_end)
         8. log + record cycle summary
@@ -47,8 +48,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from tpot2cti import attacker_profile, daily_creds
+from tpot2cti import attacker_profile
 from tpot2cti.config import Config, ConfigError, load_config
+from tpot2cti.credential_store import CredentialStore
 from tpot2cti.es_client import TpotESClient
 from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
@@ -76,6 +78,38 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Cowrie":       "build_cowrie_session",
     "Suricata":     "build_suricata_alert",
     "Honeytrap":    "build_honeytrap_probe",
+    # Web / HTTP honeypot family → build_<type>_session (shared _build_web_session)
+    "Galah":        "build_galah_session",
+    # Galah's LLM-response subtypes (separate parser instances) → same builder
+    "cacheHit":            "build_galah_session",
+    "successfulResponse":  "build_galah_session",
+    "failedResponse":      "build_galah_session",
+    "emptyLLMResponse":    "build_galah_session",
+    "contentGenerationError": "build_galah_session",
+    "Tanner":       "build_tanner_session",
+    "H0neytr4p":    "build_h0neytr4p_session",
+    "ElasticPot":   "build_elasticpot_session",
+    "Ciscoasa":     "build_ciscoasa_session",
+    "Wordpot":      "build_wordpot_session",
+    "NGINX":        "build_nginx_session",
+    "Honeyaml":     "build_honeyaml_session",
+    # Malware-drop family → File + indicator + download URL/domain + drops
+    "Adbhoney":     "build_adbhoney_session",
+    "Dionaea":      "build_dionaea_session",
+    # Fingerprint family → HASSH/JA3 Cryptographic-Key
+    "Fatt":         "build_fatt_session",
+    # Protocol / ICS / VoIP / shell family → protocol AttackPattern + Process
+    "ConPot":       "build_conpot_session",
+    "Dicompot":     "build_dicompot_session",
+    "Ipphoney":     "build_ipphoney_session",
+    "Redishoneypot": "build_redishoneypot_session",
+    "Sentrypeer":   "build_sentrypeer_session",
+    "Miniprint":    "build_miniprint_session",
+    "Medpot":       "build_medpot_session",
+    "Router":       "build_router_session",
+    "Heralding":    "build_heralding_session",
+    "Mailoney":     "build_mailoney_session",
+    "Beelzebub":    "build_beelzebub_session",
     "__fallback__": "build_fallback_event",
 }
 
@@ -248,6 +282,44 @@ def _compute_window(
 # run_cycle — one iteration of the main loop
 # ---------------------------------------------------------------------------
 
+def _session_credential_attempts(session) -> list[dict]:
+    """Flatten a session's credential attempts into credential-store rows.
+
+    The pair the honeypot accepted (``session.successful_credential``) is
+    marked ``success=True``. service/port come from the session's protocol
+    + dst_port; geo from the first event. These rows go to the credential
+    store (bulk), NOT to OpenCTI — only a per-IP summary Note does.
+    """
+    first = session.events[0] if session.events else None
+    service = (
+        (sorted(session.protocols)[0] if session.protocols else None)
+        or (first.protocol if first else None)
+        or session.event_type.lower()
+    )
+    port = (
+        (sorted(session.dst_ports)[0] if session.dst_ports else None)
+        or (first.dst_port if first else None)
+        or 0
+    )
+    succ = session.successful_credential
+    rows: list[dict] = []
+    for pair in session.credentials_tried:
+        u, p = pair
+        rows.append({
+            "username": u, "password": p,
+            "attacker_ip": session.src_ip,
+            "honeypot_name": session.sensor_hostname,
+            "honeypot_type": session.event_type,
+            "service": str(service), "port": int(port) if port else 0,
+            "when": session.last_seen,
+            "success": succ is not None and tuple(pair) == tuple(succ),
+            "country": getattr(first, "src_country_code", None) if first else None,
+            "asn": getattr(first, "src_asn", None) if first else None,
+            "org": getattr(first, "src_as_org", None) if first else None,
+        })
+    return rows
+
+
 def run_cycle(
     cfg: Config,
     state: CycleState,
@@ -257,6 +329,7 @@ def run_cycle(
     *,
     now: Optional[datetime] = None,
     benign_filter: Optional[BenignScannerFilter] = None,
+    credential_store=None,  # Optional[CredentialStore]
 ) -> dict:
     """Run ONE importer cycle and return a summary dict.
 
@@ -303,7 +376,6 @@ def run_cycle(
     events_dropped = 0
     events_self_filtered = 0  # src_ip matched our own honeypot's IP set
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
-    sensors_seen: set[str] = set()
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
 
@@ -347,8 +419,6 @@ def run_cycle(
                     continue
             events_parsed += 1
             parsed_by_type[event.event_type].append(event)
-            if event.sensor_hostname:
-                sensors_seen.add(event.sensor_hostname)
     except Exception as e:
         # ES query failed — record cycle failure and bail (the main loop
         # will sleep and retry the next interval per V1_SPEC §7).
@@ -376,6 +446,11 @@ def run_cycle(
     # to a profile-emitting parser. Drives emit_live_profile_notes() at
     # the end of the cycle (see tpot2cti/attacker_profile.py).
     profile_active_ips: set[str] = set()
+    # Per-cycle credential capture — bulk pairs go to the credential store
+    # (NOT OpenCTI); one Note per attacker IP summarises them. See
+    # tpot2cti/credential_store.py + docs/credential-store.md.
+    cred_attempts: list[dict] = []
+    cred_ips: set[str] = set()
 
     # Foundation objects — emitted once per bundle.  Per V1_SPEC §4
     # the operator Identity + TLP marking are always-present.
@@ -416,6 +491,15 @@ def run_cycle(
                     f"cycle {cycle_id}: attacker_profile.update_activity_from_session "
                     f"raised (ignored): {e}"
                 )
+            # Credential capture — accumulate for the store + per-IP Note.
+            # Done before the STIX build so a build-time error doesn't cost
+            # us the credential record.
+            if credential_store is not None and session.credentials_tried and session.src_ip:
+                try:
+                    cred_attempts.extend(_session_credential_attempts(session))
+                    cred_ips.add(session.src_ip)
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.debug(f"cycle {cycle_id}: credential capture raised (ignored): {e}")
             try:
                 # Per the V0 parser-vs-builder separation rule: parsers are pure data; STIX-shape
                 # decisions live on the builder. We dispatch by the
@@ -450,30 +534,36 @@ def run_cycle(
                 )
                 logger.debug(traceback.format_exc())
 
-    # Remember which sensors we've seen, so the catch-up scan has a
-    # list to iterate over even before any cycle has succeeded.
-    if sensors_seen:
-        daily_creds.remember_sensors(state, sensors_seen)
-
-    # ── Step 5: daily creds Notes ─────────────────────────────────────
-    creds_pairs: list[tuple] = []
-    try:
-        creds_result = daily_creds.maybe_emit_pending(
-            state, es, builder, cfg,
-            index_pattern=cfg.es.index_pattern,
-        )
-        if creds_result.stix_objects:
-            all_objects.extend(creds_result.stix_objects)
-            creds_pairs = creds_result.pairs
-            logger.info(
-                f"cycle {cycle_id}: daily_creds added "
-                f"{len(creds_result.stix_objects)} objects "
-                f"for {len(creds_result.pairs)} (sensor, date) pair(s)"
+    # ── Step 5: credentials → store (bulk) + one Note per attacker IP ──
+    # Bruteforce runs are tens of thousands of pairs; we keep them OUT of
+    # OpenCTI (credential_store) and emit only a per-IP summary Note with
+    # the pairs tried + which was accepted. Replaces the old daily
+    # top-100-per-sensor Note (per the 2026-06-02 user decision). The bulk
+    # detail stays queryable in the local store / can feed exports.
+    if credential_store is not None:
+        try:
+            n_written = credential_store.record_attempts(cred_attempts)
+            n_notes = 0
+            for ip in sorted(cred_ips):
+                try:
+                    rows = credential_store.get_ip_credentials(ip)
+                    note = builder.build_ip_credential_note(ip, rows)
+                    if note:
+                        all_objects.append(note)
+                        n_notes += 1
+                except Exception as e:
+                    logger.warning(
+                        f"cycle {cycle_id}: credential Note for {ip} failed: {e}"
+                    )
+            if n_written or n_notes:
+                logger.info(
+                    f"cycle {cycle_id}: credentials — {n_written} attempt(s) "
+                    f"stored, {n_notes} per-IP Note(s) emitted"
+                )
+        except Exception as e:
+            logger.exception(
+                f"cycle {cycle_id}: credential store/note emission failed: {e}"
             )
-    except Exception as e:
-        logger.exception(
-            f"cycle {cycle_id}: daily_creds.maybe_emit_pending failed: {e}"
-        )
 
     # ── Step 5b: attacker-profile Notes (live + daily + weekly) ───────
     # Replaces the per-session Cowrie Notes formerly emitted by
@@ -535,20 +625,10 @@ def run_cycle(
     # ── Step 7: persist state (only on a successful publish) ──────────
     if publish_ok:
         state.set_last_run(window_end)
-        # Record daily-creds emissions ONLY after a successful publish,
-        # so a failed publish doesn't poison the log (next cycle retries).
-        for sensor, utc_date in creds_pairs:
-            try:
-                state.record_daily_creds_emitted(sensor, utc_date)
-            except Exception as e:  # pragma: no cover — sqlite is reliable
-                logger.warning(
-                    f"cycle {cycle_id}: record_daily_creds_emitted({sensor}, "
-                    f"{utc_date}) failed: {e}"
-                )
     else:
         logger.warning(
             f"cycle {cycle_id}: publish failed; NOT advancing last_run "
-            f"or daily_creds_log (next cycle will retry the same window)"
+            f"(next cycle will retry the same window)"
         )
 
     # ── Step 8: cycle summary ─────────────────────────────────────────
@@ -563,7 +643,6 @@ def run_cycle(
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),
-        "daily_creds_pairs": [(s, d.isoformat()) for s, d in creds_pairs],
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),
@@ -723,6 +802,14 @@ def main() -> int:
 
     # 3) State + ES + OpenCTI + Publisher.
     state = CycleState(db_path=cfg.runtime.state_db_path)
+    # Credential store — bulk bruteforce pairs live here (SQLite), NOT in
+    # OpenCTI; the cycle emits only a per-IP summary Note. Best-effort: a
+    # store failure must not stop ingestion.
+    credential_store = None
+    try:
+        credential_store = CredentialStore(db_path=cfg.runtime.credential_db_path)
+    except Exception as e:
+        logger.warning(f"credential store unavailable (continuing without it): {e}")
     es = TpotESClient(
         host=cfg.es.host,
         port=cfg.es.port,
@@ -786,7 +873,8 @@ def main() -> int:
             cycle_started = time.monotonic()
             try:
                 run_cycle(cfg, state, es, builder_factory, publisher,
-                          benign_filter=benign_filter)
+                          benign_filter=benign_filter,
+                          credential_store=credential_store)
             except Exception as e:
                 # Cycle failed (ES error, publisher crashed, etc.).  Per
                 # V1_SPEC §7: log, record, sleep, continue.  Don't crash
@@ -836,6 +924,11 @@ def main() -> int:
             es.close()
         except Exception as e:
             logger.debug(f"es.close() raised (ignored): {e}")
+        if credential_store is not None:
+            try:
+                credential_store.close()
+            except Exception as e:
+                logger.debug(f"credential_store.close() raised (ignored): {e}")
 
     return exit_code
 
