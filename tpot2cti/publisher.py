@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -300,6 +301,15 @@ class Publisher:
         if unknown:
             log_unknown_types(unknown)
 
+        # --- Step 2b: referential-integrity pre-flight -------------------
+        # Drop relationships/sightings (and prune Note.object_refs) whose
+        # endpoints are neither in this bundle nor currently in OpenCTI —
+        # the recurring MISSING_REFERENCE_ERROR root cause (cross-cycle refs
+        # to objects that decayed / were pruned / never imported). Converts
+        # an opaque OpenCTI import error + silent edge loss into a clean,
+        # logged, intentional drop.
+        deduped, n_stripped = self._strip_unresolvable_references(deduped, cycle_id)
+
         # --- Step 3: partition into three passes -------------------------
         passes = self._partition(deduped, cycle_id)
         pass_counts = {name: len(objs) for name, objs in passes.items()}
@@ -485,6 +495,100 @@ class Publisher:
         # Append any passthrough (id-less) objects at the end so they
         # don't shuffle ahead of the well-formed ones.
         return out + passthrough
+
+    @staticmethod
+    def _endpoint_refs(obj: dict) -> list[str]:
+        """STIX ids this object points AT as a relationship/sighting endpoint.
+
+        (``Note.object_refs`` is handled separately — those are pruned in
+        place rather than dropping the whole Note.)
+        """
+        t = obj.get("type")
+        if t == "relationship":
+            return [r for r in (obj.get("source_ref"), obj.get("target_ref")) if r]
+        if t == "sighting":
+            rs = [obj.get("sighting_of_ref")]
+            rs += obj.get("where_sighted_refs") or []
+            rs += obj.get("observed_data_refs") or []
+            return [r for r in rs if r]
+        return []
+
+    def _strip_unresolvable_references(
+        self, objects: list[dict], cycle_id: str,
+    ) -> tuple[list[dict], int]:
+        """Drop objects whose endpoints OpenCTI can't resolve.
+
+        Every relationship/sighting endpoint and every ``Note.object_refs``
+        target must resolve at import time or OpenCTI raises
+        MISSING_REFERENCE_ERROR. Endpoints that are in THIS bundle are fine
+        (created in an earlier pass). For endpoints NOT in the bundle —
+        cross-cycle references (campaign attribution edges, attacker-profile
+        Notes, etc.) — we verify they actually still exist in OpenCTI via
+        ``client.exists_bulk`` and drop the ones that don't.
+
+        Returns ``(kept_objects, n_dropped)``. No-op (and zero cost) when the
+        bundle has no out-of-bundle references or the client predates
+        ``exists_bulk`` (test stubs).
+        """
+        if not objects:
+            return objects, 0
+        present = {o.get("id") for o in objects if o.get("id")}
+
+        out_of_bundle: set[str] = set()
+        for o in objects:
+            for r in self._endpoint_refs(o):
+                if r not in present:
+                    out_of_bundle.add(r)
+            for r in (o.get("object_refs") or []):
+                if r not in present:
+                    out_of_bundle.add(r)
+        if not out_of_bundle:
+            return objects, 0
+
+        exists_bulk = getattr(self.client, "exists_bulk", None)
+        if not callable(exists_bulk):
+            return objects, 0  # stub client (tests) — skip the check
+        try:
+            existing = exists_bulk(out_of_bundle)
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                f"[{cycle_id}] exists_bulk raised (ignored, keeping all refs): {exc}"
+            )
+            return objects, 0
+        missing = {r for r in out_of_bundle if r not in existing}
+        if not missing:
+            return objects, 0
+
+        kept: list[dict] = []
+        dropped = 0
+        detail: dict[str, int] = defaultdict(int)
+        for o in objects:
+            bad = [r for r in self._endpoint_refs(o) if r in missing]
+            if bad:
+                dropped += 1
+                detail[f"{o.get('type')}[{o.get('relationship_type', '-')}]→"
+                       f"{bad[0].split('--')[0]}"] += 1
+                continue
+            # Prune dangling object_refs from a Note; drop it only if that
+            # empties the list (an object-less Note can't import).
+            orefs = o.get("object_refs")
+            if orefs:
+                good = [r for r in orefs if r not in missing]
+                if not good:
+                    dropped += 1
+                    detail["note[object_refs-emptied]"] += 1
+                    continue
+                if len(good) != len(orefs):
+                    o["object_refs"] = good
+            kept.append(o)
+
+        logger.warning(
+            f"[{cycle_id}] referential-integrity pre-flight: dropped {dropped} "
+            f"object(s) referencing {len(missing)} endpoint(s) absent from "
+            f"OpenCTI (would MISSING_REFERENCE). Breakdown: {dict(detail)}. "
+            f"Sample missing: {sorted(missing)[:3]}"
+        )
+        return kept, dropped
 
     def _partition(
         self, objects: list[dict], cycle_id: str,
