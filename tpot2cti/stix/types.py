@@ -38,6 +38,7 @@ KNOWN_STIX_TYPES: frozenset[str] = frozenset({
     "indicator",
     "note",
     "vulnerability",      # CVE refs from Suricata + parsers that extract
+    "campaign",           # shared-IoC attacker grouping (tpot2cti/campaigns.py)
 
     # ─── Relationships (per V1_SPEC §4) ───────────────────────────────
     "relationship",
