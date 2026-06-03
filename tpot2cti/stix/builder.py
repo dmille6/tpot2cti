@@ -13,6 +13,7 @@ from typing import Optional
 
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
+from tpot2cti import attack_mapping
 from tpot2cti import port_intel
 from tpot2cti.stix.rendering import (
     render_cowrie_session_note_body,
@@ -94,35 +95,10 @@ _DOMAIN_RE = re.compile(
 # Anything outside this set is logged at DEBUG and skipped rather than
 # emitted as a noisy / unverified AttackPattern in build_suricata_alert.
 # Extend as we observe new ids in the wild.
-_KNOWN_MITRE_TECHNIQUES: dict[str, str] = {
-    "T1021": "Remote Services",
-    "T1021.001": "Remote Desktop Protocol",
-    "T1021.002": "SMB/Windows Admin Shares",
-    "T1021.004": "SSH",
-    "T1046": "Network Service Discovery",
-    "T1059": "Command and Scripting Interpreter",
-    "T1059.004": "Unix Shell",
-    "T1068": "Exploitation for Privilege Escalation",
-    "T1071": "Application Layer Protocol",
-    "T1071.001": "Web Protocols",
-    "T1078": "Valid Accounts",
-    "T1090": "Proxy",
-    "T1095": "Non-Application Layer Protocol",
-    "T1110": "Brute Force",
-    "T1110.001": "Password Guessing",
-    "T1110.003": "Password Spraying",
-    "T1133": "External Remote Services",
-    "T1190": "Exploit Public-Facing Application",
-    "T1203": "Exploitation for Client Execution",
-    "T1210": "Exploitation of Remote Services",
-    "T1505": "Server Software Component",
-    "T1505.003": "Web Shell",
-    "T1566": "Phishing",
-    "T1572": "Protocol Tunneling",
-    "T1595": "Active Scanning",
-    "T1595.001": "Scanning IP Blocks",
-    "T1595.002": "Vulnerability Scanning",
-}
+# Single source of truth lives in tpot2cti.attack_mapping.TECHNIQUES (shared
+# with the behaviour-driven session mapper). Aliased here for the Suricata
+# rule-id → name lookup below.
+_KNOWN_MITRE_TECHNIQUES: dict[str, str] = attack_mapping.TECHNIQUES
 
 
 # ---------------------------------------------------------------------------
@@ -537,10 +513,15 @@ class STIXBuilder:
             "name": name,
         }
         if mitre_id:
+            # x_mitre_id is OpenCTI's merge key for attack-patterns: setting it
+            # makes our honeypot-observed pattern resolve INTO the canonical
+            # ATT&CK technique node from the bundled MITRE connector, so the
+            # native Navigator/matrix reflects honeypot activity.
+            obj["x_mitre_id"] = mitre_id
             obj["external_references"] = [{
                 "source_name": "mitre-attack",
                 "external_id": mitre_id,
-                "url": f"https://attack.mitre.org/techniques/{mitre_id}/",
+                "url": f"https://attack.mitre.org/techniques/{mitre_id.replace('.', '/')}/",
             }]
         if session is not None:
             mitre_str = f" (MITRE {mitre_id})" if mitre_id else ""
@@ -555,6 +536,44 @@ class STIXBuilder:
                 parser_labels_for(session.event_type) + ["attack-pattern"]
             ))
         return self._dedup(self._stamp(obj, add_confidence=False)) or obj
+
+    def build_session_attack_patterns(self, session: AttackSession) -> list[dict]:
+        """Behaviour-driven ATT&CK techniques for any session.
+
+        Maps the session's normalised substance signals (creds, auth,
+        commands, malware, planted keys, port sweeps) to ATT&CK techniques
+        via :func:`tpot2cti.attack_mapping.techniques_for_session`, emits one
+        AttackPattern per technique (x_mitre_id → merges with the canonical
+        MITRE node) and an ``indicator --indicates--> attack-pattern`` edge
+        anchored on the attacker's IP indicator.
+
+        Called centrally by the orchestrator for EVERY session, so all 32
+        parsers contribute to the matrix — not just Suricata/web. Overlaps
+        with a builder's own AttackPatterns (e.g. web T1190) collapse via
+        deterministic ids. Returns ``[]`` when no behaviour evidences a
+        technique (the common bare-probe case).
+        """
+        if not session.src_ip:
+            return []
+        techniques = attack_mapping.techniques_for_session(session)
+        if not techniques:
+            return []
+        out: list[dict] = []
+        ip_ind_id = generate_ip_indicator_id(session.src_ip)
+        for mitre_id, name in techniques:
+            ap = self.build_attack_pattern(name, mitre_id=mitre_id, session=session)
+            if not ap:
+                continue
+            out.append(ap)
+            if rel := self.build_relationship(
+                ip_ind_id, "indicates", ap["id"],
+                description=(
+                    f"{session.event_type} behaviour on sensor "
+                    f"{session.sensor_hostname!r} maps to {name} ({mitre_id})"
+                ),
+            ):
+                out.append(rel)
+        return out
 
     # ──────────────────────────────────────────────────────────────────
     # SCOs (observables)

@@ -533,6 +533,10 @@ def run_cycle(
                 else:
                     objs = builder.build_driveby_session(session)
                 all_objects.extend(objs)
+                # Behaviour-driven ATT&CK techniques — applies uniformly to
+                # EVERY parser from the normalised session signals (not just
+                # Suricata/web). See tpot2cti/attack_mapping.py.
+                all_objects.extend(builder.build_session_attack_patterns(session))
             except Exception as e:
                 # Per V1_SPEC §7: caught + logged; cycle continues.
                 logger.warning(
