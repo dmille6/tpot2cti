@@ -165,6 +165,50 @@ class OpenCTIClient:
             "raw_response": raw,
         }
 
+    def exists_bulk(self, stix_ids) -> set:
+        """Return the subset of ``stix_ids`` that currently exist in OpenCTI.
+
+        Used by the publisher's referential-integrity pre-flight to drop
+        relationships whose endpoints OpenCTI doesn't actually have — decayed
+        (indicator TTL/revocation), pruned, or never successfully created —
+        which is the recurring ``MISSING_REFERENCE_ERROR: Element(s) not
+        found`` on bundle import.
+
+        Best-effort and **fail-open**: on any error (or a chunk failure) we
+        return the full input set ("assume exists") so a transient query
+        problem never causes us to drop a legitimate relationship.
+        """
+        ids = [i for i in dict.fromkeys(stix_ids) if i]  # de-dup, drop falsy
+        if not ids:
+            return set()
+        query = (
+            "query Exists($ids:[Any!]!){ stixCoreObjects(first:500, "
+            "filters:{mode:and, filters:[{key:\"standard_id\", values:$ids, "
+            "operator:eq, mode:or}], filterGroups:[]}){ "
+            "edges{ node{ standard_id } } } }"
+        )
+        found: set = set()
+        try:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                resp = self._api.query(query, {"ids": chunk})
+                edges = (
+                    (((resp or {}).get("data") or {})
+                     .get("stixCoreObjects") or {})
+                    .get("edges") or []
+                )
+                for e in edges:
+                    sid = ((e or {}).get("node") or {}).get("standard_id")
+                    if sid:
+                        found.add(sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"exists_bulk failed ({type(exc).__name__}: {exc}); assuming "
+                f"all {len(ids)} referenced object(s) exist (fail-open)."
+            )
+            return set(ids)
+        return found
+
     def health_check(self) -> bool:
         """Cheap GraphQL ping used by the Phase 6 /health endpoint.
 
