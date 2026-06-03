@@ -31,6 +31,7 @@ from tpot2cti.stix.external_refs import (
 from tpot2cti.stix_ids import (
     generate_attack_pattern_id,
     generate_autonomous_system_id,
+    generate_campaign_id,
     generate_city_location_id,
     generate_country_location_id,
     generate_credential_note_id,
@@ -1130,6 +1131,42 @@ class STIXBuilder:
         }
         if description:
             obj["description"] = description
+        return self._dedup(self._stamp(obj))
+
+    def build_campaign(
+        self,
+        *,
+        artifact_key: str,
+        name: str,
+        description: Optional[str] = None,
+        objective: Optional[str] = None,
+        first_seen: Optional[str] = None,
+        last_seen: Optional[str] = None,
+        labels: Optional[list[str]] = None,
+    ) -> dict:
+        """STIX 2.1 Campaign SDO for a shared-IoC attacker grouping.
+
+        Keyed deterministically off ``artifact_key`` (e.g.
+        ``"malware:<sha256>"``) so every cycle that observes another IP
+        sharing the artifact attributes to the SAME node — OpenCTI then
+        accumulates the whole coordinated set under one Campaign. See
+        tpot2cti/campaigns.py for membership logic.
+        """
+        obj = {
+            "type": "campaign",
+            "id": generate_campaign_id(artifact_key),
+            "name": name,
+        }
+        if description:
+            obj["description"] = description
+        if objective:
+            obj["objective"] = objective
+        if first_seen:
+            obj["first_seen"] = first_seen
+        if last_seen:
+            obj["last_seen"] = last_seen
+        if labels:
+            obj["labels"] = sorted(set(labels))
         return self._dedup(self._stamp(obj))
 
     # ──────────────────────────────────────────────────────────────────
