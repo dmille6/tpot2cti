@@ -85,6 +85,7 @@ ENTITY_TYPES: frozenset[str] = frozenset({
     "indicator",
     "note",
     "vulnerability",
+    "campaign",
 })
 
 #: Relationships and sightings — must go last (V1_SPEC §3 line 290).

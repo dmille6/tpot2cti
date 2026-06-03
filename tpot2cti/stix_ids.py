@@ -231,6 +231,18 @@ def generate_ip_indicator_id(ip: str) -> str:
     return sdo_id("indicator", "indicator", "ip", ip)
 
 
+def generate_campaign_id(artifact_key: str) -> str:
+    """Campaign SDO id. Seed: ``campaign:<artifact_key>``.
+
+    ``artifact_key`` is the shared concrete IoC that defines the campaign,
+    e.g. ``"malware:<sha256>"``, ``"sshkey:<fingerprint>"``,
+    ``"hassh:<hash>"``, ``"ja3:<hash>"`` (see ``tpot2cti/campaigns.py``).
+    Deterministic so every cycle that observes another IP sharing the same
+    artifact attributes it to the SAME Campaign node in OpenCTI.
+    """
+    return sdo_id("campaign", "campaign", artifact_key)
+
+
 def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") -> str:
     """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>[:<discriminator>]``.
 

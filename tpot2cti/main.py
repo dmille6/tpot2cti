@@ -49,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from tpot2cti import attacker_profile
+from tpot2cti import campaigns
 from tpot2cti.config import Config, ConfigError, load_config
 from tpot2cti.credential_store import CredentialStore
 from tpot2cti.es_client import TpotESClient
@@ -452,6 +453,9 @@ def run_cycle(
     # tpot2cti/credential_store.py + docs/credential-store.md.
     cred_attempts: list[dict] = []
     cred_ips: set[str] = set()
+    # Per-cycle set of shared-IoC artifact keys observed; re-checked for
+    # >=2-IP campaign thresholds after the build loop (see tpot2cti/campaigns.py).
+    campaign_keys: set[str] = set()
 
     # Foundation objects — emitted once per bundle.  Per V1_SPEC §4
     # the operator Identity + TLP marking are always-present.
@@ -492,6 +496,10 @@ def run_cycle(
                     f"cycle {cycle_id}: attacker_profile.update_activity_from_session "
                     f"raised (ignored): {e}"
                 )
+            # Shared-IoC campaign ledger — record this session's concrete
+            # artifacts (malware/ssh-key/hassh/ja3) for cross-cycle >=2-IP
+            # grouping. record_session_artifacts is itself defensive.
+            campaign_keys.update(campaigns.record_session_artifacts(state, session))
             # Credential capture — accumulate for the store + per-IP Note.
             # Done before the STIX build so a build-time error doesn't cost
             # us the credential record.
@@ -565,6 +573,24 @@ def run_cycle(
             logger.exception(
                 f"cycle {cycle_id}: credential store/note emission failed: {e}"
             )
+
+    # ── Step 5a: shared-IoC Campaigns ─────────────────────────────────
+    # Materialise a Campaign for any concrete artifact (malware / planted
+    # SSH key / HASSH / JA3) now shared by >=2 distinct attacker IPs — the
+    # "same actor/toolkit" signal. See tpot2cti/campaigns.py.
+    try:
+        campaign_objs = campaigns.emit_campaigns(state, builder, list(campaign_keys))
+        if campaign_objs:
+            all_objects.extend(campaign_objs)
+            logger.info(
+                f"cycle {cycle_id}: campaigns emit added "
+                f"{len(campaign_objs)} object(s) "
+                f"(from {len(campaign_keys)} candidate artifact(s))"
+            )
+    except Exception as e:
+        logger.exception(
+            f"cycle {cycle_id}: campaigns.emit_campaigns failed: {e}"
+        )
 
     # ── Step 5b: attacker-profile Notes (live + daily + weekly) ───────
     # Replaces the per-session Cowrie Notes formerly emitted by
