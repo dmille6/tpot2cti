@@ -142,6 +142,31 @@ CREATE TABLE IF NOT EXISTS attacker_profile_emit_log (
 
 CREATE INDEX IF NOT EXISTS idx_attacker_profile_emit_log_emitted_at
     ON attacker_profile_emit_log(emitted_at);
+
+-- Cross-cycle ledger of which attacker IPs have presented which concrete
+-- IoC (shared malware hash, planted SSH key, HASSH / JA3 client fingerprint).
+-- A Campaign only materialises once an artifact_key is shared by >= 2 distinct
+-- IPs (see tpot2cti/campaigns.py) — the "same actor/toolkit" signal. The
+-- second IP arrives in a LATER cycle than the first, so this state is what
+-- lets the importer detect the sharing at all. `emitted` flips to 1 once an
+-- IP's indicates-edge has been published, so popular artifacts don't re-emit
+-- every member edge every cycle.
+CREATE TABLE IF NOT EXISTS campaign_artifacts (
+    artifact_key   TEXT NOT NULL,                -- "malware:<sha256>", "hassh:<h>", ...
+    src_ip         TEXT NOT NULL,
+    artifact_type  TEXT NOT NULL,                -- "malware" / "ssh-key" / "hassh" / "ja3"
+    artifact_value TEXT NOT NULL,                -- the raw sha256 / fingerprint / hash
+    display        TEXT NOT NULL,                -- short human label
+    first_seen     TEXT NOT NULL,
+    last_seen      TEXT NOT NULL,
+    emitted        INTEGER NOT NULL DEFAULT 0,   -- 1 once this IP's edge is published
+    PRIMARY KEY (artifact_key, src_ip)
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_key
+    ON campaign_artifacts(artifact_key);
+CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
+    ON campaign_artifacts(last_seen);
 """
 
 
@@ -385,6 +410,22 @@ class CycleState:
             )
             return cur.rowcount
 
+    def prune_campaign_artifacts(self, cutoff_days: int = 180) -> int:
+        """Drop campaign_artifacts rows whose last_seen is older than cutoff.
+
+        Cutoff is generous (180d) — a shared-IoC campaign can resurface after
+        a long dormancy, and the row is what lets us re-attribute a returning
+        IP. Idempotent Campaign UUID5 means a re-emit after prune simply
+        re-establishes the node.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=cutoff_days)).isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM campaign_artifacts WHERE last_seen < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
     def prune_object_max_state(self, cutoff_days: int = 180) -> int:
         """Drop object_max_state rows not updated in cutoff days (default 180d).
 
@@ -454,6 +495,7 @@ class CycleState:
             "attacker_activity": self.prune_attacker_activity(cutoff_days=activity_cutoff_days),
             "profile_emit_log": self.prune_attacker_profile_emit_log(cutoff_days=profile_log_cutoff_days),
             "object_max_state": self.prune_object_max_state(cutoff_days=max_state_cutoff_days),
+            "campaign_artifacts": self.prune_campaign_artifacts(cutoff_days=max_state_cutoff_days),
         }
 
     # ----------------------------------------------------------------------
@@ -870,6 +912,64 @@ class CycleState:
                 (since_iso,),
             ).fetchall()
         return [r[0] for r in rows]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Campaign artifacts (shared-IoC grouping — see tpot2cti/campaigns.py)
+    # ──────────────────────────────────────────────────────────────────
+
+    def record_campaign_artifact(
+        self,
+        *,
+        artifact_key: str,
+        src_ip: str,
+        artifact_type: str,
+        artifact_value: str,
+        display: str,
+        seen_iso: str,
+    ) -> None:
+        """Upsert one (artifact_key, src_ip) observation.
+
+        first_seen is preserved on conflict; last_seen advances; ``emitted``
+        is left untouched so an already-published member stays published.
+        """
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO campaign_artifacts ("
+                "  artifact_key, src_ip, artifact_type, artifact_value, "
+                "  display, first_seen, last_seen, emitted"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(artifact_key, src_ip) DO UPDATE SET "
+                "  last_seen = excluded.last_seen, "
+                "  display   = excluded.display",
+                (
+                    artifact_key, src_ip, artifact_type, artifact_value,
+                    display, seen_iso, seen_iso,
+                ),
+            )
+
+    def get_campaign_artifact_rows(self, artifact_key: str) -> list[dict]:
+        """Return all member rows for one artifact_key (dicts), IP-sorted."""
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            rows = c.execute(
+                "SELECT * FROM campaign_artifacts WHERE artifact_key = ? "
+                "ORDER BY first_seen, src_ip",
+                (artifact_key,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_campaign_members_emitted(
+        self, artifact_key: str, src_ips: list[str]
+    ) -> None:
+        """Flip ``emitted=1`` for the given (artifact_key, src_ip) rows."""
+        if not src_ips:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "UPDATE campaign_artifacts SET emitted = 1 "
+                "WHERE artifact_key = ? AND src_ip = ?",
+                [(artifact_key, ip) for ip in src_ips],
+            )
 
     def record_attacker_profile_emitted(
         self, src_ip: str, cadence: str, last_seen_seen: str
