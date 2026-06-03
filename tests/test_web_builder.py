@@ -78,6 +78,47 @@ def test_web_url_cap(builder):
     assert _kinds(objs).get("url") == 25   # _MAX_WEB_URLS
 
 
+def test_build_domain_validation(builder):
+    # Valid domains pass through.
+    assert builder.build_domain("evil.example.com") is not None
+    assert builder.build_domain("a.b.co.uk") is not None
+    assert builder.build_domain("xn--80ak6aa92e.com") is not None  # punycode
+    # Malformed values OpenCTI would bounce ("not correctly formatted").
+    for bad in ("10.0.0.1", "evil.com:443", "nodot", "has space.com",
+                "http://x.com/p", "", "x..y.com", "2001:db8::1"):
+        assert builder.build_domain(bad) is None, bad
+
+
+def _suricata_sni_session(sni, ip="203.0.113.9", dst="198.51.100.7"):
+    ev = ParsedEvent(
+        src_ip=ip, timestamp=datetime.now(timezone.utc), sensor_hostname="s1",
+        event_type="Suricata", dst_port=443, dst_ip=dst,
+    )
+    ev.meta = {"tls_sni": sni}
+    return AttackSession.from_event(ev)
+
+
+def test_suricata_sni_resolves_to_is_self_contained(builder):
+    """A resolves-to edge must point at an ipv4-addr that is IN the bundle
+    (regression for the dangling MISSING_REFERENCE on resolves-to→ipv4)."""
+    objs = builder.build_suricata_alert(_suricata_sni_session("evil.example.com"))
+    ids = {o["id"] for o in objs}
+    dom = next(o for o in objs if o["type"] == "domain-name")
+    rel = next(o for o in objs if o.get("relationship_type") == "resolves-to")
+    assert rel["source_ref"] == dom["id"]
+    # target endpoint is present in this bundle (not a dangling reference)
+    assert rel["target_ref"] in ids
+    assert any(o["type"] == "ipv4-addr" and o["id"] == rel["target_ref"] for o in objs)
+
+
+def test_suricata_malformed_sni_emits_no_domain_or_edge(builder):
+    """A junk SNI (IP literal) must not produce a malformed domain-name SCO
+    nor a resolves-to edge (regression for FUNCTIONAL_ERROR)."""
+    objs = builder.build_suricata_alert(_suricata_sni_session("10.0.0.5"))
+    assert not any(o["type"] == "domain-name" for o in objs)
+    assert not any(o.get("relationship_type") == "resolves-to" for o in objs)
+
+
 def test_all_web_types_dispatch_to_a_builder():
     from tpot2cti.main import _PARSER_DISPATCH
     from tpot2cti.stix import builder as B
