@@ -76,6 +76,16 @@ MAX_COMMANDS_PER_PROCESS = 50
 # but reject obviously malformed strings before building observables).
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
+#: Conservative domain-name validator. Requires >=2 dot-separated labels and
+#: an alphabetic TLD, which rejects the malformations OpenCTI bounces with
+#: "Observable is not correctly formatted": IP literals (numeric TLD), values
+#: with a port (':'), path ('/'), or whitespace, and bare single labels. Used
+#: by build_domain so a junk TLS-SNI / HTTP-Host never reaches OpenCTI as a
+#: malformed domain-name SCO (which would also dangle any resolves-to edge).
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+
 
 # ---------------------------------------------------------------------------
 # Suricata MITRE technique allowlist
@@ -667,7 +677,13 @@ class STIXBuilder:
     ) -> Optional[dict]:
         if not fqdn:
             return None
-        fqdn_lc = fqdn.lower()
+        fqdn_lc = fqdn.strip().lower().rstrip(".")
+        # Reject malformed values (IP literals, ports, paths, bare labels)
+        # before OpenCTI bounces them as "Observable is not correctly
+        # formatted" — which also dangles any resolves-to edge to them.
+        if not fqdn_lc or _IPV4_RE.match(fqdn_lc) or not _DOMAIN_RE.match(fqdn_lc):
+            logger.debug(f"build_domain: skipping malformed domain {fqdn!r}")
+            return None
         obj = {
             "type": "domain-name",
             "id": generate_domain_id(fqdn),
@@ -1613,14 +1629,20 @@ class STIXBuilder:
                 # since the SNI/host refers to the destination the
                 # attacker is trying to reach; if no dst_ip, fall back to
                 # the alert's src_ip per V1_SPEC §5.2 phrasing).
+                # Build the target observable via build_ipv4 so it is (a)
+                # validated (malformed/IPv6 dst_ip → skipped, not a bad SCO)
+                # and (b) present IN this bundle — otherwise the resolves-to
+                # edge dangles into MISSING_REFERENCE.
                 target_ip = event.dst_ip or session.src_ip
                 if target_ip:
-                    target_ipv4_id = generate_ipv4_id(target_ip)
-                    if rel := self.build_relationship(
-                        d["id"], "resolves-to", target_ipv4_id,
-                        description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
-                    ):
-                        out.append(rel)
+                    target_ipv4 = self.build_ipv4(target_ip, session=session)
+                    if target_ipv4:
+                        out.append(target_ipv4)
+                        if rel := self.build_relationship(
+                            d["id"], "resolves-to", target_ipv4["id"],
+                            description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
+                        ):
+                            out.append(rel)
 
         # ── URL observable (if HTTP request URL captured) ─────────────
         if (url := meta.get("http_url")) and (host := meta.get("http_host")):
