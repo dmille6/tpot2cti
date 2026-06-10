@@ -46,6 +46,7 @@ from tpot2cti.stix_ids import (
     generate_ipv4_id,
     generate_marking_definition_id,
     generate_process_id,
+    sdo_id,
     generate_relationship_id,
     generate_sensor_id,
     generate_session_note_id,
@@ -72,6 +73,9 @@ _MAX_WEB_URLS = 25
 
 # Process command_line cap (matches PoC convention)
 MAX_COMMANDS_PER_PROCESS = 50
+
+# Ephemeral temp-file paths in scp malware-drop probes; normalized to dedupe noise.
+_TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}")
 
 # Simple IPv4 / IPv6 sanity regexes (we accept what logstash gave us,
 # but reject obviously malformed strings before building observables).
@@ -262,6 +266,102 @@ def _signal_score(session: Optional[AttackSession]) -> int:
         score += min(15, len(session.credentials_tried) * 5)
     # Cap to [10, 100].
     return max(10, min(100, score))
+
+
+def _ip_score(session: Optional["AttackSession"]) -> int:
+    """Observable score for an attacker IP: the substance-signal score
+    (_signal_score) plus a threat-intel reputation boost and a broad-scan
+    boost. Any honeypot interaction is inherently malicious, so even a bare
+    probe sits at the baseline; known-bad + hands-on activity approaches 100."""
+    if session is None:
+        return BASELINE_INDICATOR_SCORE
+    score = _signal_score(session)
+    rep = ""
+    if session.events:
+        rep = str(session.events[0].raw_doc.get("ip_rep") or "").lower()
+    if "known attacker" in rep:
+        score += 25
+    elif any(k in rep for k in ("mass scanner", "scanner", "bot", "crawler", "tor", "bad reputation")):
+        score += 12
+    if len(session.dst_ports) >= 5:
+        score += 5
+    return max(10, min(100, score))
+
+
+def _humanize_span(delta) -> str:
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    return f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
+
+
+def _describe_ip(ip: str, session: "AttackSession") -> str:
+    """Analyst-facing narrative: who/where, reputation, what was hit, how
+    much, observed behavior, concrete samples, and the activity window."""
+    ev0 = session.events[0] if session.events else None
+    geo_bits = []
+    if ev0 is not None:
+        loc = ev0.src_country_name or ev0.src_country_code
+        if loc:
+            geo_bits.append(loc)
+        if ev0.src_as_org:
+            geo_bits.append(ev0.src_as_org + (f" (AS{ev0.src_asn})" if ev0.src_asn else ""))
+        elif ev0.src_asn:
+            geo_bits.append(f"AS{ev0.src_asn}")
+    geo = f" from {', '.join(geo_bits)}" if geo_bits else ""
+    rep = ""
+    if ev0 is not None and ev0.raw_doc.get("ip_rep"):
+        rep = str(ev0.raw_doc.get("ip_rep")).strip()
+    svc = "/".join(sorted(session.protocols)) if session.protocols else ""
+    ports = sorted(session.dst_ports)
+    port_str = ""
+    if ports:
+        shown = ", ".join(str(p) for p in ports[:8])
+        port_str = f" targeting port(s) {shown}" + ("…" if len(ports) > 8 else "")
+
+    d = f"Attacker {ip}{geo} engaged T-Pot sensor '{session.sensor_hostname}'"
+    if rep and rep.lower() not in ("", "-", "unknown"):
+        d += f" (threat-intel reputation: {rep})"
+    d += f". {session.event_count} event(s) against the {session.event_type} honeypot"
+    if svc:
+        d += f" [{svc}]"
+    d += port_str + "."
+
+    beh = []
+    if session.auth_success:
+        beh.append("authenticated into the service")
+    if session.commands:
+        beh.append(f"ran {len(session.commands)} shell command(s)")
+    if session.credentials_tried:
+        beh.append(f"attempted {len(session.credentials_tried)} login(s)")
+    if session.malware_hashes:
+        beh.append(f"staged/dropped {len(session.malware_hashes)} file(s)")
+    if session.urls:
+        beh.append(f"referenced {len(session.urls)} URL(s)")
+    if session.ja3 or session.hassh:
+        beh.append("left a TLS/SSH client fingerprint")
+    if beh:
+        d += " Behavior: " + ", ".join(beh) + "."
+
+    if session.successful_credential:
+        u = session.successful_credential[0]
+        d += f" Successful login as '{u}'."
+    if session.commands:
+        sample = " ; ".join(c.strip() for c in session.commands[:3] if c.strip())
+        if sample:
+            d += f" e.g. {sample[:220]}" + ("…" if len(session.commands) > 3 else "")
+
+    if session.last_seen > session.first_seen:
+        d += (f" Activity window {session.first_seen.isoformat()} → "
+              f"{session.last_seen.isoformat()} ({_humanize_span(session.last_seen - session.first_seen)}).")
+    else:
+        d += f" Seen {session.first_seen.isoformat()}."
+    return d
+
 
 
 #: How long an Indicator stays "valid_from" → "valid_until" before
@@ -606,13 +706,8 @@ class STIXBuilder:
         }
         # OpenCTI extensions — populated when we have session context.
         if session is not None:
-            obj["x_opencti_description"] = (
-                f"IP {ip} observed attacking T-Pot sensor "
-                f"{session.sensor_hostname!r} via {session.event_type} "
-                f"({session.event_count} event(s)). "
-                f"First seen {session.first_seen.isoformat()}; "
-                f"last seen {session.last_seen.isoformat()}."
-            )
+            obj["x_opencti_description"] = _describe_ip(ip, session)
+            obj["x_opencti_score"] = _ip_score(session)
             obj["x_opencti_labels"] = sorted(
                 set(parser_labels_for(session.event_type))
             )
@@ -740,14 +835,29 @@ class STIXBuilder:
             return None
         # Cap commands to MAX_COMMANDS_PER_PROCESS for bundle-size sanity
         capped = commands[:MAX_COMMANDS_PER_PROCESS]
+        # Normalize ephemeral temp-file paths (e.g. automated scp malware-drop
+        # probes: scp -qt "/tmp/<random>") so near-identical sessions do not
+        # each spawn a unique Process observable.
+        capped = [_TMPFILE_RE.sub(r"\1/<tmpfile>", c) for c in capped]
         truncated_marker = (
             f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more"
             if len(commands) > MAX_COMMANDS_PER_PROCESS else ""
         )
         cmd_line = "\n".join(capped) + truncated_marker
+        # Pure scp-to-tempfile noise collapses to one content-addressed Process
+        # (keeps the TTP signal as a single observable with many sightings).
+        _stripped = [c.strip() for c in capped if c.strip()]
+        _is_scp_noise = bool(_stripped) and all(
+            c.startswith("scp ") and "/<tmpfile>" in c for c in _stripped
+        )
+        _proc_id = (
+            sdo_id("process", "process", session.sensor_hostname, cmd_line)
+            if _is_scp_noise
+            else generate_process_id(session.sensor_hostname, session.session_id)
+        )
         obj = {
             "type": "process",
-            "id": generate_process_id(session.sensor_hostname, session.session_id),
+            "id": _proc_id,
             "command_line": cmd_line,
             "x_opencti_description": (
                 f"Command sequence executed by attacker {session.src_ip} "

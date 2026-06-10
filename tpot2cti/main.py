@@ -116,6 +116,25 @@ _PARSER_DISPATCH: dict[str, str] = {
 }
 
 
+def _is_bare_scan(session) -> bool:
+    """True for an interaction-less single-target probe — the mass-scan
+    noise (mostly Honeytrap tcp-catchall) that floods OpenCTI with low-value
+    observables. KEPT (returns False): any interaction (auth, commands,
+    malware, downloads, or a credential attempt), a multi-port sweep
+    (>=3 ports), or a payload-carrying probe. Raw telemetry is untouched
+    in ES/Kibana; this only governs OpenCTI emission."""
+    if (session.auth_success or session.commands or session.malware_hashes
+            or session.downloads or session.credentials_tried):
+        return False
+    if len(session.dst_ports) >= 3:
+        return False
+    ev = session.events[0] if session.events else None
+    pay = session.meta.get("payload_printable") or session.meta.get("payload_hex")
+    if not pay and ev is not None:
+        pay = ev.meta.get("payload_printable") or ev.meta.get("payload_hex")
+    return not bool(pay)
+
+
 from tpot2cti.publisher import Publisher, PublishResult
 from tpot2cti.opencti_client import OpenCTIClient
 
@@ -509,6 +528,18 @@ def run_cycle(
                     cred_ips.add(session.src_ip)
                 except Exception as e:  # pragma: no cover — defensive
                     logger.debug(f"cycle {cycle_id}: credential capture raised (ignored): {e}")
+            # Substance gate: keep mass-scan noise out of OpenCTI. The
+            # catch-all / generic-probe paths (Honeytrap + the fallback
+            # drive-by parsers, which also cover Dionaea/Heralding/RDP/etc.)
+            # emit an observable only when the session shows interaction, a
+            # multi-port sweep, or a payload. The dedicated substance-rich
+            # parsers (Cowrie/Galah/Suricata/Beelzebub) always emit. The raw
+            # scan telemetry is untouched in ES/Kibana.
+            if _PARSER_DISPATCH.get(parser.type_name) in (
+                None, "build_honeytrap_probe", "build_fallback_event",
+                "build_driveby_session",
+            ) and _is_bare_scan(session):
+                continue
             try:
                 # Per the V0 parser-vs-builder separation rule: parsers are pure data; STIX-shape
                 # decisions live on the builder. We dispatch by the
