@@ -70,6 +70,7 @@ TPOT_HOST=""
 TPOT_SSH_USER="tpot"
 TPOT_SSH_PORT="64295"
 OPERATOR_ORG_NAME=""
+OPENCTI_ADMIN_EMAIL="admin@filigran.io"
 TPOT2CTI_DEFAULT_TLP="AMBER"
 ENABLE_CREDENTIALS=0
 ENABLE_VAULT=0
@@ -234,7 +235,7 @@ interactive_prompts() {
 
     if (( DRY_RUN )); then
         dry "Would prompt for TPOT_HOST, TPOT_SSH_USER, TPOT_SSH_PORT,"
-        dry "OPERATOR_ORG_NAME, TPOT2CTI_DEFAULT_TLP, enable credentials?, enable vault?"
+        dry "OPERATOR_ORG_NAME, OPENCTI_ADMIN_EMAIL, TPOT2CTI_DEFAULT_TLP, enable credentials?, enable vault?"
         # Set placeholders so downstream dry-run steps have something to show.
         TPOT_HOST="tpot.example.invalid"
         OPERATOR_ORG_NAME="DRY-RUN Operator"
@@ -262,6 +263,12 @@ interactive_prompts() {
     TPOT_SSH_PORT="$(ask_with_default 'T-Pot SSH port:' '64295')"
 
     OPERATOR_ORG_NAME="$(ask_with_default 'Operator organization name (appears in STIX):' 'T-Pot Operator')"
+
+    OPENCTI_ADMIN_EMAIL="$(ask_with_default 'OpenCTI admin login email:' 'admin@filigran.io')"
+    while [[ ! "$OPENCTI_ADMIN_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; do
+        warn "OpenCTI requires the admin login to be a valid email address (e.g. admin@example.com)."
+        OPENCTI_ADMIN_EMAIL="$(ask_with_default 'OpenCTI admin login email:' 'admin@filigran.io')"
+    done
 
     echo "  Valid TLP choices: WHITE, GREEN, AMBER, AMBER+STRICT, RED" >&2
     TPOT2CTI_DEFAULT_TLP="$(ask_with_default 'Default TLP marking:' 'AMBER')"
@@ -441,6 +448,7 @@ populate_env_files() {
         sed -i -E "s/^${key}=.*/${key}=${esc_value}/" "$file"
     }
 
+    _sed_kv "$opencti_env" "OPENCTI_ADMIN_EMAIL" "$OPENCTI_ADMIN_EMAIL"
     _sed_kv "$opencti_env" "OPENCTI_ADMIN_PASSWORD" "$GEN_OPENCTI_ADMIN_PASSWORD"
     _sed_kv "$opencti_env" "OPENCTI_ADMIN_TOKEN" "$GEN_OPENCTI_ADMIN_TOKEN"
     _sed_kv "$opencti_env" "OPENCTI_HEALTHCHECK_ACCESS_KEY" "$GEN_OPENCTI_HEALTHCHECK_ACCESS_KEY"
