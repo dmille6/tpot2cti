@@ -194,11 +194,21 @@ def emit_live_profile_notes(
     ips_emitted = 0
     ips_skipped_unchanged = 0
     ips_missing_rows = 0
+    ips_skipped_unsubstantive = 0
 
     for ip in sorted(set(active_ips)):
         rows = state.get_attacker_activity(ip)
         if not rows:
             ips_missing_rows += 1
+            continue
+
+        # Substance gate: skip pure drive-by IPs. Their IPv4 observable +
+        # Indicator are dropped by the build_*_probe substance gate, so a
+        # live profile Note (object_refs -> those ids) and its related-to
+        # edge would dangle and be culled by the publisher's referential
+        # pre-flight. Mirrors emit_daily_summary_notes (_ip_is_substantive).
+        if not _ip_is_substantive(rows):
+            ips_skipped_unsubstantive += 1
             continue
 
         current_last_seen = max(r["last_seen"] for r in rows)
@@ -253,10 +263,11 @@ def emit_live_profile_notes(
         )
         ips_emitted += 1
 
-    if ips_emitted or ips_skipped_unchanged or ips_missing_rows:
+    if ips_emitted or ips_skipped_unchanged or ips_missing_rows or ips_skipped_unsubstantive:
         logger.info(
             f"attacker_profile: live emit — {ips_emitted} Note(s) emitted, "
             f"{ips_skipped_unchanged} skipped (no new activity), "
+            f"{ips_skipped_unsubstantive} skipped (pure drive-by), "
             f"{ips_missing_rows} active IPs lacked attacker_activity rows"
         )
     return out
@@ -378,6 +389,13 @@ def emit_weekly_summary_notes(
             f"attacker_profile: weekly emit — no IPs active in window "
             f"[{start}, {end})"
         )
+        return out
+
+    # Substance gate (mirror daily/live): drop pure drive-by IPs whose
+    # IPv4 + Indicator were gated out, so weekly Notes + related-to edges
+    # do not dangle. See _ip_is_substantive.
+    per_ip = {ip: rows for ip, rows in per_ip.items() if _ip_is_substantive(rows)}
+    if not per_ip:
         return out
 
     window_label = f"ISO {iso_year}-W{iso_week:02d}"
