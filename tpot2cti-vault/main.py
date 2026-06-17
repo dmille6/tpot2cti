@@ -34,6 +34,7 @@ from log import setup_logging
 from sftp_client import RemoteFile, TpotSFTP
 from store import VaultStore
 from opencti import publish_stixfile
+from config import load_sensors
 
 logger = logging.getLogger("tpot2cti.vault")
 
@@ -57,6 +58,7 @@ def _process_file(
     sftp,                  # TpotSFTP or stub
     store: VaultStore,
     cfg: VaultConfig,
+    sensor,
     honeypot: str,
     remote_dir: str,
     f: RemoteFile,
@@ -68,7 +70,7 @@ def _process_file(
     seen_files. Otherwise stream-download, hash, store at /data/samples/
     by sha256 (idempotent on rename), and record both tables.
     """
-    if store.have_seen(cfg.sensor_name, honeypot, f.filename):
+    if store.have_seen(sensor.name, honeypot, f.filename):
         counts.files_skipped += 1
         return
 
@@ -89,20 +91,21 @@ def _process_file(
                 else:
                     # Content already present from a parallel run; drop tmp.
                     os.unlink(tmp_path)
-                store.insert_sample(sha256, cfg.sensor_name, honeypot, size)
+                store.insert_sample(sha256, sensor.name, honeypot, size)
                 counts.new_samples += 1
                 logger.info(
                     "vault: new sample sha256=%s honeypot=%s size=%d", sha256, honeypot, size,
                 )
                 # Publish a StixFile IOC for the new sample (best-effort).
-                publish_stixfile(cfg, sha256, target, honeypot, size)
+                publish_stixfile(cfg, sha256, target, honeypot, size, sensor.name)
             else:
                 # Bytes already in vault; just bump counters.
                 # The tmp file is auto-deleted by stream_download's exit.
                 store.bump_sample(sha256)
                 counts.bumped_samples += 1
 
-            store.mark_seen(cfg.sensor_name, honeypot, f.filename, sha256)
+            _link_by_sensor(cfg, sensor.name, honeypot, sha256, target)
+            store.mark_seen(sensor.name, honeypot, f.filename, sha256)
             counts.files_downloaded += 1
     except Exception as exc:
         counts.errors += 1
@@ -112,15 +115,28 @@ def _process_file(
         )
 
 
-def run_cycle(sftp, store: VaultStore, cfg: VaultConfig) -> CycleCounts:
+def _link_by_sensor(cfg, sensor_name, honeypot, sha256, target):
+    """Symlink the content-addressed sample into a per-sensor/per-honeypot
+    view, so the vault has both a deduped store and a browsable tree."""
+    try:
+        d = os.path.join(cfg.data_dir, "by-sensor", sensor_name, honeypot)
+        os.makedirs(d, exist_ok=True)
+        link = os.path.join(d, sha256)
+        if not os.path.lexists(link):
+            os.symlink(target, link)
+    except OSError as exc:
+        logger.debug("by-sensor link failed (%s/%s): %s", sensor_name, sha256, exc)
+
+
+def run_cycle(sftp, store: VaultStore, cfg: VaultConfig, sensor) -> CycleCounts:
     counts = CycleCounts()
     with store.transaction():
-        for honeypot, remote_dir in cfg.drop_dirs:
+        for honeypot, remote_dir in sensor.drop_dirs():
             counts.dirs_scanned += 1
             files = sftp.list_dir(remote_dir)
             counts.files_listed += len(files)
             for f in files:
-                _process_file(sftp, store, cfg, honeypot, remote_dir, f, counts)
+                _process_file(sftp, store, cfg, sensor, honeypot, remote_dir, f, counts)
     logger.info(
         "vault cycle: dirs=%d listed=%d downloaded=%d new=%d bumped=%d skipped=%d errors=%d",
         counts.dirs_scanned, counts.files_listed, counts.files_downloaded,
@@ -141,29 +157,32 @@ def touch_healthcheck(cfg: VaultConfig) -> None:
 def run_forever(cfg: VaultConfig) -> int:
     setup_logging(cfg.log_level)
     _ensure_dirs(cfg)
-    if not cfg.tpot_host:
+    sensors = load_sensors(cfg)
+    if not sensors:
         logger.error("TPOT_HOST not set — refusing to run")
         return 2
     store = VaultStore(cfg.state_db_path)
     logger.info(
-        "tpot2cti-vault starting: tpot=%s:%d interval=%.0fs samples_dir=%s",
-        cfg.tpot_host, cfg.tpot_ssh_port, cfg.interval_seconds, cfg.samples_dir,
+        "tpot2cti-vault starting: %d sensor(s) interval=%.0fs samples_dir=%s",
+        len(sensors), cfg.interval_seconds, cfg.samples_dir,
     )
     try:
         while True:
-            try:
-                with TpotSFTP(
-                    host=cfg.tpot_host,
-                    port=cfg.tpot_ssh_port,
-                    user=cfg.tpot_ssh_user,
-                    key_path=cfg.ssh_key_path,
-                    known_hosts_path=cfg.known_hosts_path,
-                    auto_add_host_key=cfg.auto_add_host_key,
-                ) as sftp:
-                    run_cycle(sftp, store, cfg)
-                touch_healthcheck(cfg)
-            except Exception as exc:
-                logger.warning("Vault cycle failed: %s", exc, exc_info=True)
+            for sensor in sensors:
+                try:
+                    with TpotSFTP(
+                        host=sensor.host,
+                        port=sensor.port,
+                        user=sensor.user,
+                        key_path=cfg.ssh_key_path,
+                        known_hosts_path=cfg.known_hosts_path,
+                        auto_add_host_key=cfg.auto_add_host_key,
+                        use_sudo=sensor.use_sudo,
+                    ) as sftp:
+                        run_cycle(sftp, store, cfg, sensor)
+                except Exception as exc:
+                    logger.warning("sensor %s cycle failed: %s", sensor.name, exc, exc_info=True)
+            touch_healthcheck(cfg)
             time.sleep(cfg.interval_seconds)
     finally:
         store.close()

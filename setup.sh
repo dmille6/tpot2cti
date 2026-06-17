@@ -886,6 +886,39 @@ start_tpot2cti() {
 # Per V1_SPEC §9 step 10.
 # -----------------------------------------------------------------------------
 
+enroll_sensors() {
+    (( ENABLE_VAULT )) || return 0
+    step "Step 9.5/10: Enroll malware-vault sensors"
+
+    if (( DRY_RUN )); then
+        dry "Offer to enroll T-Pot sensors via scripts/enroll-sensor.sh (bootstrap-to-key)"
+        return 0
+    fi
+
+    local helper="${SCRIPT_DIR}/scripts/enroll-sensor.sh"
+    if [[ ! -x "$helper" ]]; then
+        warn "scripts/enroll-sensor.sh missing or not executable — skipping enrollment."
+        warn "Enroll sensors later with: ./scripts/enroll-sensor.sh"
+        return 0
+    fi
+
+    cat >&2 <<'TXT'
+
+  The vault pulls malware samples from one or more T-Pot sensors over SSH.
+  Each sensor is enrolled once (bootstrap-to-key): you enter its SSH password
+  ONCE, the vault's key is installed, passwordless sudo-read is verified, and
+  from then on it pulls via key auth (no password stored).
+TXT
+
+    while ask_yes_no "Enroll a sensor now?" "y"; do
+        if ! "$helper"; then
+            warn "Enrollment did not complete; re-run later: ./scripts/enroll-sensor.sh"
+        fi
+    done
+    info "Add more sensors anytime:  ./scripts/enroll-sensor.sh"
+    info "List / remove:             ./scripts/enroll-sensor.sh --list | --remove NAME"
+}
+
 final_verification() {
     step "Step 10/10: Final verification"
 
@@ -956,6 +989,8 @@ final_verification() {
 
   First T-Pot ingestion cycle starts within 15 minutes.
 
+  Malware vault: ./scripts/enroll-sensor.sh --list   (add/remove sensors)
+
   Stop:       ./teardown.sh
   Update:     ./update.sh
   Logs:       docker compose -p $TPOT2CTI_PROJECT logs -f
@@ -987,6 +1022,7 @@ main() {
     setup_ssh_key
     test_ssh_tunnel
     start_opencti
+    enroll_sensors
     start_tpot2cti
     final_verification
 }
