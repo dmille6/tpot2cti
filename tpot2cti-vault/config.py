@@ -76,6 +76,11 @@ class VaultConfig:
     # Logging
     log_level: str
 
+    # OpenCTI publishing (StixFile IOCs for fetched samples)
+    opencti_url: str = ""
+    opencti_token: str = ""
+    publish_to_opencti: bool = False
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "VaultConfig":
         e = env if env is not None else os.environ
@@ -98,4 +103,8 @@ class VaultConfig:
             sensor_name=e.get("OPERATOR_ORG_NAME", "tpot") or "tpot",
             healthcheck_path=e.get("TPOT2CTI_HEALTH_TOUCH", "/tmp/last_cycle_ok"),
             log_level=e.get("LOG_LEVEL", "INFO").upper(),
+            opencti_url=e.get("OPENCTI_URL", ""),
+            opencti_token=e.get("OPENCTI_ADMIN_TOKEN", "") or e.get("OPENCTI_TOKEN", ""),
+            publish_to_opencti=bool(e.get("OPENCTI_URL")) and bool(
+                e.get("OPENCTI_ADMIN_TOKEN", "") or e.get("OPENCTI_TOKEN", "")),
         )
