@@ -33,6 +33,7 @@ from config import VaultConfig
 from log import setup_logging
 from sftp_client import RemoteFile, TpotSFTP
 from store import VaultStore
+from opencti import publish_stixfile
 
 logger = logging.getLogger("tpot2cti.vault")
 
@@ -93,6 +94,8 @@ def _process_file(
                 logger.info(
                     "vault: new sample sha256=%s honeypot=%s size=%d", sha256, honeypot, size,
                 )
+                # Publish a StixFile IOC for the new sample (best-effort).
+                publish_stixfile(cfg, sha256, target, honeypot, size)
             else:
                 # Bytes already in vault; just bump counters.
                 # The tmp file is auto-deleted by stream_download's exit.

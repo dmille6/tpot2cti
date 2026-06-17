@@ -8,7 +8,7 @@ per artifact to OpenCTI.
 
 Audit on 2026-05-29 found:
 
-- **0 malware artifacts captured** in 7 days of operation.
+- Fetched samples are now published to OpenCTI as StixFile IOCs (see opencti.py).
 - Container ran `unhealthy` for most of its lifetime.
 - The use case (file SCOs for malware drops) is already covered by the
   main importer's Dionaea parser via T-Pot's logstash output — which
