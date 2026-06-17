@@ -34,7 +34,7 @@ def _md5_sha1(path: str) -> tuple[str, str]:
     return md5.hexdigest(), sha1.hexdigest()
 
 
-def publish_stixfile(cfg, sha256: str, sample_path: str, honeypot: str, size: int) -> bool:
+def publish_stixfile(cfg, sha256: str, sample_path: str, honeypot: str, size: int, sensor_name: str = "") -> bool:
     """Create a StixFile observable for one captured sample. No-op (returns
     False) when OpenCTI isn't configured. Never raises -- the fetch cycle must
     survive a flaky OpenCTI."""
@@ -44,7 +44,7 @@ def publish_stixfile(cfg, sha256: str, sample_path: str, honeypot: str, size: in
         md5, sha1 = _md5_sha1(sample_path)
         desc = (
             "Malware sample captured by %s on T-Pot sensor %r. %d bytes. "
-            "Raw bytes retained in the tpot2cti malware-vault." % (honeypot, cfg.sensor_name, size)
+            "Raw bytes retained in the tpot2cti malware-vault." % (honeypot, sensor_name or cfg.sensor_name, size)
         )
         body = json.dumps({"query": _ADD_STIXFILE, "variables": {
             "sha256": sha256, "md5": md5, "sha1": sha1, "size": int(size), "desc": desc,

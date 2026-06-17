@@ -48,6 +48,62 @@ DEFAULT_DROPS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Per-sensor drop dirs RELATIVE to each sensor's T-Pot data dir (sudo-read
+# reads the real honeypot dirs directly, e.g. <data_dir>/dionaea/binaries).
+DEFAULT_DROP_RELDIRS: tuple[tuple[str, str], ...] = (
+    ("cowrie", "cowrie/downloads"),
+    ("dionaea", "dionaea/binaries"),
+    ("honeytrap", "honeytrap/downloads-all"),
+    ("adbhoney", "adbhoney/downloads"),
+)
+
+
+@dataclass(frozen=True)
+class Sensor:
+    """One T-Pot sensor the vault pulls malware from."""
+    name: str
+    host: str
+    port: int
+    user: str
+    use_sudo: bool
+    data_dir: str          # T-Pot data base on the sensor, e.g. /opt/tpotce/data
+
+    def drop_dirs(self) -> list[tuple[str, str]]:
+        base = self.data_dir.rstrip("/")
+        return [(hp, base + "/" + rel) for hp, rel in DEFAULT_DROP_RELDIRS]
+
+
+def load_sensors(cfg: "VaultConfig") -> list["Sensor"]:
+    """Sensor inventory from <data_dir>/sensors.json. Falls back to a single
+    sensor synthesized from the legacy TPOT_HOST env (backward compatible)."""
+    import json as _json
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    if os.path.exists(cfg.sensors_path):
+        try:
+            raw = _json.load(open(cfg.sensors_path))
+        except Exception as exc:
+            log.error("Bad sensors.json %s: %s", cfg.sensors_path, exc)
+            raw = []
+        out: list[Sensor] = []
+        for s in raw:
+            try:
+                out.append(Sensor(
+                    name=s["name"], host=s["host"], port=int(s.get("port", 64295)),
+                    user=s.get("user", "tpot"), use_sudo=bool(s.get("sudo", True)),
+                    data_dir=s.get("data_dir", "/opt/tpotce/data")))
+            except (KeyError, TypeError) as exc:
+                log.warning("Skipping bad sensor entry %r: %s", s, exc)
+        return out
+    if cfg.tpot_host:  # legacy single-host fallback
+        return [Sensor(
+            name=cfg.sensor_name, host=cfg.tpot_host, port=cfg.tpot_ssh_port,
+            user=cfg.tpot_ssh_user,
+            use_sudo=os.environ.get("TPOT2CTI_VAULT_SUDO", "1") == "1",
+            data_dir=os.environ.get("TPOT2CTI_VAULT_REMOTE_DATA_DIR", "/opt/tpotce/data"))]
+    return []
+
+
 @dataclass(frozen=True)
 class VaultConfig:
     # T-Pot SSH/SFTP connection (direct from the sidecar — not via tunnel container)
@@ -80,6 +136,7 @@ class VaultConfig:
     opencti_url: str = ""
     opencti_token: str = ""
     publish_to_opencti: bool = False
+    sensors_path: str = "/data/sensors.json"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "VaultConfig":
@@ -107,4 +164,5 @@ class VaultConfig:
             opencti_token=e.get("OPENCTI_ADMIN_TOKEN", "") or e.get("OPENCTI_TOKEN", ""),
             publish_to_opencti=bool(e.get("OPENCTI_URL")) and bool(
                 e.get("OPENCTI_ADMIN_TOKEN", "") or e.get("OPENCTI_TOKEN", "")),
+            sensors_path=os.path.join(data_dir, "sensors.json"),
         )
