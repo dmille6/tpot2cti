@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
@@ -80,6 +81,9 @@ _TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}"
 # Simple IPv4 / IPv6 sanity regexes (we accept what logstash gave us,
 # but reject obviously malformed strings before building observables).
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+# Download URLs (wget/curl/tftp droppers) embedded in command transcripts.
+_CMD_URL_RE = re.compile(r"\b(?:https?|ftp|tftp)://[^\s<>|;,)\\]+", re.IGNORECASE)
 
 #: Conservative domain-name validator. Requires >=2 dot-separated labels and
 #: an alphabetic TLD, which rejects the malformations OpenCTI bounces with
@@ -816,6 +820,25 @@ class STIXBuilder:
         refs = _refs_for_domain(fqdn_lc)
         if refs:
             obj["external_references"] = refs
+        return self._dedup(self._stamp(obj))
+
+    def build_referenced_ipv4(
+        self, ip: str, *, session: Optional[AttackSession] = None,
+    ) -> Optional[dict]:
+        """A plain IPv4-Addr observable for a host *referenced by* an attacker
+        (e.g. a malware payload / C2 endpoint in a wget/curl command) -- distinct
+        from build_ipv4, which describes the attacker themselves."""
+        if not ip or not _IPV4_RE.match(ip):
+            return None
+        obj = {"type": "ipv4-addr", "id": generate_ipv4_id(ip), "value": ip}
+        if session is not None:
+            obj["x_opencti_description"] = (
+                f"Endpoint referenced by attacker {session.src_ip} via "
+                f"{session.event_type} (malware payload / C2 host)."
+            )
+            obj["x_opencti_labels"] = ["attacker-referenced", "malware-c2"]
+            obj["x_opencti_score"] = 75
+            obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj))
 
     def build_process(self, session: AttackSession, commands: list[str]) -> Optional[dict]:
@@ -2339,6 +2362,41 @@ class STIXBuilder:
                     description=f"Commands from {session.src_ip}",
                 ):
                     out.append(rel)
+        # Payload/dropper URLs in the command transcript: SSH & protocol
+        # honeypots log `wget http://c2/x.sh` but never run it, so the
+        # payload URL + C2 host are IOCs we would otherwise lose. (Cowrie
+        # has its own extraction in build_cowrie_session.)
+        _seen_urls = set()
+        for _cmd in session.commands:
+            for _url in _CMD_URL_RE.findall(_cmd):
+                _url = _url.rstrip(".,;)")
+                if _url in _seen_urls:
+                    continue
+                _seen_urls.add(_url)
+                _url_obj = self.build_url(_url, session=session)
+                if not _url_obj:
+                    continue
+                out.append(_url_obj)
+                if rel := self.build_relationship(
+                    _url_obj["id"], "related-to", ipv4_id,
+                    description=f"Payload URL fetched via {session.event_type} by {session.src_ip}",
+                ):
+                    out.append(rel)
+                _host = urlparse(_url).hostname
+                if not _host:
+                    continue
+                _host_obj = (
+                    self.build_referenced_ipv4(_host, session=session)
+                    if _IPV4_RE.match(_host)
+                    else self.build_domain(_host, session=session)
+                )
+                if _host_obj:
+                    out.append(_host_obj)
+                    if rel := self.build_relationship(
+                        _url_obj["id"], "related-to", _host_obj["id"],
+                        description="Payload URL hosted on this endpoint",
+                    ):
+                        out.append(rel)
         return out
 
     def build_conpot_session(self, session: AttackSession) -> list[dict]:
