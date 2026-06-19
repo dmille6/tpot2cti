@@ -108,6 +108,16 @@ class CycleConfig:
     #: slowly-evolving so the cycle skew isn't analytically meaningful.
     #: Set to 1 to process every cycle (matches pre-2026-05-21 behavior).
     fatt_cycle_multiplier: int = 4
+    #: Emit a generic "Network Attack" AttackPattern (+ per-IP indicates
+    #: edge) for sessions with NO recognized MITRE technique. Default
+    #: False: the generic node carries ~no intel value and floods OpenCTI
+    #: with thousands of meaningless edges. Real technique/CVE/protocol
+    #: AttackPatterns are unaffected (added 2026-06-19 cycle-tune).
+    emit_generic_attack_pattern: bool = False
+    #: Drop sessions whose commands are ALL pure recon (the GPU-miner
+    #: fingerprint flood) from OpenCTI. Raw events stay in ES/Kibana; a
+    #: single meaty command keeps the full transcript (added 2026-06-19).
+    drop_recon_process: bool = True
 
 
 @dataclass(frozen=True)
@@ -312,6 +322,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         transient_retry_seconds=_env_int(env, "TPOT2CTI_TRANSIENT_RETRY_SECONDS", default=60),
         indexing_delay_seconds=_env_int(env, "TPOT2CTI_INDEXING_DELAY_SECONDS", default=60),
         fatt_cycle_multiplier=_env_int(env, "TPOT2CTI_FATT_CYCLE_MULTIPLIER", default=4),
+        emit_generic_attack_pattern=_env_bool(env, "TPOT2CTI_EMIT_GENERIC_AP", default=False),
+        drop_recon_process=_env_bool(env, "TPOT2CTI_DROP_RECON_PROCESS", default=True),
     )
 
     # --- Connector IDs ---

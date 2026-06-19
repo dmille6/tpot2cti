@@ -85,6 +85,69 @@ _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 # Download URLs (wget/curl/tftp droppers) embedded in command transcripts.
 _CMD_URL_RE = re.compile(r"\b(?:https?|ftp|tftp)://[^\s<>|;,)\\]+", re.IGNORECASE)
 
+# ── Recon-noise classifier (2026-06-19) ─────────────────────────────────────
+# Commodity fingerprinting (esp. the GPU-miner uname/lscpu/lspci/nvidia-smi
+# suite) dominates LLM-SSH command volume and mints thousands of zero-value
+# Process SDOs per cycle. build_process drops a session whose commands are ALL
+# pure recon, so only "meaty" attacks (download/exec, persistence, cred/cloud
+# theft) reach OpenCTI. Conservative: ONE offensive token anywhere in any
+# command keeps the whole session. Raw events always remain in ES/Kibana.
+_IPECHO_RE = re.compile(
+    r"(ipinfo\.io|ifconfig\.me|ifconfig\.co|icanhazip|ipify\.org|ipecho\.net|"
+    r"checkip|ip\.sb|myip|whatismyip|wtfismyip|trackip|showip|api\.ip)",
+    re.IGNORECASE,
+)
+_FETCH_LEAD_RE = re.compile(
+    r"^(sudo\s+)?(/\S+/|\./)?(curl|wget|fetch|lwp-download|get)\b", re.IGNORECASE
+)
+_MEATY_RE = re.compile(
+    r"(\|\s*(sh|bash|ash|zsh|python3?|perl|php|ruby|node)\b|\b(sh|bash)\s+-c\b|"
+    r"\beval\b|\bexec\b|\bchmod\b|\bchattr\b|\bbase64\b|\bxxd\b|\\x[0-9a-fA-F]{2}|"
+    r"\bwget\b|\bcurl\b|\btftp\b|\bftpget\b|\blwp-download\b|\bscp\b|\bsftp\b|\brsync\b|"
+    r"\bnc\b|\bncat\b|\bsocat\b|\bcrontab\b|authorized_keys|/\.ssh|id_rsa|id_ed25519|"
+    r"\bsystemctl\b|rc\.local|init\.d|\buseradd\b|\badduser\b|\busermod\b|\bchpasswd\b|"
+    r"/etc/shadow|/tmp/|/dev/shm|/var/tmp|\.sh\b|\.bin\b|\.elf\b|\bnohup\b|\bsetsid\b|"
+    r"\bdisown\b|xmrig|minerd|cpuminer|kinsing|kdevtmpfs|\.env\b|\.aws\b|\.azure\b|"
+    r"\.kube\b|credentials|169\.254\.169\.254|metadata/identity|\bkubectl\b|\bgcloud\b|"
+    r"\.git/config|\bdd\b|\biptables\b|\bufw\b|\bmysql\b|\bredis\b|\bpasswd\b|\bmkfifo\b)",
+    re.IGNORECASE,
+)
+_RECON_LEAD_RE = re.compile(
+    r"^(sudo\s+)?(/\S+/|\./)?("
+    r"uname|lscpu|lsmem|lsblk|lspci|nproc|nvidia-smi|uptime|free|whoami|id|hostname|"
+    r"hostnamectl|pwd|who|w|last|users|groups|ls|dir|cd|exit|logout|history|clear|"
+    r"reset|which|command|type|getconf|lsb_release|tty|set|env|printenv|locale|date|"
+    r"cal|top|htop|vmstat|iostat|ps|df|du|arch|getprop|"
+    r"cat\s+/proc/\S+|cat\s+/sys/\S+|"
+    r"cat\s+/etc/(os-release|issue|lsb-release|hostname|machine-id|debian_version|redhat-release|centos-release)"
+    r")(\s|$|\|)",
+    re.IGNORECASE,
+)
+
+
+def _is_recon_command(cmd: str) -> bool:
+    """True if a single command is pure recon (no offensive action)."""
+    c = (cmd or "").strip()
+    if not c:
+        return True  # blank / keepalive — ignorable
+    if _FETCH_LEAD_RE.match(c):
+        # download verb: recon only when probing an IP-echo service
+        return bool(_IPECHO_RE.search(c))
+    if _MEATY_RE.search(c):
+        return False
+    return bool(_RECON_LEAD_RE.match(c))
+
+
+def _session_is_recon_only(commands) -> bool:
+    """True if EVERY command in the session is pure recon (>=1 present)."""
+    saw = False
+    for c in commands:
+        if (c or "").strip():
+            saw = True
+            if not _is_recon_command(c):
+                return False
+    return saw
+
 #: Conservative domain-name validator. Requires >=2 dot-separated labels and
 #: an alphabetic TLD, which rejects the malformations OpenCTI bounces with
 #: "Observable is not correctly formatted": IP literals (numeric TLD), values
@@ -168,16 +231,17 @@ _PARSER_LABEL_VOCAB: dict[str, tuple[str, str]] = {
 }
 
 
-def parser_labels_for(event_type: Optional[str]) -> list[str]:
+def parser_labels_for(event_type: Optional[str], sensor_hostname: Optional[str] = None) -> list[str]:
     """Return base labels [`honeypot`, <parser>, <protocol_family>] for a
     given parser type_name. Unknown parsers fall back to the type name
     lowercased so we never have an unlabelled object."""
+    extra = [f"sensor:{sensor_hostname}"] if sensor_hostname else []
     if not event_type:
-        return ["honeypot"]
+        return ["honeypot"] + extra
     pair = _PARSER_LABEL_VOCAB.get(event_type)
     if pair is None:
-        return ["honeypot", event_type.lower()]
-    return ["honeypot", pair[0], pair[1]]
+        return ["honeypot", event_type.lower()] + extra
+    return ["honeypot", pair[0], pair[1]] + extra
 
 
 #: Indicator name templates. {ip} and {n} are substituted; {n} is the
@@ -525,7 +589,7 @@ class STIXBuilder:
                 f"on sensor {session.sensor_hostname!r}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attacker-country"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attacker-country"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj, add_confidence=False))
@@ -559,7 +623,7 @@ class STIXBuilder:
                 f"on sensor {session.sensor_hostname!r}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attacker-city"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attacker-city"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj, add_confidence=False))
@@ -588,7 +652,7 @@ class STIXBuilder:
                 + f"{session.src_ip} via {session.event_type}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attacker-as"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attacker-as"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         refs = _refs_for_as(int(asn))
@@ -637,7 +701,7 @@ class STIXBuilder:
             # AttackPattern is an SDO so it gets canonical objectLabel
             # via labels= rather than x_opencti_labels (the latter is for SCOs).
             obj["labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attack-pattern"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attack-pattern"]
             ))
         return self._dedup(self._stamp(obj, add_confidence=False)) or obj
 
@@ -713,7 +777,7 @@ class STIXBuilder:
             obj["x_opencti_description"] = _describe_ip(ip, session)
             obj["x_opencti_score"] = _ip_score(session)
             obj["x_opencti_labels"] = sorted(
-                set(parser_labels_for(session.event_type))
+                set(parser_labels_for(session.event_type, session.sensor_hostname))
             )
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         # Pivot menu — adds 5 external_references; OpenCTI renders these
@@ -751,7 +815,7 @@ class STIXBuilder:
                 f"{session.first_seen.isoformat()}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["malware-sample"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["malware-sample"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         refs = _refs_for_file(sha256_lc)
@@ -779,7 +843,7 @@ class STIXBuilder:
                 f"{session.sensor_hostname!r}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attacker-referenced"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attacker-referenced"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         refs = _refs_for_url(url)
@@ -814,7 +878,7 @@ class STIXBuilder:
                 f"{session.sensor_hostname!r}."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["attacker-referenced"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["attacker-referenced"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         refs = _refs_for_domain(fqdn_lc)
@@ -856,6 +920,11 @@ class STIXBuilder:
         """
         if not commands:
             return None
+        # Drop pure-recon sessions (miner fingerprint flood etc.) from
+        # OpenCTI; raw events stay in ES/Kibana. A single meaty command
+        # keeps the full transcript. See _session_is_recon_only.
+        if self.config.cycle.drop_recon_process and _session_is_recon_only(commands):
+            return None
         # Cap commands to MAX_COMMANDS_PER_PROCESS for bundle-size sanity
         capped = commands[:MAX_COMMANDS_PER_PROCESS]
         # Normalize ephemeral temp-file paths (e.g. automated scp malware-drop
@@ -890,7 +959,7 @@ class STIXBuilder:
                 f"first seen {session.first_seen.isoformat()})."
             ),
             "x_opencti_labels": sorted(set(
-                parser_labels_for(session.event_type) + ["command-transcript"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["command-transcript"]
             )),
             "x_opencti_created_at": session.first_seen.isoformat(),
         }
@@ -932,7 +1001,7 @@ class STIXBuilder:
                 f"client / tool — useful for campaign correlation."
             )
             obj["x_opencti_labels"] = sorted(set(
-                parser_labels_for(session.event_type) + ["ssh-fingerprint", "hassh"]
+                parser_labels_for(session.event_type, session.sensor_hostname) + ["ssh-fingerprint", "hassh"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj))
@@ -1017,7 +1086,7 @@ class STIXBuilder:
             if tag:
                 labels.append(f"comment:{tag}")
         if session is not None:
-            labels.extend(parser_labels_for(session.event_type))
+            labels.extend(parser_labels_for(session.event_type, session.sensor_hostname))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         obj["x_opencti_labels"] = sorted(set(labels))
         # Confidence/score: a planted-key SCO is one of the highest-
@@ -1728,7 +1797,7 @@ class STIXBuilder:
         # Fallback: if no recognized MITRE technique attached, emit a
         # generic "Network Attack" AttackPattern so we always have an
         # indicates-target per V1_SPEC §5.2.
-        if ip_ind and not attack_pattern_ids:
+        if ip_ind and not attack_pattern_ids and self.config.cycle.emit_generic_attack_pattern:
             generic = self.build_attack_pattern(name="Network Attack", session=session)
             if generic:
                 out.append(generic)
