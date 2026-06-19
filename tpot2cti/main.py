@@ -43,6 +43,7 @@ import signal
 import sys
 import threading
 import time
+import ipaddress
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -341,6 +342,31 @@ def _session_credential_attempts(session) -> list[dict]:
     return rows
 
 
+# Operator-specific source nets to exclude (mgmt subnets, cloud health-probes,
+# internal service nets) — comma-separated CIDRs via TPOT2CTI_EXCLUDED_SRC_NETS.
+# Empty by default; no deployment-specific CIDRs are baked into the source.
+_EXCLUDED_SRC_NETS = [
+    ipaddress.ip_network(_c.strip())
+    for _c in os.environ.get("TPOT2CTI_EXCLUDED_SRC_NETS", "").split(",")
+    if _c.strip()
+]
+
+
+def _is_internal_src(ip: str) -> bool:
+    """True if src_ip is internal/own-infra and must not become an indicator:
+    RFC1918 / link-local (incl 169.254.169.254 Azure IMDS) / loopback /
+    reserved / multicast, OR within an operator-excluded subnet
+    (TPOT2CTI_EXCLUDED_SRC_NETS — mgmt subnets, cloud health-probes, etc.)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (a.is_private or a.is_link_local or a.is_loopback
+            or a.is_reserved or a.is_multicast or a.is_unspecified):
+        return True
+    return any(a in n for n in _EXCLUDED_SRC_NETS)
+
+
 def run_cycle(
     cfg: Config,
     state: CycleState,
@@ -425,6 +451,9 @@ def run_cycle(
             # See the first-live-install postmortem for the exact case
             # that motivated this filter.
             if honeypot_ips and event.src_ip in honeypot_ips:
+                events_self_filtered += 1
+                continue
+            if _is_internal_src(event.src_ip):
                 events_self_filtered += 1
                 continue
             # Benign-scanner allowlist: drop events from Google / Censys /
