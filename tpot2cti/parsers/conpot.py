@@ -112,7 +112,11 @@ class ConPotParser(BaseParser):
         self._populate_geoip(doc, event)
 
         # ── Protocol-specific request blob (capped) ────────────────────
-        request = doc.get("request")
+        # Hive logstash (2026-06-29) renames ConPot's payload fields to
+        # conpot_* to avoid a shared-index mapping collision with Galah/
+        # h0neytr4p's object request/response. Fall back to the bare
+        # `request` for historical docs still indexed under the old name.
+        request = doc.get("conpot_request") or doc.get("request")
         if request is None:
             request_str = ""
         elif isinstance(request, (dict, list)):
