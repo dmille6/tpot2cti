@@ -57,13 +57,6 @@ def test_default_hl7_port_applied():
     assert ev is not None and ev.dst_port == 2575
 
 
-def test_every_session_is_substantive():
-    now = datetime.now(timezone.utc)
-    parser = MedpotParser()
-    sessions = parser.correlate([parser.parse(d) for d in _docs(now)])
-    assert all(parser.has_substance(s) is True for s in sessions)
-
-
 def test_malformed_docs_return_none():
     parser = MedpotParser()
     assert parser.parse({}) is None                      # no src_ip

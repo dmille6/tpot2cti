@@ -8,7 +8,7 @@ of substance.  We map one ES doc → one ParsedEvent → one AttackSession,
 and every session is substantive (the alert itself is the signal).
 
 Per the V0 parser-vs-builder separation rule, this parser stays pure (model-only):
-parse() + correlate() + has_substance() only.  The per-protocol STIX
+parse() + correlate() only.  The per-protocol STIX
 shape — AttackPattern selection, Vulnerability emission, Domain-Name
 resolves-to relationships — lives in
 ``STIXBuilder.build_suricata_alert``.

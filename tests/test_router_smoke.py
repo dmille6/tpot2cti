@@ -1,6 +1,6 @@
 """Smoke test for the router parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.router as _m
@@ -105,15 +105,9 @@ def test_router_smoke():
         f"got {len(nosid_sessions)}"
     )
 
-    drive_s = drive_sessions[0]
     list_s = list_sessions[0]
     per_s = per_sessions[0]
     nosid_s = nosid_sessions[0]
-
-    assert parser.has_substance(drive_s) is False, "empty-cmds must be drive-by"
-    assert parser.has_substance(list_s) is True, "command list must be substantive"
-    assert parser.has_substance(per_s) is True, "per-cmd docs must be substantive"
-    assert parser.has_substance(nosid_s) is True, "windowed burst must be substantive"
 
     # Aggregator: commands populated in order
     assert list_s.commands == [

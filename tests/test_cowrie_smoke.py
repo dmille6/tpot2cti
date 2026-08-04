@@ -1,6 +1,6 @@
 """Smoke test for the cowrie parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.cowrie as _m
@@ -72,9 +72,6 @@ def test_cowrie_smoke():
     print(f"  credentials_tried: {s.credentials_tried}")
     print(f"  hassh:             {s.hassh}")
     print(f"  event_count:       {s.event_count}")
-
-    # substance
-    print(f"  has_substance:     {parser.has_substance(s)}")
 
     # Build STIX (need a Config — use minimal env). Per refactor, the
     # parser no longer carries a build() method; the orchestrator calls

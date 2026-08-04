@@ -148,24 +148,6 @@ class BeelzebubParser(BaseParser):
                 session.dst_ports.add(port)
             if proto := (e.protocol or meta.get("protocol")):
                 session.protocols.add(str(proto))
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance()
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Substantive when:
-          - any command executed (post-auth shell interaction), OR
-          - any credential pair captured, OR
-          - more than 2 events on the session (sustained probing).
-        Bare single-touch connects with no creds drop to drive-by.
-        """
-        return (
-            bool(session.commands)
-            or bool(session.credentials_tried)
-            or session.event_count > 2
-        )
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

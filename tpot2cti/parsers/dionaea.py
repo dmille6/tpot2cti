@@ -139,8 +139,8 @@ class DionaeaParser(BaseParser):
         if all_hashes:
             event.meta["all_hashes"] = all_hashes
             # Primary hash for ``session.malware_hashes`` — prefer
-            # sha256, then sha1, then md5.  has_substance() and the
-            # downstream File builder both key off this.
+            # sha256, then sha1, then md5.  The downstream File builder
+            # keys off this.
             for preferred in ("sha256", "sha1", "md5"):
                 if preferred in all_hashes:
                     event.meta["primary_hash"] = all_hashes[preferred]
@@ -167,8 +167,8 @@ class DionaeaParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
     #
     # We override only to attach session.malware_hashes / urls / domains
-    # from the lone event's meta, so downstream has_substance() and the
-    # STIX builder see a uniformly-populated session.
+    # from the lone event's meta, so the downstream STIX builder sees a
+    # uniformly-populated session.
 
     def correlate(self, events: Iterable[ParsedEvent]) -> list[AttackSession]:
         """Wrap each event in a one-event :class:`AttackSession` and
@@ -177,8 +177,8 @@ class DionaeaParser(BaseParser):
         Dionaea has no protocol session id — each captured connection /
         binary drop is its own event and own session — but we still
         want ``session.malware_hashes``, ``session.urls`` and
-        ``session.domains`` populated so :meth:`has_substance` and the
-        STIX builder don't need to reach into ``events[0].meta``.
+        ``session.domains`` populated so the STIX builder doesn't need
+        to reach into ``events[0].meta``.
         """
         sessions: list[AttackSession] = []
         for event in events:
@@ -234,29 +234,6 @@ class DionaeaParser(BaseParser):
                 session.meta.setdefault("connection_protocol", cp)
             if (sz := meta.get("size_bytes")) is not None:
                 session.meta.setdefault("size_bytes", sz)
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — the LESSONS §2 substance filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Per V1_SPEC §5.3 / LESSONS §2: a Dionaea session is
-        substantive iff we actually captured *content* — either a
-        binary (any of sha256 / md5 / sha1) or a download URL pointing
-        at one.  Bare connect-and-drop probes (the dominant signal on
-        port 445) get the drive-by treatment.
-        """
-        if session.malware_hashes:
-            return True
-        if session.urls:
-            return True
-        # Defensive: also check meta.all_hashes directly in case the
-        # aggregator path was skipped for some reason.
-        all_hashes = session.meta.get("all_hashes") or {}
-        if isinstance(all_hashes, dict) and any(all_hashes.values()):
-            return True
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

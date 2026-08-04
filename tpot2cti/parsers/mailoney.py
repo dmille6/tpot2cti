@@ -179,29 +179,6 @@ class MailoneyParser(BaseParser):
         session.meta["has_data"] = any_data
         if total_data_len:
             session.meta["data_len_total"] = total_data_len
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — substance filter per V1_SPEC §5.10
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A Mailoney session is substantive iff
-          - it issued any SMTP verb outside `_NOOP_SMTP_VERBS`, OR
-          - it captured at least one credential pair, OR
-          - the attacker pushed any DATA bytes.
-
-        Drive-by noise: a session whose verbs are a subset of
-        {EHLO, HELO, QUIT, NOOP, RSET} with no creds and no DATA.
-        """
-        non_noop = any(
-            v.upper() not in _NOOP_SMTP_VERBS for v in session.commands
-        )
-        return bool(
-            non_noop
-            or session.credentials_tried
-            or session.meta.get("has_data")
-        )
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

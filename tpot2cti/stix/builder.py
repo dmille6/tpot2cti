@@ -5,6 +5,7 @@ See docs/stix/builder.md for design notes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from tpot2cti.stix.external_refs import (
     for_domain as _refs_for_domain,
     for_file_sha256 as _refs_for_file,
     for_ipv4 as _refs_for_ipv4,
+    for_ipv6 as _refs_for_ipv6,
     for_url as _refs_for_url,
 )
 from tpot2cti.stix_ids import (
@@ -43,8 +45,12 @@ from tpot2cti.stix_ids import (
     generate_file_indicator_id,
     generate_identity_id,
     generate_infrastructure_id_for_sensor,
+    attacker_ip_indicator_id,
+    attacker_ip_observable_id,
+    canonical_ip,
     generate_ip_indicator_id,
     generate_ipv4_id,
+    generate_ipv6_id,
     generate_marking_definition_id,
     generate_process_id,
     sdo_id,
@@ -78,8 +84,12 @@ MAX_COMMANDS_PER_PROCESS = 50
 # Ephemeral temp-file paths in scp malware-drop probes; normalized to dedupe noise.
 _TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}")
 
-# Simple IPv4 / IPv6 sanity regexes (we accept what logstash gave us,
-# but reject obviously malformed strings before building observables).
+# Attacker-IP validation/canonicalization + deterministic ids live in
+# tpot2cti.stix_ids: `canonical_ip`, `attacker_ip_observable_id`,
+# `attacker_ip_indicator_id`. Every attacker-IP id in this file goes
+# through those so the id always matches the emitted object (v4 or v6, any
+# notation) — minting an id from a raw string is what caused dangling refs.
+# `_IPV4_RE` remains only for the referenced-C2-literal path (build_referenced_ipv4).
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 # Download URLs (wget/curl/tftp droppers) embedded in command transcripts.
@@ -737,7 +747,7 @@ class STIXBuilder:
         if not techniques:
             return []
         out: list[dict] = []
-        ip_ind_id = generate_ip_indicator_id(session.src_ip)
+        ip_ind_id = attacker_ip_indicator_id(session.src_ip)
         for mitre_id, name in techniques:
             ap = self.build_attack_pattern(name, mitre_id=mitre_id, session=session)
             if not ap:
@@ -775,11 +785,52 @@ class STIXBuilder:
         Without session, we still emit a minimal observable so the
         publisher's drive-by path (and any unit tests) keep working.
         """
-        if not ip or not _IPV4_RE.match(ip):
+        fam = canonical_ip(ip)
+        if fam is None or fam[0] != "ipv4":
             return None
+        return self._build_ip_observable("ipv4-addr", fam[1], session)
+
+    def build_ipv6(
+        self,
+        ip: str,
+        *,
+        session: Optional[AttackSession] = None,
+    ) -> Optional[dict]:
+        """Build the IPv6-Addr observable for an attacker IP.
+
+        Same enrichment shape as :meth:`build_ipv4` (description, score,
+        labels, pivot menu), but for IPv6. The address is canonicalized
+        (compressed, lowercase) so its id is stable across notations.
+        """
+        fam = canonical_ip(ip)
+        if fam is None or fam[0] != "ipv6":
+            return None
+        return self._build_ip_observable("ipv6-addr", fam[1], session)
+
+    def build_ip_observable(
+        self,
+        ip: str,
+        *,
+        session: Optional[AttackSession] = None,
+    ) -> Optional[dict]:
+        """Version-aware attacker-IP observable: IPv4 or IPv6 (else None)."""
+        fam = canonical_ip(ip)
+        if fam is None:
+            return None
+        kind, canon = fam
+        return self._build_ip_observable(
+            "ipv6-addr" if kind == "ipv6" else "ipv4-addr", canon, session
+        )
+
+    def _build_ip_observable(
+        self, stix_type: str, ip: str, session: Optional[AttackSession]
+    ) -> Optional[dict]:
+        """Shared body for build_ipv4 / build_ipv6 (ip is already validated
+        and, for IPv6, canonical)."""
+        is_v6 = stix_type == "ipv6-addr"
         obj = {
-            "type": "ipv4-addr",
-            "id": generate_ipv4_id(ip),
+            "type": stix_type,
+            "id": generate_ipv6_id(ip) if is_v6 else generate_ipv4_id(ip),
             "value": ip,
         }
         # OpenCTI extensions — populated when we have session context.
@@ -790,9 +841,9 @@ class STIXBuilder:
                 set(parser_labels_for(session.event_type, session.sensor_hostname))
             )
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
-        # Pivot menu — adds 5 external_references; OpenCTI renders these
-        # as buttons on the IP detail page.
-        refs = _refs_for_ipv4(ip)
+        # Pivot menu — adds external_references; OpenCTI renders these as
+        # buttons on the IP detail page.
+        refs = _refs_for_ipv6(ip) if is_v6 else _refs_for_ipv4(ip)
         if refs:
             obj["external_references"] = refs
         return self._dedup(self._stamp(obj))
@@ -1127,9 +1178,14 @@ class STIXBuilder:
         When `session` is None, falls back to a minimal indicator —
         keeps backward compat with the few smoke tests that build
         bare indicators.
+
+        Handles both IPv4 and IPv6 attacker addresses.
         """
-        if not ip or not _IPV4_RE.match(ip):
+        fam = canonical_ip(ip)
+        if fam is None:
             return None
+        is_v6 = fam[0] == "ipv6"
+        ip = fam[1]  # canonical form
 
         event_type = session.event_type if session else None
         n = session_count if session_count is not None else (
@@ -1197,20 +1253,21 @@ class STIXBuilder:
             "id": generate_ip_indicator_id(ip),
             "name": _format_indicator_name(event_type, ip, n),
             "pattern_type": "stix",
-            "pattern": f"[ipv4-addr:value = '{ip}']",
+            "pattern": f"[ipv6-addr:value = '{ip}']" if is_v6
+                       else f"[ipv4-addr:value = '{ip}']",
             "valid_from": first_seen.isoformat(),
             "valid_until": valid_until.isoformat(),
             "indicator_types": ["malicious-activity"],
             "labels": sorted(set(parser_labels_for(event_type))),
             # OpenCTI custom properties (the dashboard widgets read these).
             "x_opencti_score": score,
-            "x_opencti_main_observable_type": "IPv4-Addr",
+            "x_opencti_main_observable_type": "IPv6-Addr" if is_v6 else "IPv4-Addr",
         }
         if description:
             obj["description"] = description
         # Pivot menu on the indicator too — duplicates the SCO's refs but
         # an analyst on the indicator page wants the same one-click options.
-        refs = _refs_for_ipv4(ip)
+        refs = _refs_for_ipv6(ip) if is_v6 else _refs_for_ipv4(ip)
         if refs:
             obj["external_references"] = refs
         return self._dedup(self._stamp(obj))
@@ -1316,6 +1373,9 @@ class STIXBuilder:
         """
         if not ip or not credentials:
             return None
+        sco_id = attacker_ip_observable_id(ip)
+        if sco_id is None:  # malformed IP — nothing valid to attach the Note to
+            return None
         # Accepted logins first, then by attempt volume.
         rows = sorted(
             credentials,
@@ -1359,7 +1419,7 @@ class STIXBuilder:
             "id": generate_credential_note_id(ip),
             "abstract": abstract,
             "content": body_md,
-            "object_refs": [generate_ipv4_id(ip)],
+            "object_refs": [sco_id],
         }
         return self._dedup(self._stamp(obj))
 
@@ -1606,9 +1666,9 @@ class STIXBuilder:
     def build_cowrie_session(self, session: AttackSession) -> list[dict]:
         """Build the full Cowrie session STIX graph.
 
-        Caller is expected to have already determined has_substance() is
-        True.  For drive-by sessions the caller invokes
-        `self.build_driveby_session(session)` instead.
+        Caller is expected to have already determined the session is not a
+        bare scan (`_is_bare_scan()` in main.py).  For drive-by sessions the
+        caller invokes `self.build_driveby_session(session)` instead.
 
         Emits: sensor + attacker context + IP Indicator + (HASSH key) +
         (Process) + (File + File Indicator) + URLs + Domains + Sighting +
@@ -1618,11 +1678,11 @@ class STIXBuilder:
         if not session.events:
             return out
 
-        # Foundation: sensor + attacker context (IPv4 + geo + AS)
+        # Foundation: sensor + attacker context (IP v4/v6 + geo + AS)
         out.extend(self.build_sensor_context(session.sensor_hostname))
         out.extend(self.build_attacker_context(session.events[0], session=session))
 
-        ipv4_id = generate_ipv4_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
         ip_ind = self.build_ip_indicator(session.src_ip, session=session)
@@ -1772,11 +1832,11 @@ class STIXBuilder:
         for k, v in meta.items():
             session.meta.setdefault(k, v)
 
-        # Foundation: sensor + attacker context (IPv4 + geo + AS)
+        # Foundation: sensor + attacker context (IP v4/v6 + geo + AS)
         out.extend(self.build_sensor_context(session.sensor_hostname))
         out.extend(self.build_attacker_context(event, session=session))
 
-        ipv4_id = generate_ipv4_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
         ip_ind = self.build_ip_indicator(session.src_ip, session=session)
@@ -1919,7 +1979,7 @@ class STIXBuilder:
         out.extend(self.build_sensor_context(session.sensor_hostname))
         out.extend(self.build_attacker_context(event, session=session))
 
-        ipv4_id = generate_ipv4_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # Scan classification + payload fingerprint — computed once, reused
         # for both the indicator labels/description and the Sighting text.
@@ -2032,7 +2092,7 @@ class STIXBuilder:
             attacker_objs = self.build_attacker_context(first, session=session)
             out.extend(attacker_objs)
             if attacker_objs:
-                ipv4_id = generate_ipv4_id(first.src_ip)
+                ipv4_id = attacker_ip_observable_id(first.src_ip)
 
             # IP Indicator + based-on → IPv4
             ip_ind = self.build_ip_indicator(first.src_ip, session=session)
@@ -2082,8 +2142,8 @@ class STIXBuilder:
         *,
         session: Optional[AttackSession] = None,
     ) -> list[dict]:
-        """Build the IPv4 + Location + AutonomousSystem + relationships
-        triple for one event's source.
+        """Build the attacker-IP (IPv4 or IPv6) + Location +
+        AutonomousSystem + relationships triple for one event's source.
 
         Returns a list of STIX dicts (skipping anything already-emitted
         within this bundle).  Used by both the driveby and substantive
@@ -2093,10 +2153,10 @@ class STIXBuilder:
         enrichment + pivot menu external_references.
         """
         out: list[dict] = []
-        ipv4 = self.build_ipv4(event.src_ip, session=session)
-        if not ipv4:
+        ip_obj = self.build_ip_observable(event.src_ip, session=session)
+        if not ip_obj:
             return out
-        out.append(ipv4)
+        out.append(ip_obj)
 
         # GeoIP (logstash-enriched)
         if event.src_country_code:
@@ -2106,7 +2166,7 @@ class STIXBuilder:
             if country:
                 out.append(country)
                 rel = self.build_relationship(
-                    ipv4["id"], "located-at", country["id"],
+                    ip_obj["id"], "located-at", country["id"],
                     description=f"{event.src_ip} geolocated to {event.src_country_code}",
                 )
                 if rel:
@@ -2118,7 +2178,7 @@ class STIXBuilder:
                 if city:
                     out.append(city)
                     rel = self.build_relationship(
-                        ipv4["id"], "located-at", city["id"],
+                        ip_obj["id"], "located-at", city["id"],
                         description=f"{event.src_ip} geolocated to {event.src_city}",
                     )
                     if rel:
@@ -2132,7 +2192,7 @@ class STIXBuilder:
                 out.append(asn)
                 # Use the canonical STIX "belongs-to" for IPv4 → AS
                 rel = self.build_relationship(
-                    ipv4["id"], "belongs-to", asn["id"],
+                    ip_obj["id"], "belongs-to", asn["id"],
                     description=f"{event.src_ip} belongs to AS{event.src_asn}",
                 )
                 if rel:
@@ -2169,7 +2229,7 @@ class STIXBuilder:
         if ip_ind:
             out.append(ip_ind)
             # based-on → IPv4 observable (already emitted above)
-            ipv4_id = generate_ipv4_id(session.src_ip)
+            ipv4_id = attacker_ip_observable_id(session.src_ip)
             rel = self.build_relationship(
                 ip_ind["id"], "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
@@ -2205,8 +2265,8 @@ class STIXBuilder:
         out = self.build_driveby_session(session)
         if not session.src_ip or not session.events:
             return out
-        ipv4_id = generate_ipv4_id(session.src_ip)
-        ind_id = generate_ip_indicator_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
+        ind_id = attacker_ip_indicator_id(session.src_ip)
 
         # URL observables (parser-validated full URLs), capped.
         seen: set[str] = set()
@@ -2312,7 +2372,7 @@ class STIXBuilder:
         out = self.build_driveby_session(session)
         if not session.src_ip or not session.events:
             return out
-        ipv4_id = generate_ipv4_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         if session.commands:
             proc = self.build_process(session, session.commands)
@@ -2384,7 +2444,7 @@ class STIXBuilder:
         out = self.build_driveby_session(session)
         if not session.src_ip:
             return out
-        ipv4_id = generate_ipv4_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
         for fp in (session.hassh, session.ja3):
             if not fp:
                 continue
@@ -2414,8 +2474,8 @@ class STIXBuilder:
         out = self.build_driveby_session(session)
         if not session.src_ip or not session.events:
             return out
-        ipv4_id = generate_ipv4_id(session.src_ip)
-        ind_id = generate_ip_indicator_id(session.src_ip)
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
+        ind_id = attacker_ip_indicator_id(session.src_ip)
 
         interacted = (
             bool(session.commands)

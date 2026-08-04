@@ -70,10 +70,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Parser → builder-method dispatch (the V0 parser-vs-builder separation rule)
 # ---------------------------------------------------------------------------
-# Parsers stay pure (parse + correlate + has_substance). The per-parser
-# STIX shape lives in STIXBuilder.build_<x>_session methods. The
-# orchestrator dispatches via session.event_type. Anything not listed
-# here flows through builder.build_driveby_session() (the minimal
+# Parsers stay pure (parse + correlate only — they do NOT gate emission).
+# The per-parser STIX shape lives in STIXBuilder.build_<x>_session methods.
+# The orchestrator dispatches via session.event_type; the one emission gate
+# is `_is_bare_scan()` below, applied to the generic scan paths. Anything
+# not listed here flows through builder.build_driveby_session() (the minimal
 # IP+Sighting graph used for one-shot probes).
 #
 # Add a row when a parser gains a dedicated builder method.

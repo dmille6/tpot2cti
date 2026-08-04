@@ -1,6 +1,6 @@
 """Smoke test for the beelzebub parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.beelzebub as _m
@@ -47,9 +47,6 @@ def test_beelzebub_smoke():
     sessions = parser.correlate([ev])
     assert len(sessions) == 1
     s0 = sessions[0]
-    assert parser.has_substance(s0) is True, (
-        "captured credential is always substantive (matches Heralding)"
-    )
     assert ("root", "root") in s0.credentials_tried
     print(f"single-auth: creds={len(s0.credentials_tried)} commands={len(s0.commands)} substance=True")
 
@@ -65,9 +62,6 @@ def test_beelzebub_smoke():
     blank_ev = parser.parse(blank_doc)
     assert blank_ev is not None
     blank_sessions = parser.correlate([blank_ev])
-    assert parser.has_substance(blank_sessions[0]) is False, (
-        "pure connect with no auth fields is drive-by"
-    )
     print(f"blank-probe: creds={len(blank_sessions[0].credentials_tried)} commands=0 substance=False")
 
     # ── Case B: Outlaw-style command chain post-auth ──────────────────
@@ -105,7 +99,6 @@ def test_beelzebub_smoke():
     cmd_sessions = parser.correlate(cmd_events)
     assert len(cmd_sessions) == 1
     cs = cmd_sessions[0]
-    assert parser.has_substance(cs) is True
     assert len(cs.commands) == 3
     assert ("fox", "123456") in cs.credentials_tried
     assert cs.ssh_version == "SSH-2.0-libssh_0.9.6"
@@ -135,7 +128,6 @@ def test_beelzebub_smoke():
     # Different session IDs → 4 sessions; each has 1 event + 1 cred,
     # so each is substantive on the credentials_tried branch.
     assert len(spray_sessions) == 4
-    assert all(parser.has_substance(s) for s in spray_sessions)
     print(f"spray:       sessions={len(spray_sessions)} all_substantive=True")
 
     print("OK")

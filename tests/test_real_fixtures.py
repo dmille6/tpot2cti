@@ -49,8 +49,7 @@ def test_real_docs_parse_without_exceptions(path):
     # may be intentionally dropped, e.g. suricata non-alert telemetry).
     assert parsed, f"{os.path.basename(path)}: parser dropped ALL real docs"
 
-    sessions = parser.correlate(parsed)   # must not raise
-    assert all(isinstance(parser.has_substance(s), bool) for s in sessions)
+    parser.correlate(parsed)   # must not raise
 
 
 def test_cowrie_real_extraction_is_rich():

@@ -1,6 +1,6 @@
 """Smoke test for the elasticpot parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.elasticpot as _m
@@ -69,11 +69,6 @@ def test_elasticpot_smoke():
     ds = parser.correlate([de])[0]
     cs = parser.correlate([ce])[0]
     ps = parser.correlate([pe])[0]
-
-    # has_substance assertions
-    assert parser.has_substance(ds) is False, "drive-by must NOT be substantive"
-    assert parser.has_substance(cs) is True, "CVE body must be substantive"
-    assert parser.has_substance(ps) is True, "PUT must be substantive"
 
     # CVE was correctly identified
     assert ce.meta.get("matched_cve") == "CVE-2014-3120", (

@@ -147,30 +147,6 @@ class RedishoneypotParser(BaseParser):
                 s.commands.extend(cmds)
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — strict Redis-specific filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Return True iff this session issued at least one command
-        beyond the recon-only set {INFO, PING, COMMAND}.
-
-        Per V1_SPEC §5.12 and LESSONS_LEARNED_FROM_V0.md §2, plain
-        fingerprint chatter is drive-by; CONFIG / SLAVEOF / EVAL / MODULE
-        LOAD / SET / etc. are substance.
-        """
-        if not session.events:
-            return False
-        commands = session.events[0].meta.get("commands_received") or []
-        if not commands:
-            return False
-        for cmd in commands:
-            verb = self._command_verb(cmd)
-            if verb and verb not in _RECON_REDIS_CMDS:
-                return True
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

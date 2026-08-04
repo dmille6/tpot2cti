@@ -1,6 +1,6 @@
 """Smoke test for the suricata parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.suricata as _m
@@ -57,11 +57,7 @@ def test_suricata_smoke():
     session = sessions[0]
     print(f"correlated into {len(sessions)} session(s); session_id={session.session_id}")
 
-    # 3. has_substance — default True
-    assert parser.has_substance(session) is True
-    print(f"  has_substance:    {parser.has_substance(session)}")
-
-    # 4. build STIX via the builder (parser no longer owns build()).
+    # 3. build STIX via the builder (parser no longer owns build()).
     import os
     from tpot2cti.parsers.base import _smoketest_env
     _smoketest_env()

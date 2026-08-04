@@ -1,6 +1,6 @@
 """Smoke test for the mailoney parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.mailoney as _m
@@ -39,9 +39,7 @@ def test_mailoney_smoke():
     drive_sessions = parser.correlate(drive_events)
     assert len(drive_sessions) == 1
     drive = drive_sessions[0]
-    drive_has = parser.has_substance(drive)
-    print(f"drive-by:    commands={drive.commands} creds={len(drive.credentials_tried)} has_data={drive.meta.get('has_data')} substance={drive_has}  (expected False)")
-    assert drive_has is False
+    print(f"drive-by:    commands={drive.commands} creds={len(drive.credentials_tried)} has_data={drive.meta.get('has_data')}")
 
     # ── Case 2: substantive by commands — MAIL/RCPT/DATA ───────────────
     sub_docs = [
@@ -62,9 +60,7 @@ def test_mailoney_smoke():
     sub_sessions = parser.correlate(sub_events)
     assert len(sub_sessions) == 1
     sub = sub_sessions[0]
-    sub_has = parser.has_substance(sub)
-    print(f"substantive: commands={sub.commands} has_data={sub.meta.get('has_data')} substance={sub_has}  (expected True)")
-    assert sub_has is True
+    print(f"substantive: commands={sub.commands} has_data={sub.meta.get('has_data')}")
     assert "MAIL" in sub.commands and "RCPT" in sub.commands and "DATA" in sub.commands
 
     # ── Case 3: substantive by credentials — AUTH attempt ──────────────
@@ -82,9 +78,7 @@ def test_mailoney_smoke():
     auth_sessions = parser.correlate(auth_events)
     assert len(auth_sessions) == 1
     auth = auth_sessions[0]
-    auth_has = parser.has_substance(auth)
-    print(f"auth:        commands={auth.commands} creds={auth.credentials_tried} substance={auth_has}  (expected True)")
-    assert auth_has is True
+    print(f"auth:        commands={auth.commands} creds={auth.credentials_tried}")
     assert ("postmaster", "password123") in auth.credentials_tried
 
     # ── Case 4: no session_id → window correlator path ─────────────────
@@ -101,8 +95,6 @@ def test_mailoney_smoke():
     win_sessions = parser.correlate(win_events)
     assert len(win_sessions) == 1, f"window correlator should collapse to 1 session, got {len(win_sessions)}"
     win = win_sessions[0]
-    win_has = parser.has_substance(win)
-    print(f"window:      events={win.event_count} commands={win.commands} substance={win_has}  (expected True)")
-    assert win_has is True
+    print(f"window:      events={win.event_count} commands={win.commands}")
 
     print("OK")

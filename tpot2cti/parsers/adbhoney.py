@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 
 #: ADBhoney device-info fields we preserve in meta when present.  These
-#: are not "substance" signals (they don't gate has_substance), but
+#: are not "substance" signals (they don't affect emission), but
 #: they're handy for the Note body and downstream analytics.
 _DEVICE_INFO_FIELDS: tuple[str, ...] = (
     "device_serial",
@@ -162,26 +162,6 @@ class AdbhoneyParser(BaseParser):
             for k in ("command", "data_sha256"):
                 if k in meta:
                     session.meta.setdefault(k, meta[k])
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — always True for ADBhoney
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Always True.
-
-        Port 5555 ADB on the open internet is inherently malicious —
-        there is no legitimate reason for a connection to land on the
-        honeypot — so every ADBhoney session warrants the full SDO
-        graph.  This is the deliberate exception to LESSONS §2's
-        "drive-by probes get only a Sighting" rule.
-
-        We override (rather than inherit BaseParser.has_substance's
-        default-True) so the deviation from the general substance-
-        filter convention is explicit at the parser level.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 """Smoke test for the miniprint parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.miniprint as _m
@@ -59,13 +59,6 @@ def test_miniprint_smoke():
     drive_session = parser.correlate([drive_event])[0]
     subs_session = parser.correlate([subs_event])[0]
 
-    drive_has = parser.has_substance(drive_session)
-    subs_has = parser.has_substance(subs_session)
-    print(f"drive-by    has_substance: {drive_has}  (expected False)")
-    print(f"substantive has_substance: {subs_has}  (expected True)")
-    assert drive_has is False, "empty-path empty-body probe must be non-substantive"
-    assert subs_has is True, "PJL job push must be substantive"
-
     # The substantive session must carry the request_path and body in
     # session.meta so the downstream Note builder can quote them.
     assert subs_session.meta.get("request_path", "").startswith("@PJL"), (
@@ -77,20 +70,6 @@ def test_miniprint_smoke():
     )
     assert subs_session.meta.get("matched_print_markers"), (
         "expected at least one print-marker hit on @PJL path"
-    )
-
-    # Also verify a path-only (empty body) PJL probe is substantive.
-    path_only_doc = {
-        **driveby_doc,
-        "src_ip": "198.51.100.34",
-        "request_path": "@PJL INFO ID",
-        "request_body": "",
-    }
-    path_only_event = parser.parse(path_only_doc)
-    assert path_only_event is not None
-    path_only_session = parser.correlate([path_only_event])[0]
-    assert parser.has_substance(path_only_session) is True, (
-        "PJL path alone (empty body) should still be substantive"
     )
 
     print("OK")

@@ -1,7 +1,7 @@
 # Fallback parser — handles any T-Pot honeypot type without a dedicated parser.
 
 Per the V0 parser-vs-builder separation rule, this parser stays pure (model-only):
-parse() + has_substance() only.  The per-protocol STIX shape lives in
+parse() + correlate() only.  The per-protocol STIX shape lives in
 ``STIXBuilder.build_fallback_event``.
 
 Per V1_SPEC.md §5.24 (Fallback parser):
@@ -29,9 +29,12 @@ Design notes:
   sentinel key ``FALLBACK_KEY`` (``"__fallback__"``).  This parser's
   ``type_name`` is set to that sentinel.
 
-* ``has_substance()`` is always ``True``.  Even an empty Note giving
-  operators visibility into "we saw a doc of unknown type" is more
-  useful than silently dropping the event.
+* Emission is governed centrally, not per-parser.  Fallback sessions with
+  interaction, a multi-port sweep, or a payload emit the full graph; the
+  interaction-less bare probes are dropped by ``_is_bare_scan()``
+  (``tpot2cti/main.py``).  Even an empty Note giving operators visibility
+  into "we saw a doc of unknown type" is more useful than silently dropping
+  a substantive event.
 
 * The WARNING log is rate-limited via a module-level set so an
   unrecognized type only logs once per process, not once per event.

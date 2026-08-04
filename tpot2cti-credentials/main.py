@@ -27,6 +27,7 @@ from typing import Iterable
 from config import CredentialsConfig
 from extract import CredentialEvent, extract_credential
 from log import setup_logging
+from query import build_credential_query
 from store import CredentialsStore, CycleCounts
 
 logger = logging.getLogger("tpot2cti.credentials")
@@ -66,17 +67,7 @@ def stream_credential_docs(es, cfg: CredentialsConfig, start: datetime, end: dat
     Mirrors the pagination pattern from tpot2cti.es_client.TpotESClient
     (search_after on @timestamp + _id).
     """
-    query = {
-        "bool": {
-            "must": [
-                {"range": {"@timestamp": {
-                    "gte": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                    "lt": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                }}},
-                {"terms": {"type": list(cfg.credential_types)}},
-            ]
-        }
-    }
+    query = build_credential_query(cfg.credential_types, start, end)
     # `_doc` is the canonical tiebreaker for search_after pagination in ES 8+
     # (`_id` is no longer sortable by default — fielddata disabled). Mirrors
     # the fix applied in tpot2cti/es_client.py during first-live-install.
@@ -174,6 +165,15 @@ def touch_healthcheck(cfg: CredentialsConfig) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
+# After this many CONSECUTIVE zero-event cycles we treat the sidecar as
+# unhealthy (stop touching the healthcheck file → the container reports
+# unhealthy) and log loudly. An internet-facing honeypot should see a steady
+# credential stream, so a sustained zero means the query/tunnel is broken —
+# NOT a quiet moment. This is the guard the sidecar lacked when a `type` vs
+# `type.keyword` bug made it silently collect nothing for weeks.
+_ZERO_EVENT_ALERT_CYCLES = 5
+
+
 def run_forever(cfg: CredentialsConfig) -> int:
     setup_logging(cfg.log_level)
     store = CredentialsStore(cfg.duckdb_path)
@@ -182,11 +182,37 @@ def run_forever(cfg: CredentialsConfig) -> int:
         "tpot2cti-credentials starting: es=%s://%s:%d db=%s interval=%.0fs",
         cfg.es_scheme, cfg.es_host, cfg.es_port, cfg.duckdb_path, cfg.interval_seconds,
     )
+    consecutive_zero = 0
+    seen_nonzero = False  # arm the zero-alarm only after credentials have flowed
     try:
         while True:
             try:
-                run_cycle(es, store, cfg)
-                touch_healthcheck(cfg)
+                counts = run_cycle(es, store, cfg)
+                if counts.events_processed > 0:
+                    consecutive_zero = 0
+                    seen_nonzero = True
+                    touch_healthcheck(cfg)
+                else:
+                    consecutive_zero += 1
+                    # Only report unhealthy once we've PROVEN the query works
+                    # (at least one nonzero cycle). A brand-new or genuinely
+                    # quiet deployment that has never seen traffic stays
+                    # healthy — we can't distinguish "quiet" from "broken"
+                    # until credentials have flowed at least once. After that,
+                    # a sustained zero is a real regression on an internet-
+                    # facing honeypot.
+                    if seen_nonzero and consecutive_zero >= _ZERO_EVENT_ALERT_CYCLES:
+                        # Do NOT touch the healthcheck → container goes unhealthy.
+                        logger.warning(
+                            "credential sidecar has processed ZERO events for %d "
+                            "consecutive cycles after previously seeing traffic "
+                            "(credential_types=%s). Check the ES query field (must "
+                            "be `type.keyword`), the configured types, and the SSH "
+                            "tunnel. Reporting unhealthy until credentials flow again.",
+                            consecutive_zero, list(cfg.credential_types),
+                        )
+                    else:
+                        touch_healthcheck(cfg)
             except Exception as exc:
                 logger.warning("Cycle failed: %s", exc, exc_info=True)
             time.sleep(cfg.interval_seconds)
