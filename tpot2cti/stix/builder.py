@@ -703,7 +703,17 @@ class STIXBuilder:
             obj["labels"] = sorted(set(
                 parser_labels_for(session.event_type, session.sensor_hostname) + ["attack-pattern"]
             ))
-        return self._dedup(self._stamp(obj, add_confidence=False)) or obj
+        # NOTE: return the dedup result directly (None on an already-emitted
+        # id) — like every sibling build_* method. The former ` or obj`
+        # fallback re-emitted the full SDO on every duplicate, and because
+        # build_session_attack_patterns() runs for EVERY session, the ~30
+        # unique techniques were re-minted once per substantive session:
+        # a busy catch-up window produced ~947k duplicate attack-pattern
+        # dicts, ballooning memory and overflowing SQLite's bind-variable
+        # limit in the publisher's pre-dedup state lookup (2026-07-19 →
+        # 08-04 ingestion outage). All five callers already guard with
+        # `if ap:` / `if not ap: continue`, so None is the correct contract.
+        return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_session_attack_patterns(self, session: AttackSession) -> list[dict]:
         """Behaviour-driven ATT&CK techniques for any session.

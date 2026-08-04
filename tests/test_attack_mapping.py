@@ -91,3 +91,38 @@ def test_build_session_attack_patterns_empty_paths(builder):
     assert builder.build_session_attack_patterns(_session()) == []          # no signal
     no_ip = _session(commands=["id"]); no_ip.src_ip = ""
     assert builder.build_session_attack_patterns(no_ip) == []               # no src_ip
+
+
+def test_attack_patterns_dedupe_across_sessions(builder):
+    """Regression for the 2026-07-19 ingestion outage.
+
+    build_attack_pattern() must return None for an already-emitted
+    technique (like every sibling build_* method) instead of re-minting
+    the full SDO. Because build_session_attack_patterns() runs for EVERY
+    session, the old ` or obj` fallback re-emitted the ~30 unique
+    techniques once per substantive session — a busy catch-up window
+    produced ~947k duplicate attack-pattern dicts that overflowed
+    SQLite's bind-variable limit in the publisher's pre-dedup lookup.
+    """
+    s1 = _session(etype="Cowrie", commands=["id"], malware_hashes=["a" * 64])
+    first = builder.build_session_attack_patterns(s1)
+    first_aps = [o for o in first if o["type"] == "attack-pattern"]
+    assert first_aps, "first session should emit its techniques"
+
+    # A second session from the SAME IP mapping to the SAME techniques
+    # must NOT re-emit those attack-pattern SDOs (they are already in the
+    # bundle, collapsed by deterministic id).
+    s2 = _session(etype="Cowrie", commands=["id"], malware_hashes=["a" * 64])
+    second = builder.build_session_attack_patterns(s2)
+    second_aps = [o for o in second if o["type"] == "attack-pattern"]
+    assert second_aps == [], (
+        "duplicate techniques from a second session must not be re-emitted "
+        "(build_attack_pattern must honour _dedup, not fall back to `or obj`)"
+    )
+
+
+def test_build_attack_pattern_returns_none_on_duplicate(builder):
+    """build_attack_pattern honours the builder's per-bundle dedup contract."""
+    first = builder.build_attack_pattern("Brute Force", mitre_id="T1110")
+    assert first is not None and first["type"] == "attack-pattern"
+    assert builder.build_attack_pattern("Brute Force", mitre_id="T1110") is None

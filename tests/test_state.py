@@ -91,3 +91,34 @@ def test_prune_cycles_keeps_last_n(state_db):
     n = state_db.prune_cycles(keep_last=2)
     assert n == 3
     assert len(state_db.recent_cycles(limit=10)) == 2
+
+
+def test_get_max_state_bulk_chunks_large_id_list(state_db):
+    """Regression for the 2026-07-19 ingestion outage.
+
+    A large bundle produced a stix_id list far exceeding SQLite's
+    ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on older builds), and the
+    single ``WHERE stix_id IN (...)`` raised
+    ``OperationalError: too many SQL variables`` every publish cycle,
+    stalling ingestion. get_max_state_bulk must chunk the lookup so it
+    succeeds regardless of list size, and still return the persisted
+    rows it does have.
+    """
+    # Persist a couple of known rows...
+    known = [
+        ("attack-pattern--" + "0" * 36, 80, ["a"], "n0", "d0"),
+        ("attack-pattern--" + "1" * 36, 55, ["b"], "n1", "d1"),
+    ]
+    state_db.upsert_max_state_bulk(known)
+
+    # ...then look them up inside a list of 5000 ids (well past the 999
+    # limit and past our 500-per-chunk batch size).
+    big = [f"attack-pattern--{i:036d}-x" for i in range(5000)]
+    big[10] = known[0][0]
+    big[4000] = known[1][0]
+
+    out = state_db.get_max_state_bulk(big)  # must NOT raise
+
+    assert set(out) == {known[0][0], known[1][0]}
+    assert out[known[0][0]]["max_score"] == 80
+    assert out[known[1][0]]["labels"] == ["b"]
