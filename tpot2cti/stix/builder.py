@@ -51,6 +51,7 @@ from tpot2cti.stix_ids import (
     generate_ip_indicator_id,
     generate_ipv4_id,
     generate_ipv6_id,
+    generate_malware_id,
     generate_marking_definition_id,
     generate_process_id,
     sdo_id,
@@ -133,6 +134,54 @@ _RECON_LEAD_RE = re.compile(
     r")(\s|$|\|)",
     re.IGNORECASE,
 )
+
+
+#: Vendor labels that are behaviour/category words, not malware families.
+#: Matched EXACTLY (not as substrings) so real names that merely contain one
+#: of these tokens — e.g. "abtrojan" — still pass.
+_GENERIC_MALWARE_FAMILIES: frozenset[str] = frozenset({
+    "trojan", "malware", "generic", "gen", "gen2", "agent", "linux", "elf",
+    "backdoor", "dropper", "downloader", "riskware", "suspicious", "unknown",
+    "packed", "shell", "ddos", "siggen", "virus", "worm", "exploit", "hacktool",
+    "coinminer", "miner", "flooder", "script", "trojandownloader",
+})
+
+#: Three or more consecutive digits is the signature of an auto-generated
+#: vendor detection id (Dr.Web's `r002c0dbc25`, `usblf226`, …) rather than a
+#: real family name. Verified against live hive data: this rejects ~60 such
+#: ids while keeping mirai / gafgyt / multiverze / xmriggo / malxmr / bashdlod.
+_AUTOGEN_FAMILY_RE = re.compile(r"\d{3,}")
+
+
+def normalize_malware_family(raw: Optional[str]) -> Optional[str]:
+    """Normalise a vendor family label, or return ``None`` if unusable.
+
+    Rejects, in order: empty/short tokens, generic behaviour words, and
+    auto-generated vendor detection ids. ``None`` means "do not emit a Malware
+    SDO" — the sample still gets its File observable and labels.
+
+    Emitting a Malware SDO named ``r002c0dbc25`` or ``shell`` would pollute the
+    graph and, once exported, misattribute infrastructure. See
+    ``docs/ENRICHMENT.md`` §7.
+    """
+    if not raw:
+        return None
+    fam = str(raw).strip().lower()
+    # Vendor labels arrive as "trojan.shell/malkey" or "trojan.r002c0dk825";
+    # the family is the most specific trailing token.
+    for sep in (".", "/", ":", "\\"):
+        if sep in fam:
+            fam = fam.rsplit(sep, 1)[-1]
+    fam = fam.strip()
+    if len(fam) < 4:
+        return None
+    if fam in _GENERIC_MALWARE_FAMILIES:
+        return None
+    if _AUTOGEN_FAMILY_RE.search(fam):
+        return None
+    if not fam.replace("-", "").replace("_", "").isalnum():
+        return None
+    return fam
 
 
 def _is_recon_command(cmd: str) -> bool:
@@ -359,10 +408,19 @@ def _ip_score(session: Optional["AttackSession"]) -> int:
         rep = str(session.events[0].raw_doc.get("ip_rep") or "").lower()
     if "known attacker" in rep:
         score += 25
-    elif any(k in rep for k in ("mass scanner", "scanner", "bot", "crawler", "tor", "bad reputation")):
+    elif "bad reputation" in rep:
         score += 12
-    if len(session.dst_ports) >= 5:
-        score += 5
+    # NOTE (2026-08-04): "mass scanner" / "scanner" / "bot" / "crawler" / "tor"
+    # deliberately do NOT raise the score, and neither does broad port fan-out
+    # (formerly +5 for >=5 dst_ports). Those describe COMMODITY MASS-SCANNING —
+    # precisely the population the ENRICH ring exists to suppress
+    # (docs/ENRICHMENT.md §1) — so boosting them here fights every downstream
+    # sharing gate and inflates exactly what must not be published.
+    #
+    # Suppression is expressed as LABELS, never as a lower score: the
+    # publisher's cross-cycle merge keeps max(score) (see
+    # publisher.py::_dedup / state.object_max_state), so a score can only ever
+    # ratchet UP and can never be walked back once inflated.
     return max(10, min(100, score))
 
 
@@ -762,6 +820,46 @@ class STIXBuilder:
             ):
                 out.append(rel)
         return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Malware SDO (family attribution)
+    # ──────────────────────────────────────────────────────────────────
+
+    def build_malware(
+        self,
+        family: str,
+        *,
+        sample_sha256: Optional[str] = None,
+        detection_ratio: Optional[str] = None,
+        source: str = "virustotal",
+    ) -> Optional[dict]:
+        """Malware SDO for a *confirmed, named* family.
+
+        Returns ``None`` unless the family survives
+        :func:`normalize_malware_family` — callers MUST also apply their own
+        detection-count gate before calling. Emitting a Malware SDO for a
+        generic or auto-generated vendor label is worse than emitting nothing:
+        it pollutes the graph and, once exported, misattributes someone else's
+        infrastructure. (The predecessor platform had an abuse.ch key banned
+        for exactly this class of mistake.)
+        """
+        fam = normalize_malware_family(family)
+        if not fam:
+            return None
+        obj = {
+            "type": "malware",
+            "id": generate_malware_id(fam),
+            "name": fam,
+            "is_family": True,
+            "labels": sorted({f"source:{source}", "malware-family"}),
+        }
+        bits = [f"Malware family {fam!r} attributed from honeypot-captured sample(s)."]
+        if sample_sha256:
+            bits.append(f"First attributed via sha256:{sample_sha256[:16]}….")
+        if detection_ratio:
+            bits.append(f"Multi-engine detection at attribution time: {detection_ratio}.")
+        obj["description"] = " ".join(bits)
+        return self._dedup(self._stamp(obj))
 
     # ──────────────────────────────────────────────────────────────────
     # SCOs (observables)
