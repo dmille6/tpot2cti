@@ -105,6 +105,15 @@ def generate_ipv4_id(ip: str) -> str:
     return sdo_id("ipv4-addr", "ipv4-addr", ip)
 
 
+def generate_ipv6_id(ip: str) -> str:
+    """IPv6-Addr SCO id. Seed: ``ipv6-addr:<ipv6>``.
+
+    Pass the canonical (compressed, lowercase) form so the same address in
+    different textual notations doesn't fork into two ids.
+    """
+    return sdo_id("ipv6-addr", "ipv6-addr", ip)
+
+
 def generate_file_id(sha256: str) -> str:
     """StixFile SCO id. Seed: ``stixfile:sha256:<sha256>``."""
     return sdo_id("file", "stixfile", "sha256", sha256.lower())
