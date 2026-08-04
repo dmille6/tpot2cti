@@ -304,6 +304,10 @@ class HealthServer(ThreadingHTTPServer):
             "no_success_age_s": round(no_success_age_s, 3),
             "cycle_interval_s": self._cycle_interval_seconds,
             "pycti_version": self._pycti_version,
+            # Last cycle's drop breakdown (unparsed / dispatch_error /
+            # self_or_internal / benign_scanner) so an operator can see WHY
+            # events aren't landing without grepping logs. Best-effort.
+            "last_cycle_drops": self._last_cycle_drops(),
         }
 
         # Freshness of the most recent *completed* successful cycle.
@@ -352,6 +356,19 @@ class HealthServer(ThreadingHTTPServer):
             # failed — surface the last error to aid debugging.
             payload["last_cycle_error"] = self._state.get("last_cycle_error")
         return payload, 503
+
+    def _last_cycle_drops(self) -> Optional[dict]:
+        """Return the last cycle's drop-reason breakdown from the state KV.
+
+        ``None`` if none recorded yet or the read/parse fails — health is
+        best-effort and never raises.
+        """
+        try:
+            raw = self._state.get("last_cycle_drops")
+            return json.loads(raw) if raw else None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: last_cycle_drops read failed: {e}")
+            return None
 
     def _heartbeat_age(
         self, now: datetime
