@@ -124,6 +124,33 @@ services:
   # Enabled by setting COMPOSE_PROFILES=credentials in .env.
   # Source/Dockerfile authored in Phase 8; we only declare the service
   # contract here.
+  # ── Malware-sample ingestion (optional; profile: malware) ──────────────
+  # Imports VT-confirmed malware samples from the hive's `malware-samples`
+  # index as File + Indicator + Malware SDOs. Zero third-party API cost — the
+  # verdicts already exist. Runs from the SAME image as the core, as its own
+  # process, so it can never slow or break the honeypot cycle.
+  # See docs/ENRICHMENT.md and docs/ingest/malware.md.
+  tpot2cti-malware-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tpot2cti/core:local
+    container_name: tpot2cti-malware-ingest
+    command: ["python", "-m", "tpot2cti.ingest.malware"]
+    profiles: ["malware"]
+    env_file: [.env]
+    depends_on:
+      tpot2cti-tunnel:
+        condition: service_healthy
+    volumes:
+      - ./data/tpot2cti:/data
+      - ./logs:/var/log/tpot2cti
+    restart: unless-stopped
+    networks: [opencti]
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
+
   tpot2cti-credentials:
     build:
       context: ./tpot2cti-credentials
