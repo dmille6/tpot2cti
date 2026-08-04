@@ -41,15 +41,29 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   `_SQL_VAR_CHUNK = 500`, well under the oldest limit (999), so no bundle size
   can trip it. (`tpot2cti/state.py`)
 
+### Added
+
+- **First end-to-end integration test for `run_cycle`** (`tests/test_run_cycle_integration.py`),
+  closing the V1_SPEC §13 gap where the cycle was only tested indirectly. It
+  drives real sanitized fixtures through the full parse → correlate → build →
+  publish path with fake ES + publisher seams, and carries the integration-level
+  regression guard for this incident: 60 distinct command-running attacker IPs
+  must collapse to a **handful** of AttackPatterns (bounded by the technique
+  allowlist), not one per session. (Surfaced that TEST-NET-sanitized fixture
+  IPs are correctly dropped by the self-filter — tests remap to routable space.)
+
 ### Tests
 
-- Added regression coverage for both fixes (442 passing, up from 439):
+- Added regression coverage for both fixes (446 passing, up from 439):
   - `tests/test_attack_mapping.py::test_attack_patterns_dedupe_across_sessions`
     and `::test_build_attack_pattern_returns_none_on_duplicate` — a duplicate
     technique from a second same-IP session must not be re-emitted.
   - `tests/test_state.py::test_get_max_state_bulk_chunks_large_id_list` —
     `get_max_state_bulk()` over 5,000 ids succeeds and still returns the rows
     it has.
+  - `tests/test_health.py::test_cycling_but_never_succeeding_goes_stale` and
+    `::test_never_succeeded_past_ceiling_goes_stale` — `/health` returns 503
+    once no cycle has completed within the no-success ceiling.
 
 ### Operational note
 
