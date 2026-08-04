@@ -144,13 +144,27 @@ _GENERIC_MALWARE_FAMILIES: frozenset[str] = frozenset({
     "backdoor", "dropper", "downloader", "riskware", "suspicious", "unknown",
     "packed", "shell", "ddos", "siggen", "virus", "worm", "exploit", "hacktool",
     "coinminer", "miner", "flooder", "script", "trojandownloader",
+    "possible", "bash", "python", "perl", "application", "program", "tool",
+    "variant", "heuristic", "behaveslike", "attribute", "encoded", "obfuscated",
+    "botnet", "bot", "rootkit", "adware", "spyware", "ransom", "ransomware",
 })
 
-#: Three or more consecutive digits is the signature of an auto-generated
-#: vendor detection id (Dr.Web's `r002c0dbc25`, `usblf226`, …) rather than a
-#: real family name. Verified against live hive data: this rejects ~60 such
-#: ids while keeping mirai / gafgyt / multiverze / xmriggo / malxmr / bashdlod.
-_AUTOGEN_FAMILY_RE = re.compile(r"\d{3,}")
+#: `gen2`, `gen3`, … are vendor generation counters, not families.
+_GEN_COUNTER_RE = re.compile(r"^gen\d*$")
+
+#: Stems that prefix a vendor's catch-all label (e.g. "genericrxhz"). Matched
+#: as a PREFIX, unlike the exact-match set above.
+_GENERIC_FAMILY_PREFIXES: tuple[str, ...] = (
+    "generic", "heur", "trojan", "malware", "suspicious", "unwanted", "risk",
+)
+
+#: Vendor auto-generated detection ids interleave letters and digits
+#: (`r002c0dbc25`, `r06ec0djq25`, `usblf226`). A live dry run showed that a
+#: "3+ consecutive digits" rule was too weak — `r06ec0djq25` has no such run
+#: and slipped through. Real families in this corpus (mirai, gafgyt,
+#: multiverze, xmriggo, malxmr, bashdlod, miraia) carry NO digits at all, so
+#: two or more digits anywhere is a reliable reject.
+_MAX_FAMILY_DIGITS = 2
 
 
 def normalize_malware_family(raw: Optional[str]) -> Optional[str]:
@@ -177,7 +191,11 @@ def normalize_malware_family(raw: Optional[str]) -> Optional[str]:
         return None
     if fam in _GENERIC_MALWARE_FAMILIES:
         return None
-    if _AUTOGEN_FAMILY_RE.search(fam):
+    if sum(c.isdigit() for c in fam) >= _MAX_FAMILY_DIGITS:
+        return None
+    if fam.startswith(_GENERIC_FAMILY_PREFIXES):
+        return None
+    if _GEN_COUNTER_RE.match(fam):
         return None
     if not fam.replace("-", "").replace("_", "").isalnum():
         return None
@@ -953,7 +971,17 @@ class STIXBuilder:
         name: Optional[str] = None,
         size: Optional[int] = None,
         session: Optional[AttackSession] = None,
+        labels: Optional[list[str]] = None,
+        description: Optional[str] = None,
     ) -> Optional[dict]:
+        """File SCO keyed on SHA-256.
+
+        ``labels`` / ``description`` let a non-session caller (e.g.
+        ``tpot2cti.ingest.malware``) attach context without inventing a fake
+        AttackSession. They are additive: OpenCTI unions labels on upsert, so
+        a File that CORE already created from honeypot logs keeps its existing
+        labels and attacker relationships.
+        """
         if not sha256:
             return None
         sha256_lc = sha256.lower()
@@ -977,6 +1005,12 @@ class STIXBuilder:
                 parser_labels_for(session.event_type, session.sensor_hostname) + ["malware-sample"]
             ))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
+        if labels:
+            obj["x_opencti_labels"] = sorted(set(
+                list(obj.get("x_opencti_labels") or []) + list(labels)
+            ))
+        if description and not obj.get("x_opencti_description"):
+            obj["x_opencti_description"] = description
         refs = _refs_for_file(sha256_lc)
         if refs:
             obj["external_references"] = refs
