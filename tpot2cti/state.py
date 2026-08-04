@@ -173,6 +173,11 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
 class CycleState:
     """SQLite-backed state for the importer cycle loop."""
 
+    # Max STIX ids per ``WHERE ... IN (...)`` batch. Kept well under
+    # SQLite's oldest ``SQLITE_MAX_VARIABLE_NUMBER`` (999) so bulk lookups
+    # never raise "too many SQL variables" regardless of bundle size.
+    _SQL_VAR_CHUNK = 500
+
     def __init__(self, db_path: str | Path = "/opt/connector/data/state.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,32 +520,39 @@ class CycleState:
         every id that has an existing row. Missing ids are absent from
         the result dict (caller treats as "no previous state").
 
-        Bulk-fetches with a single ``WHERE stix_id IN (...)`` to avoid
-        N+1 roundtrips per cycle (cycles emit ~700 objects).
+        Bulk-fetches with ``WHERE stix_id IN (...)`` to avoid N+1
+        roundtrips. The id list is chunked at ``_SQL_VAR_CHUNK`` so a
+        large bundle can never exceed SQLite's bound-variable limit
+        (the default ``SQLITE_MAX_VARIABLE_NUMBER`` is 999 on older
+        builds, 32,766 on newer). An unchunked ``IN (...)`` over a
+        runaway bundle raised ``OperationalError: too many SQL variables``
+        every cycle and stalled ingestion (2026-07-19 → 08-04 outage).
         """
         import json
         if not stix_ids:
             return {}
-        placeholders = ",".join("?" for _ in stix_ids)
         out: dict[str, dict] = {}
         with self._conn() as c:
-            cur = c.execute(
-                f"SELECT stix_id, max_score, labels_json, name, description "
-                f"FROM object_max_state WHERE stix_id IN ({placeholders})",
-                stix_ids,
-            )
-            for row in cur:
-                stix_id, max_score, labels_json, name, description = row
-                try:
-                    labels = json.loads(labels_json) if labels_json else []
-                except Exception:
-                    labels = []
-                out[stix_id] = {
-                    "max_score": max_score,
-                    "labels": labels,
-                    "name": name,
-                    "description": description,
-                }
+            for i in range(0, len(stix_ids), self._SQL_VAR_CHUNK):
+                chunk = stix_ids[i:i + self._SQL_VAR_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = c.execute(
+                    f"SELECT stix_id, max_score, labels_json, name, description "
+                    f"FROM object_max_state WHERE stix_id IN ({placeholders})",
+                    chunk,
+                )
+                for row in cur:
+                    stix_id, max_score, labels_json, name, description = row
+                    try:
+                        labels = json.loads(labels_json) if labels_json else []
+                    except Exception:
+                        labels = []
+                    out[stix_id] = {
+                        "max_score": max_score,
+                        "labels": labels,
+                        "name": name,
+                        "description": description,
+                    }
         return out
 
     def upsert_max_state_bulk(

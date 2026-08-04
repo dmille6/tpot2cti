@@ -184,4 +184,44 @@ operator running the multi-day window:
 
 5. **Memory drift over a 7-day window?** Container memory was stable through 17 cycles (~4 hours); a 7-day soak is the realistic test.
 
+---
+
+## Known incidents
+
+### 2026-07-19 → 2026-08-04 — silent ingestion stall ("healthy but stuck")
+
+**Symptom:** `last_run` frozen at 2026-07-19 01:47 UTC for ~16.5 days
+while the container reported healthy and cycles kept starting. Every
+cycle read ~2.9M events, built a bundle, then failed at publish with:
+
+```
+sqlite3.OperationalError: too many SQL variables
+  tpot2cti/publisher.py  → self.state.get_max_state_bulk(stix_ids)
+  tpot2cti/state.py      → WHERE stix_id IN ( …one '?' per object… )
+```
+
+**Root cause (two stacked bugs):**
+1. `build_attack_pattern()` re-emitted duplicate AttackPattern SDOs
+   (`... or obj` defeating the per-bundle dedup), so a 1-day catch-up
+   window emitted ~947k attack-patterns (~96% of the bundle).
+2. `get_max_state_bulk()` bound one SQL variable per object in a single
+   `IN (...)`, overflowing SQLite's limit on that oversized list.
+
+Because the cursor only advances on publish success (correct, by
+design), the failure meant `last_run` never moved → permanent retry of
+the same window.
+
+**Fix:** dedup attack-patterns at the builder + chunk the state lookup
+(`_SQL_VAR_CHUNK = 500`). See `CHANGELOG.md` [Unreleased].
+
+**Why it went unnoticed:** the Docker healthcheck and `/health` report
+process liveness, not cursor progress. **Follow-up (open):** make
+`/health` return 503 when `last_run` is older than N cycle intervals so
+a stall pages the same hour instead of being found by accident.
+
+**Recovery:** the window auto-caps to 1 day when `last_run` is >24h
+stale, so ingestion resumes from *now* forward; the intervening backlog
+is not auto-replayed. Rewind `last_run` manually only if a gap must be
+recovered.
+
 — end of document —
