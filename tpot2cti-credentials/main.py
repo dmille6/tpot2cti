@@ -183,24 +183,32 @@ def run_forever(cfg: CredentialsConfig) -> int:
         cfg.es_scheme, cfg.es_host, cfg.es_port, cfg.duckdb_path, cfg.interval_seconds,
     )
     consecutive_zero = 0
+    seen_nonzero = False  # arm the zero-alarm only after credentials have flowed
     try:
         while True:
             try:
                 counts = run_cycle(es, store, cfg)
                 if counts.events_processed > 0:
                     consecutive_zero = 0
+                    seen_nonzero = True
                     touch_healthcheck(cfg)
                 else:
                     consecutive_zero += 1
-                    if consecutive_zero >= _ZERO_EVENT_ALERT_CYCLES:
+                    # Only report unhealthy once we've PROVEN the query works
+                    # (at least one nonzero cycle). A brand-new or genuinely
+                    # quiet deployment that has never seen traffic stays
+                    # healthy — we can't distinguish "quiet" from "broken"
+                    # until credentials have flowed at least once. After that,
+                    # a sustained zero is a real regression on an internet-
+                    # facing honeypot.
+                    if seen_nonzero and consecutive_zero >= _ZERO_EVENT_ALERT_CYCLES:
                         # Do NOT touch the healthcheck → container goes unhealthy.
                         logger.warning(
                             "credential sidecar has processed ZERO events for %d "
-                            "consecutive cycles (credential_types=%s). An "
-                            "internet-facing honeypot should see a steady stream — "
-                            "check the ES query field (must be `type.keyword`), the "
-                            "configured types, and the SSH tunnel. Reporting "
-                            "unhealthy until credentials flow again.",
+                            "consecutive cycles after previously seeing traffic "
+                            "(credential_types=%s). Check the ES query field (must "
+                            "be `type.keyword`), the configured types, and the SSH "
+                            "tunnel. Reporting unhealthy until credentials flow again.",
                             consecutive_zero, list(cfg.credential_types),
                         )
                     else:
