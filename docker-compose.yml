@@ -171,6 +171,17 @@ services:
       - ./logs:/var/log/tpot2cti
     restart: unless-stopped
     networks: [opencti_default]
+    # Explicit, longer start_period than the image default: the module binds
+    # /health before it connects, but a cold OpenCTI can still make the first
+    # cycle slow. Being marked unhealthy while legitimately warming up is how
+    # a healthy module gets restart-looped.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}

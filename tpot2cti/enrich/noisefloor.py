@@ -52,13 +52,24 @@ from tpot2cti.stix_ids import attacker_ip_observable_id
 
 logger = logging.getLogger(__name__)
 
+
+class ActivityReadError(RuntimeError):
+    """CORE's telemetry could not be read (missing DB, schema drift, bad query).
+
+    Raised rather than returning an empty list so a broken module can never be
+    mistaken for a genuinely quiet fleet.
+    """
+
 #: Distinct honeypot services an IP must touch to count as broad fan-out.
 #: Three is deliberately conservative: two can happen by accident (a scanner
 #: hitting SSH and Telnet), three suggests indiscriminate sweeping.
 FANOUT_SUPPRESS = int(os.environ.get("ENRICH_NOISEFLOOR_FANOUT_SUPPRESS", "3"))
 
 #: How far back to look when classifying.
-WINDOW_HOURS = int(os.environ.get("ENRICH_NOISEFLOOR_WINDOW_HOURS", "168"))
+#: How recently an IP must have been active to be considered this cycle.
+#: NOT a metric window — the counters CORE stores are lifetime totals.
+#: See read_activity() for why that is deliberate.
+WINDOW_HOURS = int(os.environ.get("ENRICH_NOISEFLOOR_ACTIVE_WITHIN_HOURS", "168"))
 
 #: Max IPs classified per cycle (bundle-size guard).
 MAX_PER_CYCLE = int(os.environ.get("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", "2000"))
@@ -67,51 +78,68 @@ STATE_DB_ENV = "ENRICH_NOISEFLOOR_STATE_DB"
 
 #: This module owns these label prefixes and writes no others
 #: (docs/ENRICHMENT.md §8).
-LABEL_NOISE = "noise:fleet-scan"
-LABEL_FOCUSED = "targeted:focused"
+#: Two ORTHOGONAL observations. They are not alternatives: an address can
+#: both sweep broadly and land a real interaction, and that combination is the
+#: single most important case to represent — it is exactly what lets an export
+#: gate say "suppressed as a scanner UNLESS it actually got in".
+LABEL_NOISE = "noise:fleet-scan"          # broad surface/port fan-out
+LABEL_SUBSTANTIVE = "targeted:substantive"  # auth success, commands, or malware
 
 
 # ---------------------------------------------------------------------------
 # Read CORE's telemetry (read-only)
 # ---------------------------------------------------------------------------
 
-def read_activity(core_db: str, *, window_hours: int = WINDOW_HOURS,
-                  limit: int = MAX_PER_CYCLE) -> list[dict]:
-    """Aggregate ``attacker_activity`` per src_ip over the window.
+def read_activity(
+    core_db: str,
+    *,
+    window_hours: int = WINDOW_HOURS,
+    limit: int = MAX_PER_CYCLE,
+) -> list[dict]:
+    """Aggregate CORE's `attacker_activity` telemetry per source IP.
 
-    Reads CORE's state DB **read-only**. This is a read of a WAL database, so
-    it does not contend with CORE's writer, and — unlike the predecessor's
-    equivalent, which re-queried Elasticsearch and burned ~3.65M redundant
-    document reads an hour — the roll-up already exists.
+    **What `window_hours` actually means.** It selects rows *last active*
+    within N hours; it does NOT window the counters. CORE stores one row per
+    `(src_ip, parser, sensor)` with **lifetime** cumulative counts, so the
+    SUMs below are that pair's totals since first contact, not totals for the
+    last N hours. This is deliberate and matches the module's stated rule that
+    observations are never revoked: an IP that authenticated and ran commands
+    six months ago *did that*, and the evidence that lifts export suppression
+    should not silently expire because the attacker went quiet. Read the knob
+    as "how recently must this IP have been active for us to look at it",
+    never as "activity in the last N hours".
+
+    Raises `ActivityReadError` on any DB or schema problem — see that class.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     sql = """
         SELECT src_ip,
-               COUNT(DISTINCT parser)              AS surfaces,
-               COUNT(DISTINCT sensor)              AS sensors,
-               SUM(sessions_count)                 AS sessions,
-               SUM(auth_success_count)             AS auth_success,
-               SUM(commands_count)                 AS commands,
-               SUM(malware_drop_count)             AS malware_drops,
+               COUNT(DISTINCT parser)          AS surfaces,
+               COUNT(DISTINCT sensor)          AS sensors,
+               SUM(sessions_count)             AS sessions,
+               SUM(auth_success_count)         AS auth_success,
+               SUM(commands_count)             AS commands,
+               SUM(malware_drop_count)         AS malware_drops,
                GROUP_CONCAT(sample_dst_ports_json) AS ports_json
           FROM attacker_activity
          WHERE last_seen >= ?
-      GROUP BY src_ip
-      ORDER BY MAX(last_seen) DESC
+         GROUP BY src_ip
+         ORDER BY MAX(last_seen) DESC
          LIMIT ?
     """
     uri = f"file:{core_db}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     except sqlite3.Error as exc:
-        logger.error("noisefloor: cannot open CORE state DB %s: %s", core_db, exc)
-        return []
+        # A missing/unreadable CORE DB is a BROKEN module, not a quiet fleet.
+        # Returning [] here would publish nothing, record a successful cycle
+        # and go green — this project's signature failure, in a new shape.
+        raise ActivityReadError(f"cannot open CORE state DB {core_db}: {exc}") from exc
     try:
         conn.row_factory = sqlite3.Row
         return [dict(r) for r in conn.execute(sql, (since, limit))]
     except sqlite3.Error as exc:
-        logger.error("noisefloor: activity query failed: %s", exc)
-        return []
+        raise ActivityReadError(f"activity query failed: {exc}") from exc
     finally:
         conn.close()
 
@@ -132,12 +160,18 @@ def _distinct_ports(ports_json: Optional[str]) -> int:
 # Classify
 # ---------------------------------------------------------------------------
 
-def classify(row: dict, *, fanout: int = FANOUT_SUPPRESS) -> Optional[str]:
-    """Return a label for one aggregated IP, or ``None`` to stay silent.
+def classify(row: dict, *, fanout: int = FANOUT_SUPPRESS) -> list[str]:
+    """Return zero, one, or BOTH observation labels for one aggregated IP.
 
-    Silence is a valid answer. Labelling an ambiguous middle case is worse
-    than leaving it unlabelled — a wrong suppression hides real intelligence,
-    and a wrong "focused" tag inflates noise into a finding.
+    These are independent observations, never a single verdict. An address that
+    swept 40 ports *and* executed commands gets both — and that pairing is the
+    whole point: `noise:fleet-scan` suppresses shareability, while
+    `targeted:substantive` is the concrete evidence that overrides the
+    suppression. Returning only the first would silently discard the override.
+
+    Silence is still a valid answer. An ambiguous middle case gets no label:
+    a wrong suppression hides real intelligence, and a wrong activity tag
+    inflates noise into a finding.
     """
     substantive = (
         int(row.get("auth_success") or 0)
@@ -149,14 +183,15 @@ def classify(row: dict, *, fanout: int = FANOUT_SUPPRESS) -> Optional[str]:
     # 40 ports is fanning out even though it touched one parser.
     surfaces = max(surfaces, min(_distinct_ports(row.get("ports_json")), 99) // 5)
 
+    labels: list[str] = []
     if surfaces >= fanout:
-        return LABEL_NOISE
-    if surfaces <= 1 and substantive:
-        return LABEL_FOCUSED
-    return None
+        labels.append(LABEL_NOISE)
+    if substantive:
+        labels.append(LABEL_SUBSTANTIVE)
+    return labels
 
 
-def build_objects(builder: STIXBuilder, row: dict, label: str) -> list[dict]:
+def build_objects(builder: STIXBuilder, row: dict, labels: list[str]) -> list[dict]:
     """Attach the classification to the attacker's existing IP observable.
 
     Deterministic ids mean this lands on the observable CORE already created,
@@ -170,7 +205,7 @@ def build_objects(builder: STIXBuilder, row: dict, label: str) -> list[dict]:
     if obj is None:      # already emitted in this bundle
         return []
     obj["x_opencti_labels"] = sorted(
-        set(list(obj.get("x_opencti_labels") or []) + [label])
+        set(list(obj.get("x_opencti_labels") or []) + list(labels))
     )
     return [obj]
 
@@ -185,34 +220,50 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     started = time.monotonic()
     state.heartbeat()
 
-    rows = read_activity(core_db)
+    try:
+        rows = read_activity(core_db)
+    except ActivityReadError as exc:
+        # Fail the cycle loudly: /health goes unhealthy rather than reporting a
+        # successful zero-work run.
+        logger.error("noisefloor cycle %s: %s", cycle_id, exc)
+        state.record_cycle(
+            cycle_id, success=False, events_read=0, events_parsed=0,
+            events_dropped=0, sdos_emitted=0, errors_count=1,
+            duration_seconds=time.monotonic() - started,
+        )
+        return {"cycle_id": cycle_id, "ips": 0, "fleet_scan": 0,
+                "substantive": 0, "unlabelled": 0, "already": 0,
+                "publish_ok": False, "read_error": str(exc)}
     builder = builder_factory()
     objects: list[dict] = [
         builder.build_operator_identity(),
         builder.build_tlp_marking(),
     ]
     n_foundation = len(objects)
-    counts = {LABEL_NOISE: 0, LABEL_FOCUSED: 0, "unlabelled": 0}
+    counts = {LABEL_NOISE: 0, LABEL_SUBSTANTIVE: 0, "unlabelled": 0}
     pending_marks: list[tuple[str, str]] = []
 
     already = 0
     for row in rows:
-        label = classify(row)
-        if label is None:
+        labels = classify(row)
+        if not labels:
             counts["unlabelled"] += 1
             continue
-        # Skip IPs already carrying this exact classification. Without this the
-        # per-cycle cap would re-label the same busiest IPs forever and the long
-        # tail (tens of thousands of addresses) would never be reached.
-        seen_key = f"nf:{row.get('src_ip')}"
-        if state.get(seen_key) == label:
+        ip = row.get("src_ip")
+        # Cache per (ip, LABEL) — not one value per ip — so a later observation
+        # can still be added. Without the per-cycle cap this would starve the
+        # long tail (tens of thousands of addresses); with a single-value cache
+        # a scanner that later got in could never gain its evidence label.
+        fresh = [l for l in labels if state.get(f"nf:{ip}:{l}") != "1"]
+        if not fresh:
             already += 1
             continue
-        objs = build_objects(builder, row, label)
+        objs = build_objects(builder, row, fresh)
         if objs:
-            counts[label] += 1
+            for l in fresh:
+                counts[l] = counts.get(l, 0) + 1
+                pending_marks.append((f"nf:{ip}:{l}", "1"))
             objects.extend(objs)
-            pending_marks.append((seen_key, label))
 
     publish_ok = True
     if len(objects) > n_foundation:
@@ -238,19 +289,19 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     duration = time.monotonic() - started
     logger.info(
         "noisefloor cycle %s complete in %.1fs — ips=%d fleet-scan=%d "
-        "focused=%d unlabelled=%d already=%d publish_ok=%s",
+        "substantive=%d unlabelled=%d already=%d publish_ok=%s",
         cycle_id, duration, len(rows), counts[LABEL_NOISE],
-        counts[LABEL_FOCUSED], counts["unlabelled"], already, publish_ok,
+        counts[LABEL_SUBSTANTIVE], counts["unlabelled"], already, publish_ok,
     )
     state.record_cycle(
         cycle_id, success=publish_ok, events_read=len(rows),
-        events_parsed=counts[LABEL_NOISE] + counts[LABEL_FOCUSED],
+        events_parsed=counts[LABEL_NOISE] + counts[LABEL_SUBSTANTIVE],
         events_dropped=counts["unlabelled"], sdos_emitted=len(objects),
         errors_count=0 if publish_ok else 1, duration_seconds=duration,
     )
     return {
         "cycle_id": cycle_id, "ips": len(rows),
-        "fleet_scan": counts[LABEL_NOISE], "focused": counts[LABEL_FOCUSED],
+        "fleet_scan": counts[LABEL_NOISE], "substantive": counts[LABEL_SUBSTANTIVE],
         "unlabelled": counts["unlabelled"], "already": already,
         "publish_ok": publish_ok,
         "duration_seconds": round(duration, 3),
@@ -279,17 +330,22 @@ def main() -> int:  # pragma: no cover - process entrypoint
     # what CORE's /health reads. Sharing would let a quiet enrichment cycle
     # hold CORE's health green while CORE was dead.
     state = CycleState(db_path=own_db)
-    from tpot2cti.main import _connect_opencti
-    opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
-    restore_logging()
-    publisher = Publisher(opencti, state=state,
-                          indexing_delay_seconds=cfg.cycle.indexing_delay_seconds)
-
+    # Bind /health BEFORE connecting: _connect_opencti waits patiently for a
+    # cold platform (up to connect_timeout_seconds, default 300s) while the
+    # image's HEALTHCHECK has a 60s start period. Binding first means a slow
+    # OpenCTI start no longer shows as an unhealthy container.
     health = HealthServer(
-        state, opencti, bind=os.environ.get("ENRICH_NOISEFLOOR_HEALTH_BIND", ":8080"),
+        state, None, bind=os.environ.get("ENRICH_NOISEFLOOR_HEALTH_BIND", ":8080"),
         cycle_interval_seconds=interval,
     )
     health.start_in_background()
+
+    from tpot2cti.main import _connect_opencti
+    opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
+    restore_logging()
+    health._opencti = opencti
+    publisher = Publisher(opencti, state=state,
+                          indexing_delay_seconds=cfg.cycle.indexing_delay_seconds)
 
     stopping = False
 

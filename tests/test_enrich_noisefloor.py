@@ -21,21 +21,29 @@ def _row(**kw):
 # ── classification ───────────────────────────────────────────────────────
 
 def test_broad_surface_fanout_is_noise():
-    assert nf.classify(_row(surfaces=3)) == nf.LABEL_NOISE
-    assert nf.classify(_row(surfaces=9)) == nf.LABEL_NOISE
+    assert nf.classify(_row(surfaces=3)) == [nf.LABEL_NOISE]
+    assert nf.classify(_row(surfaces=9)) == [nf.LABEL_NOISE]
 
 
-def test_single_surface_with_substance_is_focused():
-    assert nf.classify(_row(surfaces=1, commands=5)) == nf.LABEL_FOCUSED
-    assert nf.classify(_row(surfaces=1, auth_success=1)) == nf.LABEL_FOCUSED
-    assert nf.classify(_row(surfaces=1, malware_drops=2)) == nf.LABEL_FOCUSED
+def test_substantive_activity_is_labelled():
+    assert nf.classify(_row(surfaces=1, commands=5)) == [nf.LABEL_SUBSTANTIVE]
+    assert nf.classify(_row(surfaces=1, auth_success=1)) == [nf.LABEL_SUBSTANTIVE]
+    assert nf.classify(_row(surfaces=1, malware_drops=2)) == [nf.LABEL_SUBSTANTIVE]
+
+
+def test_a_scanner_that_actually_got_in_gets_BOTH_labels():
+    """The single most important case, and the one a single-label classifier
+    silently loses. `noise:fleet-scan` suppresses sharing; the export gate only
+    overrides that suppression if the evidence label is *present*. Emitting the
+    fan-out label alone would permanently bury a real intrusion."""
+    both = nf.classify(_row(surfaces=6, commands=5, auth_success=1))
+    assert both == [nf.LABEL_NOISE, nf.LABEL_SUBSTANTIVE]
 
 
 def test_ambiguous_middle_stays_unlabelled():
     """Silence is a valid answer — a wrong suppression hides real intel."""
-    assert nf.classify(_row(surfaces=2)) is None            # 2 surfaces, no substance
-    assert nf.classify(_row(surfaces=1)) is None            # 1 surface, no substance
-    assert nf.classify(_row(surfaces=2, commands=3)) is None
+    assert nf.classify(_row(surfaces=2)) == []            # 2 surfaces, no substance
+    assert nf.classify(_row(surfaces=1)) == []            # 1 surface, no substance
 
 
 def test_works_on_a_SINGLE_sensor_install():
@@ -44,15 +52,15 @@ def test_works_on_a_SINGLE_sensor_install():
     everything there, making the feature useless for its target audience."""
     one_sensor_scan = _row(sensors=1, surfaces=5)
     one_sensor_focused = _row(sensors=1, surfaces=1, commands=9)
-    assert nf.classify(one_sensor_scan) == nf.LABEL_NOISE
-    assert nf.classify(one_sensor_focused) == nf.LABEL_FOCUSED
+    assert nf.classify(one_sensor_scan) == [nf.LABEL_NOISE]
+    assert nf.classify(one_sensor_focused) == [nf.LABEL_SUBSTANTIVE]
 
 
 def test_port_fanout_counts_as_surface_breadth():
     """A Honeytrap-only scanner sweeping many ports is fanning out even though
     it touched a single parser."""
     ports = json.dumps(list(range(1, 41)))
-    assert nf.classify(_row(surfaces=1, ports_json=ports)) == nf.LABEL_NOISE
+    assert nf.classify(_row(surfaces=1, ports_json=ports)) == [nf.LABEL_NOISE]
 
 
 def test_distinct_ports_parses_concatenated_json():
@@ -64,7 +72,7 @@ def test_distinct_ports_parses_concatenated_json():
 # ── build ────────────────────────────────────────────────────────────────
 
 def test_build_attaches_label_to_the_existing_observable(builder):
-    objs = nf.build_objects(builder, _row(), nf.LABEL_NOISE)
+    objs = nf.build_objects(builder, _row(), [nf.LABEL_NOISE])
     assert len(objs) == 1
     o = objs[0]
     assert o["id"] == attacker_ip_observable_id("45.9.1.2"), \
@@ -73,7 +81,12 @@ def test_build_attaches_label_to_the_existing_observable(builder):
 
 
 def test_build_skips_malformed_ip(builder):
-    assert nf.build_objects(builder, _row(src_ip="not-an-ip"), nf.LABEL_NOISE) == []
+    assert nf.build_objects(builder, _row(src_ip="not-an-ip"), [nf.LABEL_NOISE]) == []
+
+
+def test_build_attaches_every_label_at_once(builder):
+    objs = nf.build_objects(builder, _row(), [nf.LABEL_NOISE, nf.LABEL_SUBSTANTIVE])
+    assert set(objs[0]["x_opencti_labels"]) >= {nf.LABEL_NOISE, nf.LABEL_SUBSTANTIVE}
 
 
 # ── reading CORE telemetry ───────────────────────────────────────────────
@@ -108,11 +121,36 @@ def test_read_activity_aggregates_surfaces_per_ip(tmp_path):
     assert rows["45.9.1.2"]["surfaces"] == 3          # three distinct parsers
     assert rows["45.9.1.2"]["auth_success"] == 1
     assert rows["45.9.9.9"]["surfaces"] == 1
-    assert nf.classify(rows["45.9.1.2"]) == nf.LABEL_NOISE
+    assert nf.classify(rows["45.9.1.2"]) == [nf.LABEL_NOISE, nf.LABEL_SUBSTANTIVE]
 
 
-def test_read_activity_is_read_only_and_survives_a_missing_db(tmp_path):
-    assert nf.read_activity(str(tmp_path / "nope.db")) == []
+def test_a_missing_db_RAISES_rather_than_looking_like_a_quiet_fleet(tmp_path):
+    """This test previously asserted the opposite — that a missing DB returns
+    [] — which made a broken module indistinguishable from a fleet with nothing
+    to label: publish nothing, record success, go green. That is this project's
+    signature failure mode, and the test was enforcing it."""
+    with pytest.raises(nf.ActivityReadError):
+        nf.read_activity(str(tmp_path / "nope.db"))
+
+
+def test_schema_drift_RAISES(tmp_path):
+    db = str(tmp_path / "core.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE unrelated (x INT)")
+    conn.commit(); conn.close()
+    with pytest.raises(nf.ActivityReadError):
+        nf.read_activity(db)
+
+
+def test_a_read_failure_makes_the_cycle_fail_and_health_go_unhealthy(cfg, state_db, tmp_path):
+    from tpot2cti.stix.builder import STIXBuilder
+    pub = _Pub()
+    s = nf.run_cycle(cfg, state_db, str(tmp_path / "gone.db"),
+                     lambda: STIXBuilder(cfg), pub)
+    assert s["publish_ok"] is False and "read_error" in s
+    assert pub.objects is None
+    row = state_db.recent_cycles(1)[0]
+    assert not row["success"], "a broken read recorded a SUCCESSFUL cycle"
 
 
 def test_read_activity_never_writes_to_core_db(tmp_path):
@@ -151,7 +189,7 @@ def test_cycle_labels_and_reports(cfg, state_db, tmp_path):
     ])
     pub = _Pub()
     s = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), pub)
-    assert s["fleet_scan"] == 1 and s["focused"] == 1
+    assert s["fleet_scan"] == 1 and s["substantive"] == 1
     assert s["publish_ok"] is True
 
 
@@ -195,6 +233,31 @@ def test_already_classified_ips_are_skipped_so_the_tail_is_reached(cfg, state_db
     assert second["fleet_scan"] == 0 and second["already"] == 1
 
 
+def test_a_scanner_that_later_gets_in_still_earns_the_evidence_label(cfg, state_db, tmp_path):
+    """The skip-cache must key on (ip, label). Keyed on ip alone, an address
+    already marked as a scanner could never gain the evidence label that lifts
+    export suppression — the cache would make the miss permanent."""
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    rows = [("45.9.1.2", p, "s1", 1, 1, 0, 0, 0, 0, now, now, None)
+            for p in ("Cowrie", "Dionaea", "ConPot")]
+    _seed_core_db(db, rows)
+    first = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub())
+    assert first["fleet_scan"] == 1 and first["substantive"] == 0
+
+    # same IP comes back and actually authenticates + runs commands
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE attacker_activity SET auth_success_count=1, "
+                 "commands_count=7 WHERE parser='Cowrie'")
+    conn.commit(); conn.close()
+
+    second = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub())
+    assert second["substantive"] == 1, "evidence label lost to the skip-cache"
+    assert second["fleet_scan"] == 0, "fan-out label re-emitted needlessly"
+
+
 def test_classification_is_recorded_only_after_a_successful_publish(cfg, state_db, tmp_path):
     """A cache that records work which never landed is the failure this project
     keeps re-learning."""
@@ -208,7 +271,8 @@ def test_classification_is_recorded_only_after_a_successful_publish(cfg, state_d
         ("45.9.1.2", "ConPot",  "s1", 1, 1, 0, 0, 0, 0, now, now, None),
     ])
     nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=False))
-    assert state_db.get("nf:45.9.1.2") is None, "recorded despite failed publish"
+    assert state_db.get(f"nf:45.9.1.2:{nf.LABEL_NOISE}") is None, \
+        "recorded despite failed publish"
 
     retry = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=True))
     assert retry["fleet_scan"] == 1, "must retry after a failed publish"
