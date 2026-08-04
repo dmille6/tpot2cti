@@ -72,6 +72,10 @@ FOUNDATION_TYPES: frozenset[str] = frozenset({
     "attack-pattern",
     "location",
     "autonomous-system",
+    # Malware SDOs are referenced by relationships (file --related-to--> malware,
+    # indicator --indicates--> malware), so they must land before the
+    # relationships pass — same rationale as attack-pattern.
+    "malware",
 })
 
 #: Per-event entities the relationships then connect (V1_SPEC §3 line 287).

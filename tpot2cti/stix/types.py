@@ -26,6 +26,7 @@ KNOWN_STIX_TYPES: frozenset[str] = frozenset({
     "location",
     "attack-pattern",
     "autonomous-system",
+    "malware",           # family attribution (ingest/malware.py, ENRICH ring)
 
     # ─── Entities (per V1_SPEC §4) ────────────────────────────────────
     "ipv4-addr",
