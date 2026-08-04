@@ -43,8 +43,9 @@ Why this exists (read this before changing anything!)
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Namespace — DO NOT CHANGE.
@@ -236,8 +237,56 @@ def generate_file_indicator_id(sha256: str) -> str:
 
 
 def generate_ip_indicator_id(ip: str) -> str:
-    """IPv4 Indicator SDO id. Seed: ``indicator:ip:<ipv4>``."""
+    """IP Indicator SDO id. Seed: ``indicator:ip:<ip>`` (v4 or v6).
+
+    Family-agnostic — it just hashes the IP string. Callers must pass the
+    CANONICAL form (see :func:`attacker_ip_indicator_id`) so the same
+    address in different notations doesn't fork into two indicator ids.
+    """
     return sdo_id("indicator", "indicator", "ip", ip)
+
+
+# ---------------------------------------------------------------------------
+# Canonical attacker-IP identity (single source of truth, IPv4 + IPv6)
+# ---------------------------------------------------------------------------
+# Every place that references an attacker IP's observable or indicator id
+# MUST go through these helpers so the id always matches the emitted object,
+# regardless of the address's textual form. Minting an id from a raw,
+# non-canonical string (e.g. an expanded/uppercase IPv6) while the object
+# was emitted under the canonical form produces dangling relationships.
+
+def canonical_ip(raw: Optional[str]) -> Optional[tuple[str, str]]:
+    """Classify + canonicalize an attacker IP string.
+
+    Returns ``("ipv4", canonical)`` or ``("ipv6", canonical)`` (compressed,
+    lowercase for IPv6), or ``None`` for empty/malformed input. An
+    IPv4-mapped IPv6 address (``::ffff:1.2.3.4``) is normalized to its IPv4
+    form so one attacker isn't split across two observable families.
+    """
+    if not raw:
+        return None
+    try:
+        addr = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return ("ipv6", str(addr)) if addr.version == 6 else ("ipv4", str(addr))
+
+
+def attacker_ip_observable_id(raw: Optional[str]) -> Optional[str]:
+    """Deterministic SCO id for an attacker IP (IPv4 or IPv6), or None."""
+    fam = canonical_ip(raw)
+    if fam is None:
+        return None
+    kind, canon = fam
+    return generate_ipv6_id(canon) if kind == "ipv6" else generate_ipv4_id(canon)
+
+
+def attacker_ip_indicator_id(raw: Optional[str]) -> Optional[str]:
+    """Deterministic Indicator id for an attacker IP (IPv4 or IPv6), or None."""
+    fam = canonical_ip(raw)
+    return generate_ip_indicator_id(fam[1]) if fam else None
 
 
 def generate_campaign_id(artifact_key: str) -> str:

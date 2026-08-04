@@ -12,9 +12,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
-from tpot2cti.stix_ids import generate_ipv4_id, generate_ipv6_id
+from tpot2cti.stix_ids import (
+    attacker_ip_indicator_id,
+    attacker_ip_observable_id,
+    canonical_ip,
+    generate_ipv4_id,
+    generate_ipv6_id,
+)
 
 _V6 = "2001:db8::dead:beef"
+_V6_RAW = "2001:0DB8:0:0:0:0:DEAD:BEEF"  # non-canonical (expanded/uppercase) form of _V6
 
 
 def _session(etype="Honeytrap", ip=_V6, **kw):
@@ -79,6 +86,56 @@ def test_build_ip_indicator_ipv6_pattern(builder):
 
 
 # ── End-to-end: a full driveby session over IPv6 ─────────────────────────
+
+# ── Centralized canonical-id helpers (the fix for dangling refs) ─────────
+
+def test_attacker_ip_ids_canonical_across_notations():
+    """Every consumer (builder, attacker_profile, campaigns) mints ids via
+    these helpers, so the same address in ANY notation must yield one id."""
+    assert attacker_ip_observable_id(_V6_RAW) == attacker_ip_observable_id(_V6)
+    assert attacker_ip_indicator_id(_V6_RAW) == attacker_ip_indicator_id(_V6)
+    # ...and they equal the canonical-form ids.
+    assert attacker_ip_observable_id(_V6_RAW) == generate_ipv6_id(_V6)
+
+
+def test_helper_ids_match_emitted_builder_objects(builder):
+    """The regression guard: an id from the helper (used by attacker_profile /
+    campaigns / attack-pattern edges) MUST equal the id the builder emits for
+    the SAME non-canonical IPv6 — otherwise those references dangle."""
+    obs = builder.build_ipv6(_V6_RAW)
+    ind = builder.build_ip_indicator(_V6_RAW, session=_session())
+    assert obs["id"] == attacker_ip_observable_id(_V6_RAW)
+    assert ind["id"] == attacker_ip_indicator_id(_V6_RAW)
+
+
+def test_ipv4_mapped_ipv6_normalized_to_ipv4():
+    """`::ffff:1.2.3.4` normalizes to IPv4 so an attacker isn't split across
+    two observable families."""
+    assert canonical_ip("::ffff:1.2.3.4") == ("ipv4", "1.2.3.4")
+    assert attacker_ip_observable_id("::ffff:1.2.3.4") == generate_ipv4_id("1.2.3.4")
+
+
+def test_malformed_ip_yields_no_id():
+    for bad in ("", "not-an-ip", "1.2.3.04", "999.999.999.999", None):
+        assert attacker_ip_observable_id(bad) is None
+        assert attacker_ip_indicator_id(bad) is None
+
+
+def test_non_canonical_ipv6_session_no_ip_dangling(builder):
+    """End-to-end: a full session over a NON-canonical IPv6 has no dangling
+    IP-observable or IP-indicator references (the exact bug the pre-merge
+    review reproduced)."""
+    objs = builder.build_cowrie_session(_session(etype="Cowrie", ip=_V6_RAW))
+    ids = {o["id"] for o in objs}
+    ip_ish = {o["id"] for o in objs if o["type"] in ("ipv6-addr", "ipv4-addr", "indicator")}
+    for o in objs:
+        if o["type"] == "relationship":
+            for ref in (o["source_ref"], o["target_ref"]):
+                # every IP/indicator reference must resolve to an emitted object
+                if ref.split("--")[0] in ("ipv6-addr", "ipv4-addr", "indicator"):
+                    assert ref in ids, f"dangling IP/indicator ref: {ref}"
+    assert ip_ish, "expected ipv6-addr + indicator to be emitted"
+
 
 def test_driveby_session_ipv6_emits_full_graph_without_dangling(builder):
     """The regression: an IPv6 attacker must produce an ipv6-addr observable,

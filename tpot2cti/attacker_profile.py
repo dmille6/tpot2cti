@@ -60,8 +60,8 @@ from tpot2cti.stix_ids import (
     generate_attacker_daily_note_id,
     generate_attacker_profile_note_id,
     generate_attacker_weekly_note_id,
-    generate_ip_indicator_id,
-    generate_ipv4_id,
+    attacker_ip_indicator_id,
+    attacker_ip_observable_id,
     generate_relationship_id,
 )
 
@@ -227,15 +227,15 @@ def emit_live_profile_notes(
             continue
 
         note_id = generate_attacker_profile_note_id(ip)
-        ipv4_id = generate_ipv4_id(ip)
-        ip_ind_id = generate_ip_indicator_id(ip)
+        sco_id = attacker_ip_observable_id(ip)
+        ip_ind_id = attacker_ip_indicator_id(ip)
 
         note_obj = _build_attacker_note(
             builder=builder,
             note_id=note_id,
             abstract=f"Attacker profile — {ip} (live, all-time rolling)",
             body=body,
-            object_refs=[ipv4_id, ip_ind_id],
+            object_refs=[r for r in (sco_id, ip_ind_id) if r],
         )
         if note_obj is None:
             # _dedup said this id already shipped within this bundle (rare
@@ -252,7 +252,7 @@ def emit_live_profile_notes(
         # alone doesn't surface in the relationship browser; mirror the
         # daily-creds Note → sensor pattern).
         rel = builder.build_relationship(
-            note_id, "related-to", ipv4_id,
+            note_id, "related-to", sco_id,
             description=f"Rolling attacker profile for {ip}",
         )
         if rel:
@@ -327,20 +327,20 @@ def emit_daily_summary_notes(
         if not body:
             continue
         note_id = generate_attacker_daily_note_id(ip, utc_date_str)
-        ipv4_id = generate_ipv4_id(ip)
-        ip_ind_id = generate_ip_indicator_id(ip)
+        sco_id = attacker_ip_observable_id(ip)
+        ip_ind_id = attacker_ip_indicator_id(ip)
         note_obj = _build_attacker_note(
             builder=builder,
             note_id=note_id,
             abstract=f"Daily attacker snapshot — {ip} — {utc_date_str} (UTC)",
             body=body,
-            object_refs=[ipv4_id, ip_ind_id],
+            object_refs=[r for r in (sco_id, ip_ind_id) if r],
         )
         if note_obj is None:
             continue
         out.append(note_obj)
         rel = builder.build_relationship(
-            note_id, "related-to", ipv4_id,
+            note_id, "related-to", sco_id,
             description=f"Daily attacker snapshot for {ip} on {utc_date_str}",
         )
         if rel:
@@ -409,20 +409,20 @@ def emit_weekly_summary_notes(
         if not body:
             continue
         note_id = generate_attacker_weekly_note_id(ip, iso_year, iso_week)
-        ipv4_id = generate_ipv4_id(ip)
-        ip_ind_id = generate_ip_indicator_id(ip)
+        sco_id = attacker_ip_observable_id(ip)
+        ip_ind_id = attacker_ip_indicator_id(ip)
         note_obj = _build_attacker_note(
             builder=builder,
             note_id=note_id,
             abstract=f"Weekly attacker snapshot — {ip} — {window_label}",
             body=body,
-            object_refs=[ipv4_id, ip_ind_id],
+            object_refs=[r for r in (sco_id, ip_ind_id) if r],
         )
         if note_obj is None:
             continue
         out.append(note_obj)
         rel = builder.build_relationship(
-            note_id, "related-to", ipv4_id,
+            note_id, "related-to", sco_id,
             description=f"Weekly attacker snapshot for {ip} in {window_label}",
         )
         if rel:

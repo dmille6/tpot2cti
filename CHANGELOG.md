@@ -5,6 +5,26 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Fixed (Tier 2 — pre-merge review round)
+
+- **IPv6 dangling references, centralized.** The first IPv6 pass canonicalized
+  the address for the *observable* id but several sites still minted the
+  *indicator*/observable id from the raw string, so a non-canonical IPv6 (e.g.
+  expanded/uppercase `2001:0DB8:…:DEAD:BEEF`) produced dangling
+  `indicator→attack-pattern`, attacker-profile Note, and campaign edges. Both
+  independent reviewers reproduced it. Fix: a single source of truth in
+  `stix_ids` — `canonical_ip`, `attacker_ip_observable_id`,
+  `attacker_ip_indicator_id` — used everywhere (builder, `attacker_profile`,
+  `campaigns`), replacing the clever-but-misusable `_ip_sco_id(x) or
+  generate_ipv4_id(x)` idiom. IPv4-mapped IPv6 (`::ffff:1.2.3.4`) now normalizes
+  to IPv4 so an attacker isn't split across two observable families, and
+  `build_ipv4` canonicalizes too (so malformed-but-regex-valid IPv4 can't dangle
+  either). New regression tests use non-canonical IPv6.
+- **Credentials health-check won't false-alarm on a quiet install.** The
+  zero-event unhealthy signal now arms only *after* at least one nonzero cycle
+  (proving the query works); a brand-new or genuinely quiet honeypot stays
+  healthy until credentials have flowed at least once.
+
 ### Added (Tier 2 — CORE hardening)
 
 - **IPv6 attacker support.** Previously only `_IPV4_RE` existed, so an IPv6
