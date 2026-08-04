@@ -5,6 +5,19 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Added `docs/ENRICHMENT.md`** — the specification for the ENRICH ring
+  (not yet implemented; marked as such). Establishes: the "emits STIX ⇒ lives
+  in the package" rule that keeps deterministic IDs shared; a three-lane
+  architecture (bulk lists / per-object API / own telemetry) that ships in the
+  core image as separate processes; a zero-signup source tier as the default;
+  the enrichment ledger (cache + budget + backlog + health as one component);
+  write-back rules against the predecessor's "reputation, not graph" failure;
+  and a label-namespace registry. Updated the README roadmap, which previously
+  described a superseded one-connector-per-source plan.
+
+
 ### Fixed (Tier 2 — pre-merge review round)
 
 - **IPv6 dangling references, centralized.** The first IPv6 pass canonicalized
