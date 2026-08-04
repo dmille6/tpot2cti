@@ -272,6 +272,7 @@ See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full list.
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — Full env-var + YAML reference
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — T-Pot + OpenCTI version matrix
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — Common issues + fixes
+- [`docs/ENRICHMENT.md`](docs/ENRICHMENT.md) — Enrichment ring design (zero-cost first)
 - [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — How to contribute
 - [`V1_SPEC.md`](V1_SPEC.md) — The complete v1.0 specification
 
@@ -279,23 +280,30 @@ See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full list.
 
 ## Roadmap
 
-The core importer is intentionally focused. Future companion
-connectors (each its own optional Docker compose service) will layer
-in additional capabilities **without modifying the core**:
+The core importer is intentionally focused. Enrichment layers on as a
+separate **ring** of processes that never modify or slow the core cycle.
 
-| Companion | Purpose | Status |
-|---|---|---|
-| `tpot2cti-malwarebazaar` | Malware family attribution via local CSV mirror + TLSH fuzzy match | Planned |
-| `tpot2cti-firehol` | IP reputation against 14 blocklists | Planned |
-| `tpot2cti-otx` | AlienVault OTX pulse lookups | Planned |
-| `tpot2cti-abuseipdb` | AbuseIPDB reputation scoring | Planned |
-| `tpot2cti-misp` | Bidirectional MISP bridge | Planned |
-| `tpot2cti-mitreattack` | Auto-import MITRE ATT&CK STIX feed | Planned |
-| `tpot2cti-discord` | Daily summary webhook | Possible |
+**Design goal: meaningful enrichment at zero cost, with no signup.** Paid
+providers are optional overlays; no milestone depends on a commercial
+entitlement. The full design is specified in
+[`docs/ENRICHMENT.md`](docs/ENRICHMENT.md).
 
-Each follows the same architectural pattern — attach to OpenCTI's
-Docker network, read T-Pot ES through the same tunnel where applicable,
-write to OpenCTI via pycti. Anyone can contribute one.
+| Ring / lane | Sources | Signup | Status |
+|---|---|---|---|
+| `noisefloor` (own telemetry) | scanner-vs-focused classification | **none** | Specified |
+| `blocklists` (bulk lists) | FireHOL, Spamhaus, Tor, Feodo, CISA KEV | **none** | Specified |
+| `lookup` (per-object API) | Shodan InternetDB, CIRCL hashlookup | **none** | Specified |
+| `lookup` (per-object API) | abuse.ch (MalwareBazaar/URLhaus/ThreatFox), AbuseIPDB | free key | Specified |
+| `lookup` (per-object API) | VirusTotal / GTI | paid | Specified |
+| `ingest/malware` | hive malware samples → Malware SDOs | **none** | Specified |
+| MISP bridge · Discord digest | — | — | Possible |
+
+Enrichment modules ship in the **same image** as the core and run as
+separate processes (one compose service each, opt-in by profile), so they
+share the deterministic-ID and publish stack without duplicating it, while
+keeping full failure isolation. Anyone can contribute a source — see
+[`docs/ENRICHMENT.md`](docs/ENRICHMENT.md) and
+[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 ---
 
