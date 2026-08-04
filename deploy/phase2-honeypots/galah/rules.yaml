@@ -1,4 +1,4 @@
-# ExampleCorp persona — Galah static rules.
+# ExampleCo persona — Galah static rules.
 # Pre-baked because qwen2.5-coder:7b cannot generate full HTML pages within
 # Galah's hardcoded 120s timeout. LLM stays as fallback for paths NOT
 # matched here (~3% of traffic by historical T-Pot tail-of-distribution).

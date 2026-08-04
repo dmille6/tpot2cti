@@ -34,7 +34,7 @@ def test_galah_smoke():
         "request.method": "GET",
         "request.requestURI": "/",
         "request.userAgent": "Mozilla/5.0 (X11; Linux)",
-        "request.headers.Host": "dev.examplecorp.io",
+        "request.headers.Host": "dev.example.com",
     }
     ev = parser.parse(drive_doc)
     assert ev is not None
@@ -60,7 +60,7 @@ def test_galah_smoke():
         "@timestamp": now.isoformat(),
         "request.method": "POST",
         "request.requestURI": "/dashboard/login",
-        "request.body": "email=admin%40examplecorp.io&password=Password123%21",
+        "request.body": "email=admin%40example.com&password=Password123%21",
         "request.bodySha256": "dcc07fe3821626a5067f4f1cdc502ace9af14b2d3814f70344e5a2b5707ef37d",
         "request.userAgent": "Mozilla/5.0",
         "response.metadata.model": "qwen2.5-coder:7b",
@@ -95,7 +95,7 @@ def test_galah_smoke():
     # ── Case 4b: cred extraction populates session.credentials_tried ─
     cred_sessions = parser.correlate([parser.parse(cred_doc)])
     assert len(cred_sessions) == 1
-    assert ("admin@examplecorp.io", "Password123!") in cred_sessions[0].credentials_tried, (
+    assert ("admin@example.com", "Password123!") in cred_sessions[0].credentials_tried, (
         f"expected captured creds, got {cred_sessions[0].credentials_tried}"
     )
     print(f"cred-extract form:      pairs={cred_sessions[0].credentials_tried}")

@@ -2,7 +2,12 @@
 # Phase 2 soak snapshot — gather honeypot capture stats from T-Pot.
 # Runs over SSH against the live T-Pot. Stays under 80 lines of output.
 set -euo pipefail
-SSHCMD="ssh -o StrictHostKeyChecking=no -i /opt/tpot2cti/ssh-keys/id_ed25519 -p 64295 mike@192.0.2.10"
+# Point these at YOUR T-Pot. Never commit a real host/user.
+TPOT_HOST="${TPOT_HOST:-tpot.example.com}"
+TPOT_SSH_USER="${TPOT_SSH_USER:-tpot}"
+TPOT_SSH_PORT="${TPOT_SSH_PORT:-64295}"
+TPOT_SSH_KEY="${TPOT_SSH_KEY:-/opt/tpot2cti/ssh-keys/id_ed25519}"
+SSHCMD="ssh -o StrictHostKeyChecking=no -i ${TPOT_SSH_KEY} -p ${TPOT_SSH_PORT} ${TPOT_SSH_USER}@${TPOT_HOST}"
 
 echo "═══ $(date -u +%Y-%m-%dT%H:%M:%SZ) — Phase 2 soak snapshot ═══"
 echo ""

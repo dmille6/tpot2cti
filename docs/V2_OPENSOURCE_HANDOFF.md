@@ -20,7 +20,7 @@ A fleet of distributed T-Pot honeypot sensors, each customized to
 impersonate a real organization in a specific industry vertical
 (healthcare, MSP, petrochem refinery), ships honeypot events via
 logstash to a central Elasticsearch "hive". A separate compute host
-("ctihost") runs ~20 connectors that pull from the hive, enrich the
+(the "connector host") runs ~20 connectors that pull from the hive, enrich the
 data through ~10 threat-intel sources (VirusTotal, AbuseIPDB, OTX,
 Shodan, GreyNoise, MalwareBazaar, Triage, CrowdStrike, …), and
 publish curated STIX 2.1 objects into OpenCTI for analyst use and
@@ -316,7 +316,7 @@ budget) per month at our current scale.
 
 | Item | Cost | Notes |
 |---|---|---|
-| ctihost host (10-core, 80 GB RAM, 1 TB SSD) | varies | Self-hosted; could be a single ~$200/mo cloud VM |
+| Connector host (10-core, 80 GB RAM, 1 TB SSD) | varies | Self-hosted; could be a single ~$200/mo cloud VM |
 | 3× T-Pot sensors (residential ISP IPs) | low | Existing infra; bandwidth ~10-50 GB/mo each |
 | OpenCTI deployment | $0 | Open-source |
 | VirusTotal / GTI API | $0 (we're on academic/research tier) | Public+enterprise rate limits apply |
@@ -453,7 +453,7 @@ distributed in source comments — especially `hp-connector` and
 ## 9. What's intentionally out of scope for this doc
 
 - **Step-by-step installation.** That's `docs/SENSOR_LESSONS.md` §14
-  for sensors and `README.md` for ctihost.
+  for sensors and `README.md` for the connector host.
 - **OpenCTI deployment.** Vendor-supported; use their docs.
 - **API-key acquisition processes.** Each vendor has its own application
   flow; documented in the per-connector handoffs where relevant.

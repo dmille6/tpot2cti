@@ -8,10 +8,10 @@ req_extensions = req_ext
 [dn]
 C = US
 ST = Louisiana
-L = Baton Rouge
-O = ExampleCorp, LLC
+L = Example City
+O = ExampleCo, LLC
 OU = Engineering
-CN = dev.examplecorp.io
+CN = dev.example.com
 
 [req_ext]
 subjectAltName = @alt_names
@@ -19,6 +19,6 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 
 [alt_names]
-DNS.1 = dev.examplecorp.io
-DNS.2 = *.dev.examplecorp.io
-DNS.3 = examplecorp.io
+DNS.1 = dev.example.com
+DNS.2 = *.dev.example.com
+DNS.3 = example.com

@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Security
+
+- **Removed real infrastructure identifiers from the public repository.**
+  `deploy/phase2-honeypots/soak-snapshot.sh` hard-coded a live sensor address,
+  SSH user and key path (`mike@192.0.2.10`, port 64295); it now reads
+  `TPOT_HOST` / `TPOT_SSH_USER` / `TPOT_SSH_PORT` / `TPOT_SSH_KEY` from the
+  environment with example defaults. `docs/V2_OPENSOURCE_HANDOFF.md` no longer
+  names the real connector host. The live honeypot persona (organisation,
+  domains `*.examplecorp.io`, internal hostnames, staff names, city) is
+  genericised to `ExampleCo` / `*.example.com` across 19 files, and the TLS
+  config renamed to `openssl-dev-example.cnf`.
+
+  **These values were previously committed and are therefore already public in
+  git history — this change stops them being served at HEAD but does not purge
+  history.** Treat the affected sensor address, the `id_ed25519` key and that
+  SSH account as exposed, and assume the published persona is burned for
+  deception purposes.
+
+
 ### Documentation
 
 - **Added `docs/ENRICHMENT.md`** — the specification for the ENRICH ring

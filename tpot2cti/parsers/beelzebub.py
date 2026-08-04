@@ -94,7 +94,7 @@ class BeelzebubParser(BaseParser):
         if (client := doc.get("client")):
             event.meta["ssh_client"] = str(client)
 
-        # Beelzebub's service-name label ("ExampleCorp dev01 - SSH
+        # Beelzebub's service-name label ("ExampleCo dev01 - SSH
         # interactive (hybrid cache + LLM)") is useful as a label.
         if (svc := doc.get("service")):
             event.meta["beelzebub_service"] = str(svc)
