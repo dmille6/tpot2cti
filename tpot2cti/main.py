@@ -486,13 +486,16 @@ def run_cycle(
 
     # Consolidated drop breakdown — every event read is accounted for as
     # exactly one of: parsed, unparsed, dispatch-error, self/internal, benign.
-    events_dropped = events_dropped_unparsed + events_dropped_dispatch
     drop_reasons = {
         "unparsed": events_dropped_unparsed,
         "dispatch_error": events_dropped_dispatch,
         "self_or_internal": events_self_filtered,
         "benign_scanner": benign_stats.total_filtered,
     }
+    # events_dropped is the TOTAL discarded (all reasons), so the intuitive
+    # invariant holds: events_read == events_parsed + events_dropped. The
+    # per-reason split lives in drop_reasons / drops=.
+    events_dropped = sum(drop_reasons.values())
     # Persist the last cycle's drop breakdown so /health can surface it
     # without an operator having to grep logs. Best-effort — never fatal.
     try:
@@ -502,9 +505,7 @@ def run_cycle(
 
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
-        f"events_dropped={events_dropped} events_self_filtered={events_self_filtered} "
-        f"events_benign={benign_stats.total_filtered} "
-        f"drops={drop_reasons} "
+        f"events_dropped={events_dropped} drops={drop_reasons} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"types={sorted(parsed_by_type.keys())}"
     )

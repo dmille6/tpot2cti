@@ -173,12 +173,223 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # HealthServer — the threaded wrapper the main loop uses
 # ---------------------------------------------------------------------------
 
+class HealthStatus:
+    """Pure ``/health`` status computation over :class:`CycleState`.
+
+    Split out from :class:`HealthServer` (which binds a socket in its
+    constructor) so the status logic is unit-testable without opening a
+    port. ``HealthServer`` owns one of these and delegates to it.
+    """
+
+    def __init__(
+        self,
+        state,
+        cycle_interval_seconds: float = 900.0,
+        pycti_version: Optional[str] = None,
+        started_at_monotonic: Optional[float] = None,
+    ) -> None:
+        self._state = state
+        self._cycle_interval_seconds = float(cycle_interval_seconds)
+        self._pycti_version = pycti_version or _detect_pycti_version()
+        self._started_at = (
+            started_at_monotonic
+            if started_at_monotonic is not None
+            else time.monotonic()
+        )
+
+    def compute_status(self) -> tuple[dict, int]:
+        """Return (payload, http_status_code) for the /health response.
+
+        Healthy (200) if EITHER:
+
+          * the last *completed* cycle succeeded within
+            ``STALENESS_MULTIPLIER × interval`` seconds (``liveness:
+            "fresh-cycle"``), OR
+          * a cycle is actively in progress — the cycle loop's heartbeat
+            (``state.heartbeat()``, bumped at cycle start, after the ES
+            stream, and after every publisher pass) is within that window
+            **and** we are not past the no-success ceiling
+            (``liveness: "in-progress"``).
+
+        Otherwise stale (503). The heartbeat arm keeps a heavy
+        long-running cycle from flapping the container to "unhealthy"
+        while it is demonstrably working — but only until the no-success
+        ceiling (``NO_SUCCESS_CEILING_MULTIPLIER × interval``). Past that,
+        a process that keeps *starting* cycles but never *completes* one
+        (the 2026-07-19 stall) correctly reads unhealthy (``liveness:
+        "cycling-no-success"``). A genuinely hung/dead process stops
+        beating, so it still goes stale on schedule.
+
+        The ceiling is measured against the last *successful* cycle. The
+        one subtlety is a fresh install that has never succeeded: a big
+        first cycle can legitimately run longer than the ceiling, so as
+        long as **no cycle has finished yet** we treat it as in-progress
+        (give the first cycle time). Only once a cycle has *completed*
+        without success does the ceiling start from process start — that
+        is the "failing loop" case.
+        """
+        now = datetime.now(timezone.utc)
+        uptime_s = time.monotonic() - self._started_at
+        stale_after_s = self._cycle_interval_seconds * STALENESS_MULTIPLIER
+        max_no_success_s = (
+            self._cycle_interval_seconds * NO_SUCCESS_CEILING_MULTIPLIER
+        )
+
+        last_ts_iso, last_duration_s, last_success, any_completed = \
+            self._cycle_summary()
+        heartbeat_iso, heartbeat_age_s = self._heartbeat_age(now)
+        heartbeat_fresh = (
+            heartbeat_age_s is not None and heartbeat_age_s <= stale_after_s
+        )
+
+        cycle_age_s = _age_seconds(last_ts_iso, now) if last_ts_iso else None
+
+        # Time since a cycle last SUCCEEDED — the signal the heartbeat arm
+        # may not mask past the ceiling:
+        #   * prior success exists      -> age of that success (catches the
+        #     16-day stall: old success + now failing -> past ceiling -> 503)
+        #   * never succeeded, and no cycle has even *finished* yet -> a
+        #     first cycle is still running; give it time (age 0) so a big
+        #     first catch-up on a fresh install doesn't false-alarm
+        #   * never succeeded but cycles have *completed* without success
+        #     -> a failing loop; measure from process start (uptime)
+        if last_success is True and cycle_age_s is not None:
+            no_success_age_s = cycle_age_s
+        elif not any_completed:
+            no_success_age_s = 0.0
+        else:
+            no_success_age_s = uptime_s
+        within_success_ceiling = no_success_age_s <= max_no_success_s
+
+        base: dict[str, Any] = {
+            "uptime_s": round(uptime_s, 3),
+            "stale_after_s": stale_after_s,
+            "max_no_success_s": max_no_success_s,
+            "no_success_age_s": round(no_success_age_s, 3),
+            "cycle_interval_s": self._cycle_interval_seconds,
+            "pycti_version": self._pycti_version,
+            # Last cycle's drop breakdown (unparsed / dispatch_error /
+            # self_or_internal / benign_scanner) so an operator can see WHY
+            # events aren't landing without grepping logs. Best-effort.
+            "last_cycle_drops": self._last_cycle_drops(),
+        }
+
+        # Freshness of the most recent *completed* successful cycle.
+        cycle_fresh = (
+            last_success is True
+            and cycle_age_s is not None
+            and cycle_age_s <= stale_after_s
+        )
+        heartbeat_rescues = heartbeat_fresh and within_success_ceiling
+
+        if cycle_fresh or heartbeat_rescues:
+            payload = {
+                "status": "ok",
+                "liveness": "fresh-cycle" if cycle_fresh else "in-progress",
+                "last_cycle_ts": last_ts_iso,
+                "last_cycle_duration_s": last_duration_s,
+                "age_s": cycle_age_s,
+                "heartbeat_age_s": heartbeat_age_s,
+                **base,
+            }
+            return payload, 200
+
+        # Stale (503). Distinguish the "cycling but never completing"
+        # failure — heartbeat is fresh, so the process is alive and
+        # looping, but no cycle has succeeded within the ceiling — from a
+        # plain dead/hung process, because the remedy differs.
+        cycling_no_success = heartbeat_fresh and not within_success_ceiling
+        payload = {
+            "status": "stale",
+            "liveness": "cycling-no-success" if cycling_no_success else "stale",
+            "last_cycle_ts": last_ts_iso,
+            "last_cycle_duration_s": last_duration_s,
+            "age_s": cycle_age_s,
+            "heartbeat_age_s": heartbeat_age_s,
+            **base,
+        }
+        if last_ts_iso is None or last_success is not True:
+            # Never run a successful cycle, OR the most recent cycle
+            # failed — surface the last error to aid debugging.
+            payload["last_cycle_error"] = self._state.get("last_cycle_error")
+        return payload, 503
+
+    def _cycle_summary(
+        self,
+    ) -> tuple[Optional[str], Optional[float], Optional[bool], bool]:
+        """One ``recent_cycles`` read → (ts, duration, success, any_completed).
+
+        The first three describe the most recent *successful* cycle (so a
+        freshly-failed cycle doesn't flip /health to 503 while a prior
+        success is still inside the staleness window). ``any_completed`` is
+        True if ANY recent cycle has finished (``ended_at`` set) — used to
+        tell "first cycle still running" from "looping without success".
+        Any field may be None / False if state is empty or unreadable;
+        health is best-effort and never raises.
+        """
+        try:
+            rows = self._state.recent_cycles(limit=10)
+        except Exception as e:
+            logger.warning(f"health: state.recent_cycles failed: {e}")
+            return None, None, None, False
+        any_completed = any(row.get("ended_at") for row in rows)
+        for row in rows:
+            if row.get("success") == 1 and row.get("ended_at"):
+                return (
+                    row.get("ended_at"),
+                    row.get("duration_seconds"),
+                    True,
+                    any_completed,
+                )
+        if rows:
+            # Topmost row exists but isn't a success — report failure shape.
+            return (
+                rows[0].get("ended_at"),
+                rows[0].get("duration_seconds"),
+                False,
+                any_completed,
+            )
+        return None, None, None, any_completed
+
+    def _last_cycle_drops(self) -> Optional[dict]:
+        """Return the last cycle's drop-reason breakdown from the state KV.
+
+        ``None`` if none recorded yet or the read/parse fails — health is
+        best-effort and never raises.
+        """
+        try:
+            raw = self._state.get("last_cycle_drops")
+            return json.loads(raw) if raw else None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: last_cycle_drops read failed: {e}")
+            return None
+
+    def _heartbeat_age(
+        self, now: datetime
+    ) -> tuple[Optional[str], Optional[float]]:
+        """Return ``(heartbeat_iso, age_seconds)`` from the state KV.
+
+        Both fields are None if no heartbeat has been recorded yet or the
+        state read fails — health is best-effort and never raises.
+        """
+        try:
+            iso = self._state.get("last_heartbeat_ts")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: heartbeat read failed: {e}")
+            return None, None
+        if not iso:
+            return None, None
+        return iso, _age_seconds(iso, now)
+
+
 class HealthServer(ThreadingHTTPServer):
     """HTTP server wrapping stdlib `ThreadingHTTPServer`.
 
     Subclassing the server (rather than composing it) keeps the
     `state` / `opencti` references on the same object the handler
-    receives via `self.server`, which is the stdlib idiom.
+    receives via `self.server`, which is the stdlib idiom. The status
+    computation itself lives in :class:`HealthStatus` (socket-free and
+    unit-testable); this server just owns one and serves it over HTTP.
 
     Usage::
 
@@ -207,9 +418,15 @@ class HealthServer(ThreadingHTTPServer):
         self._state = state
         self._opencti = opencti
         self._cycle_interval_seconds = float(cycle_interval_seconds)
-        self._started_at = time.monotonic()
         self._thread: Optional[threading.Thread] = None
         self._pycti_version = pycti_version or _detect_pycti_version()
+        # The status logic lives here (socket-free); the server just serves it.
+        self._status = HealthStatus(
+            state,
+            cycle_interval_seconds=self._cycle_interval_seconds,
+            pycti_version=self._pycti_version,
+            started_at_monotonic=time.monotonic(),
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -249,173 +466,12 @@ class HealthServer(ThreadingHTTPServer):
         logger.info("health: stopped")
 
     # ------------------------------------------------------------------
-    # status computation — called by the handler
+    # status computation — delegated to the socket-free HealthStatus
     # ------------------------------------------------------------------
 
     def compute_status(self) -> tuple[dict, int]:
-        """Return (payload, http_status_code) for the /health response.
-
-        Healthy (200) if EITHER:
-
-          * the last *completed* cycle succeeded within
-            ``STALENESS_MULTIPLIER × interval`` seconds (``liveness:
-            "fresh-cycle"``), OR
-          * a cycle is actively in progress — the cycle loop's heartbeat
-            (``state.heartbeat()``, bumped at cycle start, after the ES
-            stream, and after every publisher pass) is within that window
-            **and** a cycle has succeeded within the no-success ceiling
-            (``liveness: "in-progress"``).
-
-        Otherwise stale (503). The heartbeat arm keeps a heavy
-        long-running cycle (a hive-scale publish, or the first big
-        catch-up cycle after a restart) from flapping the container to
-        "unhealthy" while it is demonstrably working — but only until the
-        no-success ceiling (``NO_SUCCESS_CEILING_MULTIPLIER × interval``).
-        Past that, a process that keeps *starting* cycles but never
-        *completes* one (the 2026-07-19 stall) correctly reads unhealthy
-        (``liveness: "cycling-no-success"``) instead of green forever. A
-        genuinely hung/dead process stops beating, so it still goes stale
-        on schedule.
-        """
-        now = datetime.now(timezone.utc)
-        uptime_s = time.monotonic() - self._started_at
-        stale_after_s = self._cycle_interval_seconds * STALENESS_MULTIPLIER
-        max_no_success_s = (
-            self._cycle_interval_seconds * NO_SUCCESS_CEILING_MULTIPLIER
-        )
-
-        last_ts_iso, last_duration_s, last_success = self._last_successful_cycle()
-        heartbeat_iso, heartbeat_age_s = self._heartbeat_age(now)
-
-        # How long since a cycle last SUCCEEDED — or, if none ever has,
-        # since the process started. This is the signal the heartbeat arm
-        # is not allowed to mask past the ceiling.
-        cycle_age_s = _age_seconds(last_ts_iso, now) if last_ts_iso else None
-        if last_success is True and cycle_age_s is not None:
-            no_success_age_s = cycle_age_s
-        else:
-            no_success_age_s = uptime_s
-        within_success_ceiling = no_success_age_s <= max_no_success_s
-
-        base: dict[str, Any] = {
-            "uptime_s": round(uptime_s, 3),
-            "stale_after_s": stale_after_s,
-            "max_no_success_s": max_no_success_s,
-            "no_success_age_s": round(no_success_age_s, 3),
-            "cycle_interval_s": self._cycle_interval_seconds,
-            "pycti_version": self._pycti_version,
-            # Last cycle's drop breakdown (unparsed / dispatch_error /
-            # self_or_internal / benign_scanner) so an operator can see WHY
-            # events aren't landing without grepping logs. Best-effort.
-            "last_cycle_drops": self._last_cycle_drops(),
-        }
-
-        # Freshness of the most recent *completed* successful cycle.
-        cycle_fresh = (
-            last_success is True
-            and cycle_age_s is not None
-            and cycle_age_s <= stale_after_s
-        )
-
-        # Liveness of an in-progress cycle (heartbeat updated as work
-        # lands) — but the heartbeat may only rescue health while a cycle
-        # has succeeded recently enough (the no-success ceiling).
-        heartbeat_fresh = (
-            heartbeat_age_s is not None and heartbeat_age_s <= stale_after_s
-        )
-        heartbeat_rescues = heartbeat_fresh and within_success_ceiling
-
-        if cycle_fresh or heartbeat_rescues:
-            payload = {
-                "status": "ok",
-                "liveness": "fresh-cycle" if cycle_fresh else "in-progress",
-                "last_cycle_ts": last_ts_iso,
-                "last_cycle_duration_s": last_duration_s,
-                "age_s": cycle_age_s,
-                "heartbeat_age_s": heartbeat_age_s,
-                **base,
-            }
-            return payload, 200
-
-        # Stale (503). Distinguish the "cycling but never completing"
-        # failure — heartbeat is fresh, so the process is alive and
-        # looping, but no cycle has succeeded within the ceiling — from a
-        # plain dead/hung process, because the remedy differs.
-        cycling_no_success = heartbeat_fresh and not within_success_ceiling
-        payload = {
-            "status": "stale",
-            "liveness": "cycling-no-success" if cycling_no_success else "stale",
-            "last_cycle_ts": last_ts_iso,
-            "last_cycle_duration_s": last_duration_s,
-            "age_s": cycle_age_s,
-            "heartbeat_age_s": heartbeat_age_s,
-            **base,
-        }
-        if last_ts_iso is None or last_success is not True:
-            # Never run a successful cycle, OR the most recent cycle
-            # failed — surface the last error to aid debugging.
-            payload["last_cycle_error"] = self._state.get("last_cycle_error")
-        return payload, 503
-
-    def _last_cycle_drops(self) -> Optional[dict]:
-        """Return the last cycle's drop-reason breakdown from the state KV.
-
-        ``None`` if none recorded yet or the read/parse fails — health is
-        best-effort and never raises.
-        """
-        try:
-            raw = self._state.get("last_cycle_drops")
-            return json.loads(raw) if raw else None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug(f"health: last_cycle_drops read failed: {e}")
-            return None
-
-    def _heartbeat_age(
-        self, now: datetime
-    ) -> tuple[Optional[str], Optional[float]]:
-        """Return ``(heartbeat_iso, age_seconds)`` from the state KV.
-
-        Both fields are None if no heartbeat has been recorded yet or the
-        state read fails — health is best-effort and never raises.
-        """
-        try:
-            iso = self._state.get("last_heartbeat_ts")
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug(f"health: heartbeat read failed: {e}")
-            return None, None
-        if not iso:
-            return None, None
-        return iso, _age_seconds(iso, now)
-
-    def _last_successful_cycle(
-        self,
-    ) -> tuple[Optional[str], Optional[float], Optional[bool]]:
-        """Pull the most recent row from `state.recent_cycles(1)`.
-
-        Returns `(ended_at_iso, duration_seconds, success)` — any field
-        may be None if state is empty / corrupt.  We scan the last few
-        rows for the most recent SUCCESSFUL row rather than just taking
-        the topmost row, so a freshly-failed cycle doesn't immediately
-        flip /health to 503 if a recent prior success is still inside
-        the staleness window.
-        """
-        try:
-            rows = self._state.recent_cycles(limit=10)
-        except Exception as e:
-            logger.warning(f"health: state.recent_cycles failed: {e}")
-            return None, None, None
-        for row in rows:
-            if row.get("success") == 1 and row.get("ended_at"):
-                return (
-                    row.get("ended_at"),
-                    row.get("duration_seconds"),
-                    True,
-                )
-        # No successful row in recent history.
-        if rows:
-            # Topmost row exists but isn't a success — report failure shape.
-            return rows[0].get("ended_at"), rows[0].get("duration_seconds"), False
-        return None, None, None
+        """Delegate to :class:`HealthStatus` (see there for the contract)."""
+        return self._status.compute_status()
 
 
 # ---------------------------------------------------------------------------
