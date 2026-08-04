@@ -43,6 +43,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ### Added
 
+- **Per-reason drop counters in the cycle summary and `/health`.** The cycle
+  loop previously folded every discarded event into one opaque `events_dropped`
+  bucket — so "why did nothing land?" meant grepping logs. Reads are now
+  accounted for as exactly one of `parsed / unparsed / dispatch_error /
+  self_or_internal / benign_scanner`; the breakdown appears in the cycle
+  summary log (`drops={...}`), the cycle summary dict, and the `/health`
+  payload (`last_cycle_drops`), so a silent-loss regression (e.g. a filter that
+  starts dropping everything) is visible at a glance. (`tpot2cti/main.py`,
+  `tpot2cti/health.py`)
+
 - **First end-to-end integration test for `run_cycle`** (`tests/test_run_cycle_integration.py`),
   closing the V1_SPEC §13 gap where the cycle was only tested indirectly. It
   drives real sanitized fixtures through the full parse → correlate → build →

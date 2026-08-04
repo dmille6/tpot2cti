@@ -106,6 +106,19 @@ def test_one_cycle_produces_graph_and_advances_cursor(cfg, state_db):
     assert "ipv4-addr" in types
     assert "indicator" in types
 
+    # Drop-reason accounting: every read event is exactly one of parsed /
+    # unparsed / dispatch_error / self_or_internal / benign_scanner.
+    dr = summary["drop_reasons"]
+    assert set(dr) == {"unparsed", "dispatch_error", "self_or_internal", "benign_scanner"}
+    accounted = summary["events_parsed"] + sum(dr.values())
+    assert accounted == summary["events_read"], (
+        f"events unaccounted for: read={summary['events_read']} "
+        f"parsed={summary['events_parsed']} drops={dr}"
+    )
+    # The breakdown is also persisted for /health to read.
+    import json as _json
+    assert _json.loads(state_db.get("last_cycle_drops")) == dr
+
 
 def test_attack_patterns_are_technique_bounded_not_per_event(cfg, state_db):
     """Regression guard for the 2026-07-19 stall.
