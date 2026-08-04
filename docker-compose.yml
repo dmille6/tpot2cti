@@ -151,6 +151,30 @@ services:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
 
+  # ── ENRICH: noise floor (optional; profile: enrich) ───────────────────
+  # Classifies attacker IPs as broad-scanning noise vs focused activity using
+  # ONLY our own telemetry — no third party, no signup, no rate limit. Reads
+  # CORE's state DB read-only (mode=ro in code); the mount is writable because
+  # SQLite needs WAL bookkeeping even for readers.
+  # See docs/ENRICHMENT.md and docs/enrich/noisefloor.md.
+  tpot2cti-noisefloor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tpot2cti/core:local
+    container_name: tpot2cti-noisefloor
+    command: ["python", "-m", "tpot2cti.enrich.noisefloor"]
+    profiles: ["enrich"]
+    env_file: [.env]
+    volumes:
+      - ./data/tpot2cti:/data
+      - ./logs:/var/log/tpot2cti
+    restart: unless-stopped
+    networks: [opencti_default]
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
+
   tpot2cti-credentials:
     build:
       context: ./tpot2cti-credentials
