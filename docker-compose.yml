@@ -140,13 +140,13 @@ services:
     profiles: ["malware"]
     env_file: [.env]
     depends_on:
-      tpot2cti-tunnel:
+      tunnel:
         condition: service_healthy
     volumes:
       - ./data/tpot2cti:/data
       - ./logs:/var/log/tpot2cti
     restart: unless-stopped
-    networks: [opencti]
+    networks: [opencti_default]
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
