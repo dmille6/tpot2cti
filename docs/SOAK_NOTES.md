@@ -214,10 +214,19 @@ the same window.
 **Fix:** dedup attack-patterns at the builder + chunk the state lookup
 (`_SQL_VAR_CHUNK = 500`). See `CHANGELOG.md` [Unreleased].
 
-**Why it went unnoticed:** the Docker healthcheck and `/health` report
-process liveness, not cursor progress. **Follow-up (open):** make
-`/health` return 503 when `last_run` is older than N cycle intervals so
-a stall pages the same hour instead of being found by accident.
+**Why it went unnoticed:** the Docker healthcheck and `/health` reported
+process liveness, not cursor progress — cycles kept *starting* (bumping
+the heartbeat) so the old `cycle_fresh OR heartbeat_fresh` rule stayed
+green even though no cycle ever *completed*.
+
+**Detection fix (done):** the heartbeat arm now has a hard ceiling
+(`NO_SUCCESS_CEILING_MULTIPLIER × interval`, default 3×). If no cycle
+*completes successfully* within it, `/health` returns 503 with
+`liveness: "cycling-no-success"` even while the process keeps looping —
+so the Docker healthcheck (`curl -f`) marks the container unhealthy
+within ~3 intervals instead of staying green for weeks. A genuinely long
+single cycle still won't flap (it stays under the ceiling). See
+`tpot2cti/health.py` + `CHANGELOG.md`.
 
 **Recovery:** the window auto-caps to 1 day when `last_run` is >24h
 stale, so ingestion resumes from *now* forward; the intervening backlog

@@ -64,6 +64,19 @@ DEFAULT_BIND: str = ":8080"
 # the request handler.
 STALENESS_MULTIPLIER: float = 2.0
 
+# Hard ceiling on the heartbeat arm: the heartbeat keeps /health green
+# while a cycle is actively working, but it may NOT do so indefinitely.
+# If NO cycle has *completed successfully* within this many intervals,
+# /health goes 503 even though the process is still cycling — because
+# "cycling forever but never succeeding" is a failure, not health.
+#
+# This is the direct fix for the 2026-07-19 → 08-04 stall, where every
+# cycle started (bumping the heartbeat) but failed at publish, so the
+# old `cycle_fresh OR heartbeat_fresh` rule stayed green for 16 days.
+# Set larger than STALENESS_MULTIPLIER so one genuinely long cycle
+# (a big first catch-up) still won't flap the container.
+NO_SUCCESS_CEILING_MULTIPLIER: float = 3.0
+
 
 # ---------------------------------------------------------------------------
 # ISO 8601 duration parsing — we accept the subset T-Pot/V1_SPEC uses
@@ -249,45 +262,66 @@ class HealthServer(ThreadingHTTPServer):
             "fresh-cycle"``), OR
           * a cycle is actively in progress — the cycle loop's heartbeat
             (``state.heartbeat()``, bumped at cycle start, after the ES
-            stream, and after every publisher pass) is within the same
-            window (``liveness: "in-progress"``).
+            stream, and after every publisher pass) is within that window
+            **and** a cycle has succeeded within the no-success ceiling
+            (``liveness: "in-progress"``).
 
-        Otherwise stale (503). The heartbeat arm is what keeps a heavy
+        Otherwise stale (503). The heartbeat arm keeps a heavy
         long-running cycle (a hive-scale publish, or the first big
-        catch-up cycle after a restart — both of which can run longer
-        than the gap the staleness window assumes) from flapping the
-        container to "unhealthy" while it is demonstrably working. A
-        genuinely hung/dead process stops beating, so it still goes
-        stale on schedule.
+        catch-up cycle after a restart) from flapping the container to
+        "unhealthy" while it is demonstrably working — but only until the
+        no-success ceiling (``NO_SUCCESS_CEILING_MULTIPLIER × interval``).
+        Past that, a process that keeps *starting* cycles but never
+        *completes* one (the 2026-07-19 stall) correctly reads unhealthy
+        (``liveness: "cycling-no-success"``) instead of green forever. A
+        genuinely hung/dead process stops beating, so it still goes stale
+        on schedule.
         """
         now = datetime.now(timezone.utc)
         uptime_s = time.monotonic() - self._started_at
         stale_after_s = self._cycle_interval_seconds * STALENESS_MULTIPLIER
+        max_no_success_s = (
+            self._cycle_interval_seconds * NO_SUCCESS_CEILING_MULTIPLIER
+        )
 
         last_ts_iso, last_duration_s, last_success = self._last_successful_cycle()
         heartbeat_iso, heartbeat_age_s = self._heartbeat_age(now)
 
+        # How long since a cycle last SUCCEEDED — or, if none ever has,
+        # since the process started. This is the signal the heartbeat arm
+        # is not allowed to mask past the ceiling.
+        cycle_age_s = _age_seconds(last_ts_iso, now) if last_ts_iso else None
+        if last_success is True and cycle_age_s is not None:
+            no_success_age_s = cycle_age_s
+        else:
+            no_success_age_s = uptime_s
+        within_success_ceiling = no_success_age_s <= max_no_success_s
+
         base: dict[str, Any] = {
             "uptime_s": round(uptime_s, 3),
             "stale_after_s": stale_after_s,
+            "max_no_success_s": max_no_success_s,
+            "no_success_age_s": round(no_success_age_s, 3),
             "cycle_interval_s": self._cycle_interval_seconds,
             "pycti_version": self._pycti_version,
         }
 
         # Freshness of the most recent *completed* successful cycle.
-        cycle_age_s = _age_seconds(last_ts_iso, now) if last_ts_iso else None
         cycle_fresh = (
             last_success is True
             and cycle_age_s is not None
             and cycle_age_s <= stale_after_s
         )
 
-        # Liveness of an in-progress cycle (heartbeat updated as work lands).
+        # Liveness of an in-progress cycle (heartbeat updated as work
+        # lands) — but the heartbeat may only rescue health while a cycle
+        # has succeeded recently enough (the no-success ceiling).
         heartbeat_fresh = (
             heartbeat_age_s is not None and heartbeat_age_s <= stale_after_s
         )
+        heartbeat_rescues = heartbeat_fresh and within_success_ceiling
 
-        if cycle_fresh or heartbeat_fresh:
+        if cycle_fresh or heartbeat_rescues:
             payload = {
                 "status": "ok",
                 "liveness": "fresh-cycle" if cycle_fresh else "in-progress",
@@ -299,10 +333,14 @@ class HealthServer(ThreadingHTTPServer):
             }
             return payload, 200
 
-        # Stale: neither a fresh completed cycle nor a fresh heartbeat.
+        # Stale (503). Distinguish the "cycling but never completing"
+        # failure — heartbeat is fresh, so the process is alive and
+        # looping, but no cycle has succeeded within the ceiling — from a
+        # plain dead/hung process, because the remedy differs.
+        cycling_no_success = heartbeat_fresh and not within_success_ceiling
         payload = {
             "status": "stale",
-            "liveness": "stale",
+            "liveness": "cycling-no-success" if cycling_no_success else "stale",
             "last_cycle_ts": last_ts_iso,
             "last_cycle_duration_s": last_duration_s,
             "age_s": cycle_age_s,
