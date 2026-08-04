@@ -37,6 +37,7 @@ stdlib `http.server`).  No asyncio anywhere.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -420,8 +421,12 @@ def run_cycle(
     # ── Step 1: ES query ──────────────────────────────────────────────
     events_read = 0
     events_parsed = 0
-    events_dropped = 0
-    events_self_filtered = 0  # src_ip matched our own honeypot's IP set
+    # Drop reasons kept separate so "why did events vanish?" is answerable
+    # at a glance (surfaced in the cycle summary + /health). A single opaque
+    # "dropped" bucket is how silent-loss regressions hide.
+    events_dropped_unparsed = 0    # parser returned None (unknown type / below parse floor)
+    events_dropped_dispatch = 0    # parser raised an exception on the doc
+    events_self_filtered = 0  # src_ip is our own honeypot / RFC1918 / reserved
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
@@ -437,11 +442,11 @@ def run_cycle(
             try:
                 event = dispatch(doc)
             except Exception as e:
-                events_dropped += 1
+                events_dropped_dispatch += 1
                 logger.debug(f"cycle {cycle_id}: dispatch raised: {e}")
                 continue
             if event is None:
-                events_dropped += 1
+                events_dropped_unparsed += 1
                 continue
             # Self-filter: drop events whose src_ip is one of our own
             # honeypot's public IPs. Suricata observes both directions of
@@ -479,10 +484,28 @@ def run_cycle(
         )
         raise
 
+    # Consolidated drop breakdown — every event read is accounted for as
+    # exactly one of: parsed, unparsed, dispatch-error, self/internal, benign.
+    drop_reasons = {
+        "unparsed": events_dropped_unparsed,
+        "dispatch_error": events_dropped_dispatch,
+        "self_or_internal": events_self_filtered,
+        "benign_scanner": benign_stats.total_filtered,
+    }
+    # events_dropped is the TOTAL discarded (all reasons), so the intuitive
+    # invariant holds: events_read == events_parsed + events_dropped. The
+    # per-reason split lives in drop_reasons / drops=.
+    events_dropped = sum(drop_reasons.values())
+    # Persist the last cycle's drop breakdown so /health can surface it
+    # without an operator having to grep logs. Best-effort — never fatal.
+    try:
+        state.set("last_cycle_drops", json.dumps(drop_reasons))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"cycle {cycle_id}: could not persist drop reasons: {e}")
+
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
-        f"events_dropped={events_dropped} events_self_filtered={events_self_filtered} "
-        f"events_benign={benign_stats.total_filtered} "
+        f"events_dropped={events_dropped} drops={drop_reasons} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"types={sorted(parsed_by_type.keys())}"
     )
@@ -731,6 +754,7 @@ def run_cycle(
         "events_read": events_read,
         "events_parsed": events_parsed,
         "events_dropped": events_dropped,
+        "drop_reasons": drop_reasons,
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),
