@@ -5,6 +5,37 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Added (Tier 2 — CORE hardening)
+
+- **IPv6 attacker support.** Previously only `_IPV4_RE` existed, so an IPv6
+  `src_ip` produced no observable, no indicator, and no sighting (silent total
+  loss). Added `generate_ipv6_id`, `build_ipv6`, a version-aware
+  `build_ip_observable` dispatcher and `_classify_ip`/`_ip_sco_id` helpers
+  (stdlib `ipaddress`, canonicalized/compressed), made `build_ip_indicator`
+  and `build_attacker_context` version-aware, and switched the session
+  builders' hardcoded `generate_ipv4_id(src_ip)` sites to the version-aware id
+  (with an IPv4-identical fallback). IPv4 behaviour is unchanged; new
+  `tests/test_ipv6.py` covers the observable/indicator/dispatch/canonicalization
+  and a full IPv6 driveby session with no dangling references.
+
+### Changed (Tier 2 — CORE hardening)
+
+- **Deleted the dead `has_substance()` parser contract.** It was defined on
+  every parser and documented as the key emission gate, but the cycle loop
+  never called it — `_is_bare_scan()` (main.py) is the real, single gate.
+  Removed the 26 parser methods + base default (no runtime change), rewrote the
+  comments/docstrings/docs so `_is_bare_scan` is the one documented gate, and
+  cleaned the tests that asserted the dead method.
+
+### Fixed (Tier 2 — CORE hardening)
+
+- **Credentials sidecar queried the wrong field.** `tpot2cti-credentials`
+  filtered on the analyzed `type` (capitalized values match nothing), so it
+  silently collected zero credentials while its healthcheck stayed green (CORE's
+  own credential store was unaffected). Now queries `type.keyword`, reports the
+  container unhealthy after 5 consecutive zero-event cycles, and has a
+  query-shape regression test.
+
 ### Changed (pre-merge review round)
 
 - **`/health` no longer false-alarms on a long *first* cycle.** The no-success
