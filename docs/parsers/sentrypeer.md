@@ -20,10 +20,12 @@ Per V1_SPEC.md §5.19:
     Indicator(ip), Sighting,
     Note with the SIP method + dialed number.
 
-Per docs/LESSONS_LEARNED_FROM_V0.md §2 (substance filter):
+Emission (per docs/LESSONS_LEARNED_FROM_V0.md §2):
     Internet-exposed SIP traffic from strangers is by definition
-    anomalous — every probe is signal.  `has_substance()` always
-    returns True.
+    anomalous — every probe is signal.  Parsers no longer gate
+    emission; the drive-by vs. full-graph decision lives in
+    `_is_bare_scan()` (`tpot2cti/main.py`), and SentryPeer sessions
+    are not routed through the bare-scan drop path.
 
 This parser only `parse()`s and `correlate()`s; the STIX bundle is
 built by the publisher (tpot2cti/stix/builder.py) using the metadata

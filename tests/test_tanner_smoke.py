@@ -1,6 +1,6 @@
 """Smoke test for the tanner parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.tanner as _m
@@ -83,12 +83,6 @@ def test_tanner_smoke():
     xs = parser.correlate([xe])[0]
     cs = parser.correlate([ce])[0]
     es = parser.correlate([ee])[0]
-
-    assert parser.has_substance(ds) is False, "unknown must NOT be substantive"
-    assert parser.has_substance(ss) is True, "sqli must be substantive"
-    assert parser.has_substance(xs) is True, "xss must be substantive"
-    assert parser.has_substance(cs) is True, "cmd_exec must be substantive"
-    assert parser.has_substance(es) is False, "empty must NOT be substantive"
 
     # MITRE technique pre-resolved
     assert se.meta.get("mitre_technique") == {

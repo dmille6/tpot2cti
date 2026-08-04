@@ -1,6 +1,6 @@
 """Smoke test for the honeytrap parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.honeytrap as _m
@@ -67,13 +67,6 @@ def test_honeytrap_smoke():
 
     drive_session = drive_sessions[0]
     subs_session = subs_sessions[0]
-
-    drive_has = parser.has_substance(drive_session)
-    subs_has = parser.has_substance(subs_session)
-    print(f"drive-by has_substance:   {drive_has}  (expected False)")
-    print(f"substantive has_substance: {subs_has}  (expected True)")
-    assert drive_has is False
-    assert subs_has is True
 
     # Need a Config to build STIX. Per refactor, the orchestrator dispatches
     # substantive Honeytrap sessions to builder.build_honeytrap_probe(s).
@@ -148,8 +141,6 @@ def test_honeytrap_smoke():
         f"burst should collapse to 1 session, got {len(scan_sessions)}"
     scan_session = scan_sessions[0]
     assert scan_session.dst_ports == set(cpanel_ports)
-    # Empty payloads but a real sweep → substantive via the port threshold.
-    assert parser.has_substance(scan_session) is True
 
     builder3 = STIXBuilder(cfg)
     scan_objs = builder3.build_honeytrap_probe(scan_session)

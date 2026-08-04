@@ -147,24 +147,6 @@ class RouterParser(BaseParser):
                         session.commands.append(cs)
             if e.dst_port is not None:
                 session.dst_ports.add(e.dst_port)
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — at least one command run
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A router session is substantive iff at least one command
-        was executed.
-
-        Per V1_SPEC §5.23: "Process(joined commands) if any commands
-        run" — the inverse is: no commands → no Process → no full
-        SDO graph, just the drive-by Sighting.  Auth attempts alone
-        do not qualify (the router honeypot accepts default creds
-        almost universally, so authentication is not a substance
-        signal here).
-        """
-        return bool(session.commands)
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

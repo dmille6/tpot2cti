@@ -43,7 +43,7 @@ from tpot2cti.stix_ids import (
     generate_campaign_id,
     generate_cryptographic_key_id,
     generate_file_id,
-    generate_ip_indicator_id,
+    attacker_ip_indicator_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -254,7 +254,7 @@ def emit_campaigns(
 
         # indicator(ip) → indicates → campaign, for each pending member.
         for r in pending:
-            ind_id = generate_ip_indicator_id(r["src_ip"])
+            ind_id = attacker_ip_indicator_id(r["src_ip"])
             if rel := builder.build_relationship(
                 ind_id, "indicates", camp_id,
                 description=(

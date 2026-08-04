@@ -1,6 +1,6 @@
 """Smoke test for the conpot parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.conpot as _m
@@ -74,15 +74,11 @@ def test_conpot_smoke():
     print(f"\ncorrelated into {len(sessions)} session(s)")
 
     for s in sessions:
-        sub = parser.has_substance(s)
         print(
             f"  session src_ip={s.src_ip:<16} "
             f"protocol={s.meta.get('protocol'):<8} "
-            f"event_count={s.event_count} "
-            f"has_substance={sub}"
+            f"event_count={s.event_count}"
         )
-        # Every ConPot session is substantive per V1_SPEC §5.6.
-        assert sub is True, f"ConPot session {s.src_ip} not substantive!"
         assert s.dst_ports, "session.dst_ports should be populated"
         assert s.protocols, "session.protocols should be populated"
 

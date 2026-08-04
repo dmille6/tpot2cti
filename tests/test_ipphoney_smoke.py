@@ -1,6 +1,6 @@
 """Smoke test for the ipphoney parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.ipphoney as _m
@@ -74,15 +74,11 @@ def test_ipphoney_smoke():
     print(f"\ncorrelated into {len(sessions)} session(s)")
 
     for s in sessions:
-        sub = parser.has_substance(s)
         has_attrs = "request_attributes" in s.meta
         print(
             f"  session src_ip={s.src_ip:<16} "
-            f"has_attrs={has_attrs} "
-            f"has_substance={sub}"
+            f"has_attrs={has_attrs}"
         )
-        # Every Ipphoney session is substantive per V1_SPEC §5.15.
-        assert sub is True, f"Ipphoney session {s.src_ip} not substantive!"
 
     # First session must carry the IPP attributes on session.meta.
     assert "request_attributes" in sessions[0].meta

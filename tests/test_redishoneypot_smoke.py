@@ -1,6 +1,6 @@
 """Smoke test for the redishoneypot parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.redishoneypot as _m
@@ -74,11 +74,6 @@ def test_redishoneypot_smoke():
     ss = parser.correlate([se])[0]
     es = parser.correlate([ee])[0]
     empty_s = parser.correlate([empty_e])[0]
-
-    assert parser.has_substance(ds) is False, "INFO/PING/COMMAND must be drive-by"
-    assert parser.has_substance(ss) is True, "CONFIG/SLAVEOF must be substantive"
-    assert parser.has_substance(es) is True, "EVAL must be substantive"
-    assert parser.has_substance(empty_s) is False, "empty must NOT be substantive"
 
     # Commands mirrored onto the session
     assert ss.commands and "CONFIG SET dir /var/spool/cron" in ss.commands

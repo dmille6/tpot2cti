@@ -23,9 +23,11 @@ Per V1_SPEC.md §5.15:
      mirror the attributes onto session.meta to make that possible
      without parser changes.)
 
-Per docs/LESSONS_LEARNED_FROM_V0.md §2 (substance filter):
+Emission (per docs/LESSONS_LEARNED_FROM_V0.md §2):
     IPP probes are rare enough that every one is worth recording.
-    `has_substance()` always returns True.
+    Parsers no longer gate emission; the drive-by vs. full-graph
+    decision lives in `_is_bare_scan()` (`tpot2cti/main.py`), and
+    IPPhoney sessions are not routed through the bare-scan drop path.
 
 This parser only `parse()`s and `correlate()`s; the STIX bundle is
 built by the publisher (tpot2cti/stix/builder.py) using the metadata

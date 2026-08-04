@@ -20,10 +20,9 @@ Per V1_SPEC.md §5.22:
   Substance filter:
     Always substantive.  Honeyaml only listens for IaC config paths;
     by the time a request hits its log, the attacker has already
-    declared scanning intent.  Per docs/LESSONS_LEARNED_FROM_V0.md
-    §2 we still keep `has_substance()` explicit (returning True from
-    a docstring-annotated override is clearer to future maintainers
-    than relying on the BaseParser default).
+    declared scanning intent, so every Honeyaml session is treated as
+    substantive. (Emission is gated centrally by `_is_bare_scan()` in
+    the orchestrator, not per-parser.)
 
   STIX emitted (by the orchestrator from session state):
     - IPv4-Addr

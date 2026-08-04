@@ -1,6 +1,6 @@
 """Smoke test for the honeyaml parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.honeyaml as _m
@@ -61,12 +61,6 @@ def test_honeyaml_smoke():
     bs = parser.correlate([be])[0]
     bos = parser.correlate([bo])[0]
     bgs = parser.correlate([bg])[0]
-
-    # Honeyaml is always substantive — drive-by AND substantive cases
-    # both return True (that IS the contract here).
-    assert parser.has_substance(bs) is True, "Honeyaml bare probe must be substantive"
-    assert parser.has_substance(bos) is True, "Honeyaml body probe must be substantive"
-    assert parser.has_substance(bgs) is True, "Honeyaml big-body probe must be substantive"
 
     # request_path / urls
     assert bs.urls == ["/config.yaml"]

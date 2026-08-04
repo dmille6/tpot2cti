@@ -18,8 +18,10 @@ family (`ADT`) with no trigger; we preserve whatever the doc carries.
 AutonomousSystem, Location (via `build_attacker_context`), Indicator(ip),
 Sighting, and a Note with the HL7 message type.
 
-**Substance:** `has_substance()` always returns `True` — HL7 traffic from
-random internet hosts is anomalous by definition, so each Medpot doc warrants
-the full STIX graph (V1_SPEC §5.9).
+**Emission:** HL7 traffic from random internet hosts is anomalous by
+definition, so each Medpot session warrants the full STIX graph (V1_SPEC §5.9).
+Parsers no longer gate emission — the drive-by vs. full-graph decision is
+centralized in `_is_bare_scan()` (`tpot2cti/main.py`), and Medpot is not routed
+through the bare-scan drop path.
 
 **Default port:** 2575 (conventional HL7 MLLP listener).

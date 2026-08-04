@@ -139,24 +139,6 @@ class TannerParser(BaseParser):
                 s.urls.append(str(url))
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — classified-attack filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Return True iff attack_type is anything other than
-        ``""`` / ``"unknown"`` / ``"none"``.
-
-        Per V1_SPEC §5.17 and LESSONS_LEARNED_FROM_V0.md §2 we want the
-        full STIX graph (with AttackPattern) for every classified web
-        attack TANNER catches; unclassified hits are drive-by.
-        """
-        if not session.events:
-            return False
-        attack_type = str(session.events[0].meta.get("attack_type") or "").lower()
-        return attack_type not in _TANNER_NO_ATTACK
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

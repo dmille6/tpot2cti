@@ -1,6 +1,6 @@
 """Smoke test for the nginx parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.nginx as _m
@@ -82,21 +82,8 @@ def test_nginx_smoke():
     ss = parser.correlate([se])[0]
     es = parser.correlate([ee])[0]
 
-    assert parser.has_substance(ds) is False, "/ + 200 + browser UA must be drive-by"
-    assert parser.has_substance(gs) is True, "/.git scan must be substantive"
-    assert parser.has_substance(ss) is True, "sqlmap UA must be substantive"
-    assert parser.has_substance(es) is True, "500 status must be substantive"
-
     # session.urls populated from request_uri
     assert ds.urls == ["/"]
     assert gs.urls == ["/.git/HEAD"]
-
-    # API / scan URI matching also fires on /api/ path
-    api_doc = {**driveby_doc, "src_ip": "198.51.100.63",
-               "request_uri": "/api/v2/login", "status_code": 200,
-               "user_agent": "Mozilla/5.0"}
-    ae = parser.parse(api_doc)
-    a_s = parser.correlate([ae])[0]
-    assert parser.has_substance(a_s) is True, "/api/ scan URI must be substantive"
 
     print("OK")

@@ -1,6 +1,6 @@
 """Smoke test for the sentrypeer parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.sentrypeer as _m
@@ -78,13 +78,10 @@ def test_sentrypeer_smoke():
     print(f"\ncorrelated into {len(sessions)} session(s)")
 
     for s in sessions:
-        sub = parser.has_substance(s)
         print(
             f"  session src_ip={s.src_ip:<16} "
-            f"method={s.meta.get('sip_method')!r:<10} "
-            f"has_substance={sub}"
+            f"method={s.meta.get('sip_method')!r:<10}"
         )
-        assert sub is True, f"SentryPeer session {s.src_ip} not substantive!"
 
     # ── Per-session assertions ─────────────────────────────────────────
     # REGISTER: method present, no called_number, no intl flag

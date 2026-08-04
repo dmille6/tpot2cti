@@ -24,9 +24,11 @@ Per V1_SPEC.md §5.8:
   Relationships:
     Indicator → indicates → AttackPattern.
 
-Per docs/LESSONS_LEARNED_FROM_V0.md §2 (substance filter):
+Emission (per docs/LESSONS_LEARNED_FROM_V0.md §2):
     DICOM probes are rare enough that every one is interesting.
-    `has_substance()` is overridden to always return True.
+    Parsers no longer gate emission; the drive-by vs. full-graph
+    decision lives in `_is_bare_scan()` (`tpot2cti/main.py`), and
+    Dicompot sessions are not routed through the bare-scan drop path.
 
 This parser only `parse()`s and `correlate()`s; the STIX bundle is
 built by the publisher (tpot2cti/stix/builder.py) using the metadata

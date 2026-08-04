@@ -39,8 +39,7 @@ class IppHoneyParser(BaseParser):
 
     Per V1_SPEC §5.15 every IPP probe is substantive (IPP probes are
     rare → each one worth recording in full).  We use the default
-    one-event-per-session correlator and override `has_substance()` to
-    always return True.
+    one-event-per-session correlator; every session is substantive.
     """
 
     type_name = TYPE_NAME
@@ -137,24 +136,6 @@ class IppHoneyParser(BaseParser):
                 s.meta["request_attributes_truncated"] = True
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — ALWAYS True for Ipphoney
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Every IPP probe is substantive.
-
-        Per V1_SPEC §5.15 and the Phase-4 instructions: IPP traffic
-        from random internet hosts is rare and worth recording in
-        full (IPv4 + AS + Location + Indicator + Sighting).
-
-        See docs/LESSONS_LEARNED_FROM_V0.md §2: per-parser substance
-        decisions, not a global rule.  For Ipphoney the answer is
-        always yes.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
 [![T-Pot](https://img.shields.io/badge/T--Pot-24.04-orange)](https://github.com/telekom-security/tpotce)
 [![OpenCTI](https://img.shields.io/badge/OpenCTI-6.x-009688)](https://github.com/OpenCTI-Platform/opencti)
 [![Status](https://img.shields.io/badge/Status-Beta-yellow)](#project-status)
-[![Tests](https://img.shields.io/badge/tests-447%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-427%20passing-brightgreen)](tests/)
 
 > 🚧 **Status: Beta — feature-complete v1.0, soak-testing in progress.**
 > The importer, the three sidecars, and the install / teardown /
