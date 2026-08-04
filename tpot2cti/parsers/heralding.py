@@ -130,23 +130,6 @@ class HeraldingParser(BaseParser):
                 session.dst_ports.add(port)
             if proto := (e.protocol or meta.get("protocol")):
                 session.protocols.add(str(proto))
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — substance filter per V1_SPEC §5.5
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A Heralding session is substantive when it captured credentials
-        OR generated more than two events (>2 — i.e., the attacker did
-        more than open + close).
-
-        Per docs/LESSONS_LEARNED_FROM_V0.md §2, drive-by sessions still
-        get an IP-Addr + Sighting via the drive-by path; only substantive
-        sessions get the full SDO graph (Indicator, AttackPattern, the
-        eventual daily credentials Note).
-        """
-        return bool(session.credentials_tried) or session.event_count > 2
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

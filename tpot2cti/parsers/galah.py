@@ -267,22 +267,6 @@ class GalahParser(BaseParser):
                     if len(pairs) >= 4:
                         return pairs
         return pairs
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance()
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A Galah session is one HTTP request.  Substantive when the
-        per-event substance flag is True (see parse()) OR the request
-        body yielded captured credentials.
-        """
-        if not session.events:
-            return False
-        if session.credentials_tried:
-            return True
-        return bool(session.events[0].meta.get("galah_substance"))
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

@@ -237,29 +237,6 @@ class CowrieParser(BaseParser):
                     session.domains.append(host)
             except Exception:
                 continue
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — the LESSONS §2 substance filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Per V1_SPEC §5.1:
-
-        Cowrie sessions with no commands, no downloads, and no
-        successful login are emitted as a Sighting only.
-
-        We also count credentials_tried > 0 (the attacker tried something,
-        even if every attempt failed) and event_count > 2 (more than just
-        connect + disconnect) as substantive.
-        """
-        return bool(
-            session.auth_success
-            or session.commands
-            or session.malware_hashes
-            or session.credentials_tried
-            or session.event_count > 2
-        )
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

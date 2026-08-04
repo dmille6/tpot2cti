@@ -1,6 +1,6 @@
 """Smoke test for the h0neytr4p parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.h0neytr4p as _m
@@ -62,13 +62,6 @@ def test_h0neytr4p_smoke():
 
     drive_session = parser.correlate([drive_event])[0]
     subs_session = parser.correlate([subs_event])[0]
-
-    drive_has = parser.has_substance(drive_session)
-    subs_has = parser.has_substance(subs_session)
-    print(f"drive-by    has_substance: {drive_has}  (expected False)")
-    print(f"substantive has_substance: {subs_has}  (expected True)")
-    assert drive_has is False, "plain GET / must be non-substantive"
-    assert subs_has is True, "POST /actuator/env must be substantive"
 
     # The substantive session must carry the URL + domain in aggregates,
     # and the matched_hints list in meta.

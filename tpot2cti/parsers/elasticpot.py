@@ -159,39 +159,6 @@ class ElasticPotParser(BaseParser):
                 s.urls.append(str(url))
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — strict ES-specific filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Return True iff the single event in this session represents
-        an exploitation attempt rather than a drive-by probe.
-
-        Per V1_SPEC §5.11 and LESSONS_LEARNED_FROM_V0.md §2, the bar is:
-          - body matched a known ES exploit signature, OR
-          - request method is not GET (write/script attempt), OR
-          - URL targets /_search with a non-empty body
-            (search-template injection vector).
-        """
-        if not session.events:
-            return False
-        meta = session.events[0].meta
-
-        if meta.get("matched_cve"):
-            return True
-
-        method = str(meta.get("request_method") or "GET").upper()
-        if method and method != "GET":
-            return True
-
-        url = str(meta.get("request_url") or "")
-        body = str(meta.get("request_body") or "")
-        if "/_search" in url and body.strip():
-            return True
-
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

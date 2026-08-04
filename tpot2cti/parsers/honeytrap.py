@@ -273,34 +273,6 @@ class HoneytrapParser(BaseParser):
                 session.meta["payload_sha512"] = sha512
         if tags:
             session.meta["tags"] = tags
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — substance filter per V1_SPEC §5.4
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A Honeytrap burst is substantive iff it either captured a
-        non-trivial payload (> ``SUBSTANCE_PAYLOAD_THRESHOLD`` bytes), swept
-        enough distinct ports to count as a port scan
-        (>= ``SUBSTANCE_PORT_THRESHOLD``), or pulled a follow-up download.
-
-        Single empty-payload touches on one port remain drive-by noise; the
-        builder still records the IPv4-Addr + Sighting, just without the
-        richer scan/payload context.
-        """
-        if not session.events:
-            return False
-        payload = (
-            session.meta.get("payload_printable")
-            or session.events[0].meta.get("payload_printable")
-            or ""
-        )
-        if len(payload) > SUBSTANCE_PAYLOAD_THRESHOLD:
-            return True
-        if len(session.dst_ports) >= SUBSTANCE_PORT_THRESHOLD:
-            return True
-        return bool(session.malware_hashes)
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

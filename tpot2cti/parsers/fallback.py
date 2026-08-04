@@ -103,21 +103,6 @@ class FallbackParser(BaseParser):
         self._populate_geoip(doc, event)
 
         return event
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — always True
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Always substantive.
-
-        Per V1_SPEC §5.24, the fallback exists specifically to guarantee
-        zero data gaps.  Every event of an unknown type contributes
-        *something* (at minimum a Note) so operators can see what their
-        T-Pot is capturing even before a dedicated parser exists.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

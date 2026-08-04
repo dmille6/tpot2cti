@@ -3,8 +3,7 @@
 Each parser is exercised end-to-end on a minimal synthetic doc:
   1. parse() returns a ParsedEvent with the right shape
   2. correlate() returns at least one AttackSession
-  3. has_substance() returns a bool (drive-by suppression discipline)
-  4. The matching builder method emits at least one valid STIX object
+  3. The matching builder method emits at least one valid STIX object
 
 This is the sweep that would have caught the dst_port/dest_port regression
 (commit decc6df) had it existed — every parser is exercised in the same
@@ -77,7 +76,7 @@ def test_parse_missing_src_ip_returns_none_or_empty(type_name, parser_docs, pars
 
 
 # ---------------------------------------------------------------------------
-# correlate() + has_substance()
+# correlate()
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("type_name", _all_parser_types())
@@ -87,15 +86,6 @@ def test_correlate_returns_sessions(type_name, parser_docs, parser_registry):
     event = parser.parse(parser_docs[type_name])
     sessions = parser.correlate([event])
     assert sessions and all(isinstance(s, AttackSession) for s in sessions)
-
-
-@pytest.mark.parametrize("type_name", _all_parser_types())
-def test_has_substance_returns_bool(type_name, parser_docs, parser_registry):
-    """has_substance() must return a bool — not None, not a truthy non-bool."""
-    parser = parser_registry[type_name]
-    event = parser.parse(parser_docs[type_name])
-    s = parser.correlate([event])[0]
-    assert isinstance(parser.has_substance(s), bool)
 
 
 # ---------------------------------------------------------------------------

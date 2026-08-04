@@ -55,8 +55,8 @@ class ConPotParser(BaseParser):
 
     Per V1_SPEC §5.6 every ConPot probe is substantive: even a bare
     Modbus connection to TCP/502 from a stranger is signal.  We use
-    the default one-event-per-session correlator and override
-    `has_substance()` to always return True.
+    the default one-event-per-session correlator; every session is
+    substantive.
     """
 
     type_name = TYPE_NAME
@@ -189,27 +189,6 @@ class ConPotParser(BaseParser):
                 s.meta["request_truncated"] = True
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — ALWAYS True for ConPot
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """ConPot probes are inherently rare and always substantive.
-
-        Per V1_SPEC §5.6 and the user-supplied Phase-4 spec: every
-        ICS/SCADA probe — even an empty connection — is worth the full
-        STIX SDO graph (IPv4 + AS + Location + Indicator + Sighting +
-        Note + AttackPattern).  There is no legitimate reason for a
-        stranger to speak Modbus or S7comm to your IP; the event of
-        them trying IS the signal.
-
-        See also docs/LESSONS_LEARNED_FROM_V0.md §2: the substance
-        filter is per-protocol, not global.  For ConPot the filter
-        is effectively "always on".
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

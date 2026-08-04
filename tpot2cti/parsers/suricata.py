@@ -197,12 +197,7 @@ class SuricataParser(BaseParser):
     # We inherit BaseParser.correlate, which calls AttackSession.from_event
     # for each event.  Per V1_SPEC §5.2 we explicitly do NOT group by
     # flow_id — each alert is its own Sighting.
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — default True
-    # ──────────────────────────────────────────────────────────────────
     # All Suricata alerts are substantive: the rule firing IS the signal.
-    # We inherit BaseParser.has_substance which returns True.
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers

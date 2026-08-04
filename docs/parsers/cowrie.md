@@ -8,9 +8,8 @@ build per-session STIX that captures the full attacker interaction.
 
 Per the V0 parser-vs-builder separation rule ("Honeypot-specific IoC extraction belongs in the
 STIX builder, not the parser"), this parser stays pure (model-only):
-parse() + correlate() + has_substance() only.  The per-protocol STIX
-shape lives in ``STIXBuilder.build_cowrie_session`` — see
-``tpot2cti/stix/builder.py``.
+parse() + correlate() only.  The per-protocol STIX shape lives in
+``STIXBuilder.build_cowrie_session`` — see ``tpot2cti/stix/builder.py``.
 
 Per V1_SPEC.md §5.1:
 
@@ -19,7 +18,9 @@ Per V1_SPEC.md §5.1:
     username, password, input, shasum/sha256, url, version,
     hassh, kex_algs, duration
 
-  Substance filter: Cowrie sessions with no commands, no downloads,
-  and no successful login are emitted as a Sighting only.  Pure
-  probe-and-leave noise gets one-line representation rather than
-  full SDO graph.
+  Emission: Cowrie is a substance-rich parser and always emits — it is
+  NOT routed through the centralized `_is_bare_scan()` drop path in
+  `tpot2cti/main.py`.  The builder still varies the graph richness per
+  session: sessions with no commands, no downloads, and no successful
+  login are represented compactly, while richer sessions get the full
+  SDO graph.

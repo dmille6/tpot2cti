@@ -60,8 +60,8 @@ class MiniprintParser(BaseParser):
 
         Pulls ``request_path`` and ``request_body``, truncates the body
         to :data:`REQUEST_BODY_CAP`, and pre-computes the matched-marker
-        list so :meth:`has_substance` is a dict lookup at evaluation
-        time.
+        list so downstream substance checks are a dict lookup at
+        evaluation time.
 
         Returns ``None`` (logged at DEBUG) for malformed docs.
         """
@@ -133,7 +133,7 @@ class MiniprintParser(BaseParser):
     def correlate(self, events: Iterable[ParsedEvent]) -> list[AttackSession]:
         """Wrap each event in a one-event :class:`AttackSession` and
         mirror Miniprint-specific meta fields to ``session.meta`` so
-        :meth:`has_substance` and the downstream STIX builder read
+        the downstream STIX builder reads
         uniformly-populated session fields.
         """
         sessions: list[AttackSession] = []
@@ -157,34 +157,6 @@ class MiniprintParser(BaseParser):
         ):
             if k in first_meta:
                 session.meta.setdefault(k, first_meta[k])
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — substance filter per V1_SPEC §5.16 + LESSONS §2
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A Miniprint session is substantive iff:
-
-          - the attacker actually sent a non-empty request_body, OR
-          - the request_path matches a known print-job control marker
-            (``@PJL``, ``/printer/``, ``%!PS``, etc.).
-
-        Bare TCP-touch probes (SYN, banner grab, immediate close) leave
-        both fields empty and fall through to the drive-by code path.
-        """
-        if not session.events:
-            return False
-
-        body_length = session.meta.get("body_length") or 0
-        if body_length > 0:
-            return True
-
-        matched = session.meta.get("matched_print_markers") or []
-        if matched:
-            return True
-
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

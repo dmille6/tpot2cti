@@ -21,13 +21,16 @@ Every emitted object:
   - has `created` + `modified` timestamps in ISO 8601 UTC
   - has `confidence` set from config
 
-The substance-filter pattern lives in `BaseParser.has_substance()` —
+The drive-by vs. full-graph decision is centralized in the
+orchestrator's `_is_bare_scan()` (`tpot2cti/main.py`), NOT per-parser —
 the builder doesn't decide what to emit; it only knows HOW to emit
 the things the parser asked for.  The caller pattern is:
 
     parser = get_parser(doc['type'])
     for session in parser.correlate(events):
-        if parser.has_substance(session):
-            stix_objects = builder.build_full_session(session)
-        else:
-            stix_objects = builder.build_driveby_session(session)
+        # Generic catch-all / drive-by paths (Honeytrap, fallback) drop
+        # interaction-less single-target probes; substance-rich parsers
+        # (Cowrie/Galah/Suricata/Beelzebub) always emit.
+        if _is_a_generic_path(parser) and _is_bare_scan(session):
+            continue
+        stix_objects = builder.build_<dispatch>(session)

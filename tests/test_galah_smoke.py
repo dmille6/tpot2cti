@@ -1,6 +1,6 @@
 """Smoke test for the galah parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.galah as _m
@@ -38,8 +38,7 @@ def test_galah_smoke():
     }
     ev = parser.parse(drive_doc)
     assert ev is not None
-    sessions = parser.correlate([ev])
-    assert parser.has_substance(sessions[0]) is False
+    parser.correlate([ev])
     print(f"GET-/ drive-by:         substance=False  url={ev.meta.get('http_url')}")
 
     # ── Case 2: GET /.env — exploit-hint URI → substantive ─────────────
@@ -51,8 +50,7 @@ def test_galah_smoke():
         "request.userAgent": "curl/8.5.0",
     }
     ev = parser.parse(env_doc)
-    sessions = parser.correlate([ev])
-    assert parser.has_substance(sessions[0]) is True
+    parser.correlate([ev])
     assert ev.meta["galah_uri_hint"] is True
     print(f"GET-/.env hint:         substance=True   uri_hint=True")
 
@@ -69,8 +67,7 @@ def test_galah_smoke():
         "response.metadata.provider": "ollama",
     }
     ev = parser.parse(cred_doc)
-    sessions = parser.correlate([ev])
-    assert parser.has_substance(sessions[0]) is True
+    parser.correlate([ev])
     assert ev.meta["galah_cred_capture_path"] is True
     assert ev.meta["http_method"] == "POST"
     assert ev.meta["http_body"].startswith("email=")
@@ -91,8 +88,7 @@ def test_galah_smoke():
         "request.userAgent": "sqlmap/1.7.2#stable (https://sqlmap.org)",
     }
     ev = parser.parse(sqlmap_doc)
-    sessions = parser.correlate([ev])
-    assert parser.has_substance(sessions[0]) is True
+    parser.correlate([ev])
     assert ev.meta["galah_ua_hint"] is True
     print(f"sqlmap UA:              substance=True   ua_hint=True")
 
@@ -130,8 +126,7 @@ def test_galah_smoke():
         },
     }
     ev = parser.parse(nested_doc)
-    sessions = parser.correlate([ev])
-    assert parser.has_substance(sessions[0]) is True
+    parser.correlate([ev])
     assert ev.meta["http_method"] == "POST"
     assert "cmd=cat" in ev.meta["http_body"]
     print(f"nested-shape POST:      substance=True   method={ev.meta['http_method']}")

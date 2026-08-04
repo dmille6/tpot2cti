@@ -1,6 +1,6 @@
 """Smoke test for the fatt parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.fatt as _m
@@ -78,12 +78,7 @@ def test_fatt_smoke():
         f"FATT burst should fold into 1 session, got {len(burst_sessions)}"
     )
 
-    drive_s = drive_sessions[0]
     burst_s = burst_sessions[0]
-
-    # has_substance assertions
-    assert parser.has_substance(drive_s) is False, "empty-fp must be drive-by"
-    assert parser.has_substance(burst_s) is True, "burst with fp must be substantive"
 
     # FIRST non-empty wins for each fp field
     assert burst_s.ja3 == "771,4865-4866-4867,0-23-65281", (

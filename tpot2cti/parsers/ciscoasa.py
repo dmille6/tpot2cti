@@ -120,18 +120,6 @@ class CiscoasaParser(BaseParser):
     # Per V1_SPEC §5.13: each exploit attempt is its own connection.
     # We inherit BaseParser.correlate (one event → one session) — no
     # override needed.
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — always True per V1_SPEC §5.13
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Always substantive — every probe of a fake Cisco ASA is
-        meaningful (port 443 with crafted payload is not internet
-        background radiation).  Per V1_SPEC §5.13.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

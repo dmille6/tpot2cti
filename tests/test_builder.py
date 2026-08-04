@@ -98,7 +98,7 @@ def test_driveby_session_emits_dual_sighting(builder, synthetic_session):
     assert len(sightings) == 2
 
 
-def test_full_cowrie_session_has_substance_objects(builder, synthetic_session):
+def test_full_cowrie_session_emits_rich_graph(builder, synthetic_session):
     """A substantive Cowrie session emits Process + File + URL + Domain."""
     objs = builder.build_cowrie_session(synthetic_session)
     types = {o["type"] for o in objs}

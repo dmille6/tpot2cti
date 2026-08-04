@@ -178,39 +178,6 @@ class NginxParser(BaseParser):
                 s.urls.append(str(uri))
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — error status, scan URI, or scanner UA
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Return True iff the single request looks like scanning or
-        exploitation rather than a generic crawl of `/`.
-
-        Per V1_SPEC §5.21:
-          - 4xx / 5xx status → the request hit a path the server
-            doesn't have, which is the definition of scanning, OR
-          - request_uri matches a known scan/exploit signature, OR
-          - user_agent matches a known scanner UA.
-        """
-        if not session.events:
-            return False
-        meta = session.events[0].meta
-
-        status = meta.get("status_code")
-        if isinstance(status, int) and 400 <= status <= 599:
-            return True
-
-        uri = str(meta.get("request_uri") or "")
-        if uri and _NGINX_SCAN_SIGNALS.search(uri):
-            return True
-
-        ua = str(meta.get("user_agent") or "")
-        if ua and _NGINX_SCANNER_UA.search(ua):
-            return True
-
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

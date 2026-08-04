@@ -466,6 +466,13 @@ class BaseParser:
         ...
 ```
 
+> **SUPERSEDED:** `has_substance()` was specified per-parser but was never
+> wired into the cycle loop, so it was removed. The single drive-by-vs-full
+> -graph emission gate lives in the orchestrator as `_is_bare_scan()`
+> (`tpot2cti/main.py`), applied only to the generic scan paths (Honeytrap /
+> fallback / default drive-by). Parsers now implement `parse()` and,
+> optionally, `correlate()` only.
+
 Parsers below are listed in priority order (highest-value first).
 
 ### 5.1 Cowrie (`type:"Cowrie"`)

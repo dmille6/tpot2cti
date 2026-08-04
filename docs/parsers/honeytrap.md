@@ -8,7 +8,7 @@ actually sends an exploit payload to a non-honeypotted port and that
 payload is worth preserving.
 
 Per the V0 parser-vs-builder separation rule, this parser stays pure (model-only):
-parse() + has_substance() only.  The per-protocol STIX shape lives in
+parse() + correlate() only.  The per-protocol STIX shape lives in
 ``STIXBuilder.build_honeytrap_probe``.
 
 Per V1_SPEC.md §5.4:
@@ -24,6 +24,9 @@ Per V1_SPEC.md §5.4:
     - IPv4-Addr (via builder.build_attacker_context)
     - Sighting (probe of port N) with payload summary in description
 
-  Substance filter: empty-payload probes get a minimal Sighting only.
-  Sessions with > 8 bytes of printable payload get the full graph with
-  a Sighting description that preserves the captured bytes.
+  Emission: Honeytrap is a generic catch-all path, so it IS subject to
+  the centralized `_is_bare_scan()` gate (`tpot2cti/main.py`).  An
+  interaction-less single-target probe with no payload (and fewer than 3
+  swept ports) is dropped as mass-scan noise; a payload-carrying probe or
+  a multi-port sweep gets the full graph, with a Sighting description that
+  preserves the captured bytes.

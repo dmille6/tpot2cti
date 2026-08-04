@@ -117,7 +117,7 @@ class H0neytr4pParser(BaseParser):
         Pulls the request method / URI / body / user-agent (all nested
         under ``request``), the ``host_header`` field, and runs the
         substance hint list now so the result is cached on the event
-        and re-used by :meth:`has_substance`.
+        and re-used downstream.
 
         Returns ``None`` for malformed docs (missing src_ip or
         @timestamp); these are logged at DEBUG and dropped.
@@ -222,8 +222,8 @@ class H0neytr4pParser(BaseParser):
             event.meta["host_header"] = str(host_header)
 
         # ── Run the substance hint scan now, cache the matches ─────────
-        # We run it once at parse time so has_substance() (called many
-        # times by the orchestrator) is just a dict lookup.
+        # We run it once at parse time so downstream substance checks are
+        # just a dict lookup.
         matched_hints = self._scan_hints(uri, body_truncated, user_agent)
         if matched_hints:
             event.meta["matched_hints"] = matched_hints
@@ -239,10 +239,9 @@ class H0neytr4pParser(BaseParser):
         reconstructed URL pushed to ``session.urls`` and the host_header
         pushed to ``session.domains``.
 
-        Promotion at correlate time means downstream
-        :meth:`has_substance` (and the eventual STIX builder) read
-        uniformly-populated session fields instead of having to reach
-        into ``events[0].meta`` for every entity.
+        Promotion at correlate time means the downstream STIX builder
+        reads uniformly-populated session fields instead of having to
+        reach into ``events[0].meta`` for every entity.
         """
         sessions: list[AttackSession] = []
         for event in events:
@@ -290,36 +289,6 @@ class H0neytr4pParser(BaseParser):
             ):
                 if k in first_meta:
                     session.meta.setdefault(k, first_meta[k])
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — substance filter per V1_SPEC §5.7 + LESSONS §2
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """An h0neytr4p session is substantive iff any one of:
-
-          - method is not GET
-          - body length > 8 bytes
-          - the URI / body / user-agent matched any exploit hint
-
-        Anything else (plain ``GET /``, ``GET /favicon.ico`` from
-        scanners) gets the drive-by treatment per LESSONS §2.
-        """
-        if not session.events:
-            return False
-
-        method = session.meta.get("method") or ""
-        body_length = session.meta.get("body_length") or 0
-        matched_hints = session.meta.get("matched_hints") or []
-
-        if method and method != "GET":
-            return True
-        if body_length > BODY_LENGTH_THRESHOLD:
-            return True
-        if matched_hints:
-            return True
-        return False
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
