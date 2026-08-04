@@ -3,5 +3,5 @@
     "Server": "nginx/1.18.0 (Ubuntu)",
     "Content-Type": "text/plain; charset=utf-8"
   },
-  "body": "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n[remote \"origin\"]\n\turl = git@github.com:louisianatech/dashboard-frontend.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n[branch \"develop\"]\n\tremote = origin\n\tmerge = refs/heads/develop\n[user]\n\tname = LouisianaTech Deploy\n\temail = deploy@louisianatech.io\n"
+  "body": "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n[remote \"origin\"]\n\turl = git@github.com:example-org/dashboard-frontend.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n[branch \"develop\"]\n\tremote = origin\n\tmerge = refs/heads/develop\n[user]\n\tname = ExampleCo Deploy\n\temail = deploy@example.com\n"
 }

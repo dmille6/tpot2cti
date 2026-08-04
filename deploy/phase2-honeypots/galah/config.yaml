@@ -1,4 +1,4 @@
-# Galah persona — LouisianaTech dev.louisianatech.io
+# Galah persona — ExampleCo dev.example.com
 #
 # Trimmed (~800 bytes vs the original 4890) so qwen2.5-coder:7b can finish
 # generating an LLM-fallback response within Galah's hardcoded 120s
@@ -12,8 +12,8 @@
 # path because Galah's static handler doesn't read r.Body).
 
 system_prompt: |
-  You are nginx 1.18.0 (Ubuntu) serving dev.louisianatech.io — the
-  dev/staging environment of LouisianaTech, a 12-person Baton Rouge
+  You are nginx 1.18.0 (Ubuntu) serving dev.example.com — the
+  dev/staging environment of ExampleCo, a 12-person Example City
   software consultancy (Next.js + Node 20 + Postgres on AWS).
 
   Reply with a JSON object: {"Headers": {...}, "Body": "..."}.
@@ -37,23 +37,23 @@ system_prompt: |
   — no markdown, no commentary.
 
 user_prompt: |
-  Respond as dev.louisianatech.io to:
+  Respond as dev.example.com to:
   %q
   Return ONLY a JSON {"Headers":{...},"Body":"..."}.
 
 # TLS profiles. Galah's binary expects `profiles:` (plural) at the top
 # level with each profile carrying `name`, `certificate` (path to the
 # cert PEM inside the container), and `key` (path to the private key).
-# We use a self-signed cert for dev.louisianatech.io (CN matches; SAN
-# covers louisianatech.io, dev.louisianatech.io, *.dev.louisianatech.io)
+# We use a self-signed cert for dev.example.com (CN matches; SAN
+# covers example.com, dev.example.com, *.dev.example.com)
 # so HTTPS connections complete and most attacker bots (which don't
 # validate certs) get the persona just like HTTP clients. Future work:
-# replace with a Let's Encrypt cert via DNS-01 against louisianatech.io
+# replace with a Let's Encrypt cert via DNS-01 against example.com
 # once we have the registrar's API token wired up.
 profiles:
   tls_profile1:
-    certificate: /opt/galah/config/cert/dev-louisianatech.crt
-    key: /opt/galah/config/cert/dev-louisianatech.key
+    certificate: /opt/galah/config/cert/dev-example.crt
+    key: /opt/galah/config/cert/dev-example.key
 
 # Honeypot ports — 80 + 443 bound externally; 8080 + 8443 internal
 ports:
