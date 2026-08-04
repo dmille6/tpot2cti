@@ -1,7 +1,7 @@
 apiVersion: "v1"
 protocol: "ssh"
 address: ":22"
-description: "LouisianaTech dev01 - SSH interactive (hybrid cache + LLM)"
+description: "ExampleCo dev01 - SSH interactive (hybrid cache + LLM)"
 serverVersion: "OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"
 serverName: "dev01"
 passwordRegex: ".*"
@@ -9,7 +9,7 @@ deadlineTimeoutSeconds: 6000
 
 # Hardcoded handlers for the 14 most-common attacker commands captured
 # in our 6-day baseline (Outlaw kill chain + anti-honeypot fingerprinting).
-# Anchored to Ubuntu 22.04 / EC2 c5.xlarge / dev01.louisianatech.io.
+# Anchored to Ubuntu 22.04 / EC2 c5.xlarge / app01.example.com.
 # Anything NOT matched falls through to the LLM plugin at the bottom.
 commands:
 
@@ -89,7 +89,7 @@ commands:
   - regex: '^cat /proc/cpuinfo$'
     handler: "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nstepping\t: 7\nmicrocode\t: 0x500320a\ncpu MHz\t\t: 3000.000\ncache size\t: 36608 KB\nphysical id\t: 0\nsiblings\t: 4\ncore id\t\t: 0\ncpu cores\t: 2\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 22\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single pti ssbd ibrs ibpb stibp fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke avx512_vnni md_clear arch_capabilities\nbugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa itlb_multihit mmio_stale_data retbleed\nbogomips\t: 6000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 1\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nstepping\t: 7\nmicrocode\t: 0x500320a\ncpu MHz\t\t: 3000.000\ncache size\t: 36608 KB\nphysical id\t: 0\nsiblings\t: 4\ncore id\t\t: 1\ncpu cores\t: 2\napicid\t\t: 2\ninitial apicid\t: 2\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 22\nwp\t\t: yes\nbogomips\t: 6000.00\n\nprocessor\t: 2\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nstepping\t: 7\ncpu MHz\t\t: 3000.000\ncache size\t: 36608 KB\nphysical id\t: 0\nsiblings\t: 4\ncore id\t\t: 0\ncpu cores\t: 2\napicid\t\t: 1\nbogomips\t: 6000.00\n\nprocessor\t: 3\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nstepping\t: 7\ncpu MHz\t\t: 3000.000\ncache size\t: 36608 KB\nphysical id\t: 0\nsiblings\t: 4\ncore id\t\t: 1\ncpu cores\t: 2\napicid\t\t: 3\nbogomips\t: 6000.00\n\n"
 
-  # ── Common probes beyond Outlaw — anchored to dev01.louisianatech.io
+  # ── Common probes beyond Outlaw — anchored to app01.example.com
   - regex: '^cat /etc/issue$'
     handler: "Ubuntu 22.04.3 LTS \\n \\l\n\n"
 
@@ -133,13 +133,13 @@ commands:
     handler: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDx7K2pNvBmQrTwYzL3oCwAvBnX4xPdKjAcQrNpLwZsTrEfCdGxYpJhMnQ8WkVo2bUtRcS5XvK3eL7HsBnZxQzL2pNvBmQrTwYzL3oCwAvBnX4xPdKjAcQrNpLwZsTrEfCdGxYpJhMnQ8WkVo2bUtRcS5XvK3eL7HsBnZxQ deploy@dev01\n"
 
   - regex: '^cat /root/\.aws/credentials$'
-    handler: "[default]\naws_access_key_id = AKIA4PLQNX9KH8VCB2YE\naws_secret_access_key = fzD7K2xPwNvB8mQrTjY3HsKaL5gVtN9wXcM4PnRq\nregion = us-east-1\n\n[ltdev]\naws_access_key_id = AKIA7QrNpLwZsTrEfCdG\naws_secret_access_key = MnQ8WkVo2bUtRcS5XvK3eL7HsBnZxQzL2pNvBmQr\nregion = us-east-1\n"
+    handler: "[default]\naws_access_key_id = AKIA4PLQNX9KH8VCB2YE\naws_secret_access_key = fzD7K2xPwNvB8mQrTjY3HsKaL5gVtN9wXcM4PnRq\nregion = us-east-1\n\n[exampledev]\naws_access_key_id = AKIA7QrNpLwZsTrEfCdG\naws_secret_access_key = MnQ8WkVo2bUtRcS5XvK3eL7HsBnZxQzL2pNvBmQr\nregion = us-east-1\n"
 
   - regex: '^cat /home/dev/\.aws/credentials$'
     handler: "[default]\naws_access_key_id = AKIA4PLQNX9KH8VCB2YE\naws_secret_access_key = fzD7K2xPwNvB8mQrTjY3HsKaL5gVtN9wXcM4PnRq\nregion = us-east-1\n"
 
   - regex: '^docker ps$'
-    handler: "CONTAINER ID   IMAGE                       COMMAND                  CREATED       STATUS       PORTS                     NAMES\n4a7d8e1b9c2e   ltdev/dashboard-api:1.4.2   \"node /app/server.js\"   3 days ago    Up 3 days    0.0.0.0:3000->3000/tcp    api\n8c2e1f9a3d7e   postgres:14.10              \"docker-entrypoint.s…\"   12 days ago   Up 12 days   5432/tcp                  db\n6d5c1e2f9a3d   redis:7.2-alpine            \"docker-entrypoint.s…\"   12 days ago   Up 12 days   6379/tcp                  cache\n"
+    handler: "CONTAINER ID   IMAGE                       COMMAND                  CREATED       STATUS       PORTS                     NAMES\n4a7d8e1b9c2e   exampledev/dashboard-api:1.4.2   \"node /app/server.js\"   3 days ago    Up 3 days    0.0.0.0:3000->3000/tcp    api\n8c2e1f9a3d7e   postgres:14.10              \"docker-entrypoint.s…\"   12 days ago   Up 12 days   5432/tcp                  db\n6d5c1e2f9a3d   redis:7.2-alpine            \"docker-entrypoint.s…\"   12 days ago   Up 12 days   6379/tcp                  cache\n"
 
   - regex: '^docker .*$'
     handler: "Error response from daemon: dial unix docker.raw.sock: connect: connection refused\n"
@@ -169,7 +169,7 @@ plugin:
 
     SYSTEM IDENTITY (must stay consistent across responses):
       Hostname:      dev01
-      FQDN:          dev01.louisianatech.io
+      FQDN:          app01.example.com
       OS:            Ubuntu 22.04.3 LTS (kernel 5.15.0-91-generic)
       Architecture:  x86_64
       Uptime:        47 days, 3 hours
@@ -180,7 +180,7 @@ plugin:
       You are currently logged in as: root
 
     ORGANIZATION:
-      LouisianaTech — 12-person software consultancy based in Baton Rouge LA.
+      ExampleCo — 12-person software consultancy based in Example City LA.
       Specializes in custom SaaS for regional oil & gas, medical billing,
       and real estate. Heavy AWS user.
 
@@ -201,8 +201,8 @@ plugin:
     FAKE FILES THAT EXIST (be consistent if asked):
       /home/dev/.aws/credentials  — AWS keys (AKIA4PLQNX9KH8VCB2YE / fzD7...)
       /home/dev/.ssh/authorized_keys  — deploy@dev01 RSA key
-      /home/dev/repos/louisianatech-internal/  — git checkout
-      /etc/nginx/sites-available/  — louisianatech-marketing, dashboard
+      /home/dev/repos/example-internal/  — git checkout
+      /etc/nginx/sites-available/  — example-marketing, dashboard
       /var/log/nginx/access.log, /var/log/postgresql/postgresql-14-main.log
 
     BEHAVIORAL RULES:
@@ -226,7 +226,7 @@ plugin:
       10. Only the users listed above exist in /home (root, ubuntu, dev,
           mike, jenkins). Requests for /home/<other_name>/ → return
           "No such file or directory". Do NOT invent extra users (Sarah,
-          Marie, Jamal etc. from the louisianatech.io marketing site do
+          Marie, Jamal etc. from the example.com marketing site do
           NOT have shell accounts on dev01 — they're the company team,
           not engineers with deploy access).
 
@@ -244,11 +244,11 @@ plugin:
 
       $ cat /home/dev/.bash_history
       ✓ ls -la
-        cd ~/repos/louisianatech-internal
+        cd ~/repos/example-internal
         git pull
         npm run dev
-        aws s3 ls s3://ltdev-customer-data/
-        psql -h db.internal.louisianatech.io -U ltdev
+        aws s3 ls s3://exampledev-customer-data/
+        psql -h db.internal.example.com -U exampledev
       ✗ cat: /home/dev/.bash_history: Permission denied   ← WRONG
 
       $ cat /home/sarah/.bash_history

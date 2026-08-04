@@ -21,7 +21,7 @@ def test_beelzebub_smoke():
         "src_port": "53118",
         "dest_port": "22",
         "protocol": "SSH",
-        "service": "LouisianaTech dev01 - SSH interactive (hybrid cache + LLM)",
+        "service": "ExampleCo dev01 - SSH interactive (hybrid cache + LLM)",
         "client": "SSH-2.0-libssh_0.9.6",
         "geoip": {
             "country_iso_code": "RU",

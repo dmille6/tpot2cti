@@ -2,8 +2,8 @@
 
 Persona-anchored deployment of T-Pot's two AI honeypots, tuned for
 maximum believability against unattended attacker traffic. Captures
-sit on the LouisianaTech persona — a fictional 12-person Baton Rouge
-software consultancy at `dev.louisianatech.io`.
+sit on the ExampleCo persona — a fictional 12-person Example City
+software consultancy at `dev.example.com`.
 
 This directory is the canonical, version-controlled copy of what's
 running on the T-Pot host. If we ever re-image the sensor, the
@@ -16,7 +16,7 @@ and run the docker-compose edits in `compose/`."
 beelzebub/
   ssh-22.yaml             40 hardcoded command handlers (Outlaw kill chain,
                           uname/cat /etc/passwd/etc.) + LLM fallback for
-                          everything else. Anchored to "LouisianaTech dev01".
+                          everything else. Anchored to "ExampleCo dev01".
 galah/
   config.yaml             Trimmed system_prompt (~1.7 KB) + TLS profile
                           mapping → /opt/galah/config/cert/. Small enough
@@ -46,12 +46,12 @@ galah/
                           ghp_ GitHub etc.). All values are RANDOM,
                           formatted-to-look-real bait — none are real
                           credentials.
-    git-config.json       Fake [remote "origin"] = louisianatech/dashboard-frontend
+    git-config.json       Fake [remote "origin"] = example-org/dashboard-frontend
     robots.json           Disallow /wp-admin, /api, /admin, /dashboard
     wp-login.json         Real-shape WordPress 6.3 login form HTML
     api-login.json        JSON 401 for /api/v*/login etc.
   cert/
-    openssl-dev-louisianatech.cnf
+    openssl-dev-example.cnf
                           CSR config for the self-signed cert. To
                           regenerate (when the 90-day cert expires):
                           see "Cert renewal" below.
@@ -110,11 +110,11 @@ install -m 0644 galah/templates/*.json   ~/tpotce/data/galah/templates/
 # 3. Generate the self-signed cert (90-day; see "Cert renewal" to redo)
 mkdir -p ~/tpotce/data/galah/cert
 openssl req -x509 -nodes -days 90 -newkey rsa:2048 \
-  -keyout ~/tpotce/data/galah/cert/dev-louisianatech.key \
-  -out   ~/tpotce/data/galah/cert/dev-louisianatech.crt \
-  -config galah/cert/openssl-dev-louisianatech.cnf \
+  -keyout ~/tpotce/data/galah/cert/dev-example.key \
+  -out   ~/tpotce/data/galah/cert/dev-example.crt \
+  -config galah/cert/openssl-dev-example.cnf \
   -extensions req_ext
-chmod 644 ~/tpotce/data/galah/cert/dev-louisianatech.{crt,key}
+chmod 644 ~/tpotce/data/galah/cert/dev-example.{crt,key}
 
 # 4. Merge the compose snippets into ~/tpotce/docker-compose.yml. The
 #    Cowrie/Snare port shifts must also be made (see Phase 2 sed script
@@ -151,11 +151,11 @@ Self-signed cert expires 90 days from generation. Calendar reminder
 ```bash
 cd ~/tpotce/data/galah/cert
 openssl req -x509 -nodes -days 90 -newkey rsa:2048 \
-  -keyout dev-louisianatech.key \
-  -out   dev-louisianatech.crt \
-  -config /path/to/this/repo/deploy/phase2-honeypots/galah/cert/openssl-dev-louisianatech.cnf \
+  -keyout dev-example.key \
+  -out   dev-example.crt \
+  -config /path/to/this/repo/deploy/phase2-honeypots/galah/cert/openssl-dev-example.cnf \
   -extensions req_ext
-chmod 644 dev-louisianatech.{crt,key}
+chmod 644 dev-example.{crt,key}
 cd ~/tpotce && docker compose restart galah
 ```
 
@@ -163,8 +163,8 @@ cd ~/tpotce && docker compose restart galah
 
 | Claim                  | Where it shows up                                    |
 |------------------------|------------------------------------------------------|
-| LouisianaTech LLC      | TLS cert subject, footers, header brand              |
-| Baton Rouge, LA        | TLS cert L=, /team page, footer                      |
+| ExampleCo LLC      | TLS cert subject, footers, header brand              |
+| Example City, EX        | TLS cert L=, /team page, footer                      |
 | 12-person team         | Landing card, /team page heading + stat              |
 | Founded 2017           | /team CEO bio, landing copy                          |
 | Next.js + Node 20 + PG | X-Powered-By header, /services page                  |
@@ -172,5 +172,5 @@ cd ~/tpotce && docker compose restart galah
 | dev/staging banner     | Landing page yellow warning                          |
 | 4 service practices    | Oil & Gas, Medical Billing, Real Estate, Custom SaaS |
 | Fake .env credentials  | /.env (AKIA-prefix, sk-proj, ghp_, etc.)             |
-| dev01.louisianatech.io | Beelzebub SSH banner, prompt $PS1                    |
+| app01.example.com | Beelzebub SSH banner, prompt $PS1                    |
 | Outlaw kill chain ready| Beelzebub hardcoded responses for the 14 commands    |

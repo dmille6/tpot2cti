@@ -3,5 +3,5 @@
     "Server": "nginx/1.18.0 (Ubuntu)",
     "Content-Type": "text/plain"
   },
-  "body": "User-agent: *\nDisallow: /wp-admin/\nDisallow: /api/\nDisallow: /admin/\nDisallow: /dashboard/\nDisallow: /staging/\nSitemap: https://dev.louisianatech.io/sitemap.xml\n"
+  "body": "User-agent: *\nDisallow: /wp-admin/\nDisallow: /api/\nDisallow: /admin/\nDisallow: /dashboard/\nDisallow: /staging/\nSitemap: https://dev.example.com/sitemap.xml\n"
 }
