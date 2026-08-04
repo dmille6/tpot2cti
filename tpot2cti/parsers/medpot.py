@@ -39,8 +39,7 @@ class MedpotParser(BaseParser):
 
     Per V1_SPEC §5.9 every HL7 message hitting an internet-exposed
     Medpot instance is substantive.  We use the default one-event-per-
-    session correlator and override `has_substance()` to always return
-    True.
+    session correlator; every session is substantive.
     """
 
     type_name = TYPE_NAME
@@ -117,18 +116,6 @@ class MedpotParser(BaseParser):
                 s.meta.setdefault("msg_type", msg_type)
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — ALWAYS True for Medpot
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Always True — internet HL7 traffic is anomalous by definition.
-
-        See docs/parsers/medpot.md.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

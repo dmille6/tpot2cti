@@ -122,20 +122,6 @@ class HoneyamlParser(BaseParser):
                 s.urls.append(str(path))
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — always True for Honeyaml
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Honeyaml probes are inherently substantive.
-
-        Per V1_SPEC §5.22, Honeyaml only logs IaC-config probe attempts
-        — there is no benign traffic to filter out.  Every request gets
-        the full STIX graph (IPv4-Addr + Sighting + Note).
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

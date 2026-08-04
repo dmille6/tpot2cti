@@ -116,24 +116,6 @@ class WordpotParser(BaseParser):
                 s.urls.append(str(path))
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — strict WordPress-recon filter
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Return True iff request_path matches a WordPress attack
-        surface (`/wp-admin`, `/wp-login.php`, `/xmlrpc.php`,
-        `/wp-config*`, `/wp-content/plugins/*`).  Per V1_SPEC §5.18
-        and LESSONS_LEARNED_FROM_V0.md §2.
-        """
-        if not session.events:
-            return False
-        path = str(session.events[0].meta.get("request_path") or "")
-        if not path:
-            return False
-        return bool(_WP_RECON_PATHS.search(path))
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

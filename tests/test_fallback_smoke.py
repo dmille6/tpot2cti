@@ -1,6 +1,6 @@
 """Smoke test for the fallback parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.fallback as _m
@@ -44,7 +44,6 @@ def test_fallback_smoke():
     sessions1 = parser.correlate([e1])
     assert len(sessions1) == 1, "case 1: one event → one session"
     s1 = sessions1[0]
-    assert parser.has_substance(s1), "case 1: fallback always substantive"
 
     # --- Case 2: same type again — WARNING must NOT re-fire ---------------
     doc2 = {

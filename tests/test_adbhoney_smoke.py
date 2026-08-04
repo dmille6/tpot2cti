@@ -1,6 +1,6 @@
 """Smoke test for the adbhoney parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.adbhoney as _m
@@ -16,9 +16,9 @@ def test_adbhoney_smoke():
     now = datetime.now(timezone.utc)
 
     # ── Case 1: "drive-by" — bare ADB probe, no command, no upload ─────
-    # Per the spec this is STILL substantive because ADB-on-5555 is
-    # inherently malicious.  The smoke test verifies has_substance is
-    # True even with no command / no data.
+    # Per the spec ADB-on-5555 is inherently malicious.  The smoke test
+    # verifies the bare probe still parses/correlates cleanly even with
+    # no command / no data.
     bare_probe_doc = {
         "@timestamp": now.isoformat(),
         "type": "Adbhoney",
@@ -58,13 +58,6 @@ def test_adbhoney_smoke():
 
     bare_session = parser.correlate([bare_event])[0]
     subs_session = parser.correlate([subs_event])[0]
-
-    bare_has = parser.has_substance(bare_session)
-    subs_has = parser.has_substance(subs_session)
-    print(f"bare-probe  has_substance: {bare_has}  (expected True — ADB is always malicious)")
-    print(f"substantive has_substance: {subs_has}  (expected True)")
-    assert bare_has is True, "ADB bare probe must be substantive (port 5555 is malicious)"
-    assert subs_has is True, "ADB drop must be substantive"
 
     # The substantive session must carry the sha256 + command in
     # aggregates, plus device-info in meta.

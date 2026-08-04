@@ -22,19 +22,18 @@ Per V1_SPEC.md §5.14:
   Event correlation: each ADB connection is its own event.  We inherit
   the default one-event-per-session correlator.
 
-Substance filter (per docs/LESSONS_LEARNED_FROM_V0.md §2):
+Emission (per docs/LESSONS_LEARNED_FROM_V0.md §2):
 
-  *All ADBhoney sessions are substantive.*  Port 5555 ADB connections
+  *All ADBhoney sessions are worth emitting.*  Port 5555 ADB connections
   are inherently malicious — there is no legitimate reason for one to
-  land on an open-internet honeypot — so we treat every event as
-  worthy of the full STIX SDO graph.  This is the rare case where
-  LESSONS §2's "drive-by probes get one Sighting only" rule does NOT
-  apply: the probe itself is the substance.
+  land on an open-internet honeypot — so every event warrants the full
+  STIX SDO graph.  This is the rare case where LESSONS §2's "drive-by
+  probes get one Sighting only" rule does NOT apply: the probe itself is
+  the substance.
 
-  We override :meth:`has_substance` to always return True for this
-  reason.  (We could just inherit BaseParser's default-True
-  implementation, but we explicitly override + docstring it so future
-  readers don't assume the omission was an oversight.)
+  Parsers no longer gate emission.  The drive-by vs. full-graph decision
+  is centralized in `_is_bare_scan()` (`tpot2cti/main.py`), and ADBhoney
+  is not routed through the bare-scan drop path.
 
 Per-session promotions to the AttackSession:
 

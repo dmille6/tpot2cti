@@ -49,8 +49,8 @@ class SentryPeerParser(BaseParser):
     """Parser for T-Pot's SentryPeer SIP honeypot.
 
     Per V1_SPEC §5.19 every SIP transaction reaching the honeypot is
-    substantive.  We use the default one-event-per-session correlator
-    and override `has_substance()` to always return True.
+    substantive.  We use the default one-event-per-session correlator; every session
+    is substantive.
     """
 
     type_name = TYPE_NAME
@@ -162,25 +162,6 @@ class SentryPeerParser(BaseParser):
                     s.meta.setdefault(k, ev.meta[k])
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — ALWAYS True for SentryPeer
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Every SentryPeer probe is substantive.
-
-        Per V1_SPEC §5.19 and the Phase-4 instructions: SIP traffic
-        from strangers on the internet is by definition anomalous, so
-        each doc warrants the full STIX SDO graph.
-
-        See docs/LESSONS_LEARNED_FROM_V0.md §2: per-parser substance
-        decisions, not a global rule.  For SentryPeer the answer is
-        always yes — toll-fraud probing and SIP-stack fingerprinting
-        are both valuable signals even when no "dial" happens.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

@@ -52,8 +52,7 @@ class DicompotParser(BaseParser):
 
     Per V1_SPEC §5.8 every DICOM probe is substantive.  We use the
     default one-event-per-session correlator (each ES doc is a discrete
-    DICOM transaction) and override `has_substance()` to always return
-    True.
+    DICOM transaction); every session is substantive.
     """
 
     type_name = TYPE_NAME
@@ -146,25 +145,6 @@ class DicompotParser(BaseParser):
                     s.meta.setdefault(k, v)
             sessions.append(s)
         return sessions
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — ALWAYS True for Dicompot
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Every DICOM probe is substantive.
-
-        Per V1_SPEC §5.8 and the Phase-4 instructions: medical-imaging
-        protocol probes are rare on the open internet and each one is
-        worth a full STIX SDO graph (IPv4 + AS + Location + Indicator +
-        Sighting + Note + AttackPattern("medical-imaging-probe")).
-
-        See docs/LESSONS_LEARNED_FROM_V0.md §2: per-parser substance
-        decisions, not a global rule.  For Dicompot the answer is
-        always yes.
-        """
-        return True
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

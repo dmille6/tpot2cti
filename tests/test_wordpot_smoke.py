@@ -1,6 +1,6 @@
 """Smoke test for the wordpot parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.wordpot as _m
@@ -96,13 +96,6 @@ def test_wordpot_smoke():
     ps = parser.correlate([pe])[0]
     cs = parser.correlate([ce])[0]
     rs = parser.correlate([re_])[0]
-
-    assert parser.has_substance(ds) is False, "/ must NOT be substantive"
-    assert parser.has_substance(ls) is True, "/wp-login.php must be substantive"
-    assert parser.has_substance(xs) is True, "/xmlrpc.php must be substantive"
-    assert parser.has_substance(ps) is True, "plugins path must be substantive"
-    assert parser.has_substance(cs) is True, "wp-config.php.bak must be substantive"
-    assert parser.has_substance(rs) is False, "/robots.txt must NOT be substantive"
 
     # URL mirrored onto the session
     assert ls.urls == ["/wp-login.php"]

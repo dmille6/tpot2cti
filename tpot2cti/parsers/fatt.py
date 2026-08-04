@@ -198,27 +198,6 @@ class FattParser(BaseParser):
                 session.meta["tlsClient"] = str(v)
             if "tlsServer" not in session.meta and (v := meta.get("tlsServer")):
                 session.meta["tlsServer"] = str(v)
-
-    # ──────────────────────────────────────────────────────────────────
-    # has_substance() — at least one non-empty fingerprint
-    # ──────────────────────────────────────────────────────────────────
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """A FATT session is substantive iff we captured at least one
-        of the four fingerprint values (JA3, JA3S, HASSH, HASSHServer).
-
-        FATT docs with all four blank carry no information beyond what
-        the underlying honeypot already provided — they route to the
-        one-Sighting drive-by code path per V1_SPEC §5.20 +
-        docs/LESSONS_LEARNED_FROM_V0.md §2.
-        """
-        return bool(
-            session.ja3
-            or session.ja3s
-            or session.hassh
-            or session.meta.get("hasshServer")
-        )
-
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────

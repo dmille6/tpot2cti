@@ -1,6 +1,6 @@
 """Smoke test for the dionaea parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.dionaea as _m
@@ -60,13 +60,6 @@ def test_dionaea_smoke():
 
     drive_session = parser.correlate([drive_event])[0]
     subs_session = parser.correlate([subs_event])[0]
-
-    drive_has = parser.has_substance(drive_session)
-    subs_has = parser.has_substance(subs_session)
-    print(f"drive-by    has_substance: {drive_has}  (expected False)")
-    print(f"substantive has_substance: {subs_has}  (expected True)")
-    assert drive_has is False, "drive-by Dionaea must be non-substantive"
-    assert subs_has is True, "Dionaea drop with hash+URL must be substantive"
 
     # The substantive session must carry the primary hash, URL, and
     # derived domain in the session aggregates the orchestrator reads.

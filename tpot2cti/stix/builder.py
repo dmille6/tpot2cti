@@ -1606,9 +1606,9 @@ class STIXBuilder:
     def build_cowrie_session(self, session: AttackSession) -> list[dict]:
         """Build the full Cowrie session STIX graph.
 
-        Caller is expected to have already determined has_substance() is
-        True.  For drive-by sessions the caller invokes
-        `self.build_driveby_session(session)` instead.
+        Caller is expected to have already determined the session is not a
+        bare scan (`_is_bare_scan()` in main.py).  For drive-by sessions the
+        caller invokes `self.build_driveby_session(session)` instead.
 
         Emits: sensor + attacker context + IP Indicator + (HASSH key) +
         (Process) + (File + File Indicator) + URLs + Domains + Sighting +

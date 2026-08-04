@@ -1,6 +1,6 @@
 """Smoke test for the heralding parser (migrated from its old
 `if __name__` block so CI runs it). Generic parse/correlate/
-has_substance/STIX contract is covered in test_parsers.py."""
+STIX contract is covered in test_parsers.py."""
 from __future__ import annotations
 
 import tpot2cti.parsers.heralding as _m
@@ -55,9 +55,7 @@ def test_heralding_smoke():
     drive_sessions = parser.correlate(drive_events)
     assert len(drive_sessions) == 1
     drive_session = drive_sessions[0]
-    drive_has = parser.has_substance(drive_session)
-    print(f"drive-by:       events={drive_session.event_count} creds={len(drive_session.credentials_tried)} substance={drive_has}  (expected False)")
-    assert drive_has is False, "drive-by should NOT be substantive"
+    print(f"drive-by:       events={drive_session.event_count} creds={len(drive_session.credentials_tried)}")
 
     # parse + correlate the substantive session
     sub_events = [parser.parse(d) for d in sub_docs]
@@ -66,12 +64,10 @@ def test_heralding_smoke():
     sub_sessions = parser.correlate(sub_events)
     assert len(sub_sessions) == 1, f"expected 1 session, got {len(sub_sessions)}"
     sub_session = sub_sessions[0]
-    sub_has = parser.has_substance(sub_session)
-    print(f"substantive:    events={sub_session.event_count} creds={len(sub_session.credentials_tried)} substance={sub_has}  (expected True)")
+    print(f"substantive:    events={sub_session.event_count} creds={len(sub_session.credentials_tried)}")
     print(f"                credentials_tried: {sub_session.credentials_tried}")
     print(f"                dst_ports:         {sorted(sub_session.dst_ports)}")
     print(f"                protocols:         {sorted(sub_session.protocols)}")
-    assert sub_has is True, "substantive session should be substantive"
     assert len(sub_session.credentials_tried) == 4
     assert ("root", "root") in sub_session.credentials_tried
     assert 22 in sub_session.dst_ports
@@ -91,8 +87,7 @@ def test_heralding_smoke():
     probe_sessions = parser.correlate(probe_events)
     assert len(probe_sessions) == 1
     probe_session = probe_sessions[0]
-    probe_has = parser.has_substance(probe_session)
-    print(f"probe-cluster:  events={probe_session.event_count} creds={len(probe_session.credentials_tried)} substance={probe_has}  (expected True)")
-    assert probe_has is True, "event_count>2 should be substantive"
+    print(f"probe-cluster:  events={probe_session.event_count} creds={len(probe_session.credentials_tried)}")
+    assert probe_session.event_count == 3
 
     print("OK")

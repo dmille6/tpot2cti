@@ -6,11 +6,14 @@ Elasticsearch documents into normalized `ParsedEvent` objects, then
 correlate those events into `AttackSession` aggregates that the STIX
 builder consumes.
 
-The substance filter — the single most important pattern we learned
-from V0 (see docs/LESSONS_LEARNED_FROM_V0.md §2) — lives on the
-session, not the event.  Drive-by probes get one Sighting; substantive
-sessions get the full SDO graph.  Every parser decides what "substance"
-means for its protocol via the `has_substance()` method.
+Parsers are pure data: they normalize and correlate, and do NOT decide
+what gets emitted. The one emission gate — drive-by probes get a single
+Sighting, substantive sessions get the full SDO graph — lives in the
+orchestrator as `_is_bare_scan()` (`tpot2cti/main.py`), applied only to
+the generic scan paths (Honeytrap / fallback / default drive-by). The
+dedicated builders own their own compact-vs-rich shape. (History: V0 had
+a per-parser `has_substance()` method; it was never wired into the cycle
+loop, so it was removed — `_is_bare_scan` is the real, single gate.)
 
 Per V1_SPEC.md §5 (parser interface):
 
@@ -20,11 +23,6 @@ Per V1_SPEC.md §5 (parser interface):
         def parse(self, doc: dict) -> ParsedEvent | None:
             '''Convert a T-Pot ES doc into a normalized internal event.
             Return None to skip the doc (e.g. malformed).'''
-            ...
-
-        def has_substance(self, event: ParsedEvent) -> bool:
-            '''Whether to emit STIX for this event. Default True;
-            parsers can suppress (e.g. low-noise TCP probes).'''
             ...
 """
 
@@ -88,11 +86,11 @@ class AttackSession:
     sharing a session_id from the same src_ip.  For protocols without
     sessions (Suricata, ConPot), each event becomes its own session.
 
-    `has_substance()` operates on the *session* — drive-by probes that
-    open a connection and disconnect get observable+Sighting only;
-    sessions with actual attack activity (commands, auth, malware
-    drops, credential attempts, multiple events) get the full STIX
-    graph.
+    The orchestrator's `_is_bare_scan()` gate operates on the *session* —
+    drive-by probes that open a connection and disconnect get an
+    observable+Sighting only; sessions with actual attack activity
+    (commands, auth, malware drops, credential attempts, multiple events)
+    get the full STIX graph.
     """
 
     src_ip: str
@@ -185,18 +183,18 @@ class BaseParser:
 
     Subclasses MUST set `type_name` to the value of T-Pot's `type` field
     they handle (e.g. "Cowrie", "Suricata").  Subclasses MUST implement
-    `parse()`.  They MAY override `correlate()` and `has_substance()`.
+    `parse()`.  They MAY override `correlate()`.
 
     The default `correlate()` is one-event-per-session — correct for
     Suricata, ConPot, FATT and anything else without protocol sessions.
     Parsers with native sessions (Cowrie, Heralding) override to group
     by session_id.
 
-    The default `has_substance()` returns True — full STIX graph for
-    every session.  Parsers that have a meaningful "drive-by probe"
-    notion override to suppress noise.  Per V1_SPEC §5.1 (Cowrie
-    example): "Pure probe-and-leave noise gets one-line representation
-    rather than full SDO graph."
+    Parsers do NOT gate emission. Whether a session gets a full STIX
+    graph or a one-line drive-by representation is decided centrally by
+    `_is_bare_scan()` in `tpot2cti/main.py`, per V1_SPEC §5.1 (Cowrie):
+    "Pure probe-and-leave noise gets one-line representation rather than
+    full SDO graph."
     """
 
     #: The value of T-Pot's `type` field this parser handles
@@ -243,23 +241,6 @@ class BaseParser:
                 return [self._session_from_events(g) for g in by_session.values()]
         """
         return [AttackSession.from_event(e) for e in events]
-
-    def has_substance(self, session: AttackSession) -> bool:
-        """Whether this session warrants the full STIX SDO graph.
-
-        Default: True (always full treatment).  Parsers override to
-        suppress drive-by noise.  Standard pattern:
-
-            def has_substance(self, session):
-                return (
-                    session.auth_success
-                    or session.commands
-                    or session.malware_hashes
-                    or session.credentials_tried
-                    or session.event_count > 2
-                )
-        """
-        return True
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers parsers can use
