@@ -148,6 +148,9 @@ def test_attack_patterns_are_technique_bounded_not_per_event(cfg, state_db):
 
     # The 60 distinct IPs came through as observables...
     assert ipv4 >= 50, f"expected ~60 distinct IPs, got {ipv4}"
+    # ...and the commands DID map to techniques (guards against a broken
+    # ATT&CK path making the bound below pass vacuously)...
+    assert aps > 0, "expected at least one attack-pattern from command sessions"
     # ...but AttackPatterns are bounded by the technique allowlist, and in
     # particular do NOT scale with the number of IPs/sessions.
     assert aps <= 40, f"attack-patterns not deduped: {aps} (regression!)"

@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Changed (pre-merge review round)
+
+- **`/health` no longer false-alarms on a long *first* cycle.** The no-success
+  ceiling is measured against the last *successful* cycle; a fresh install
+  whose first cycle legitimately runs longer than the ceiling now stays
+  `in-progress` as long as **no cycle has finished yet** (the ceiling only
+  starts once a cycle has *completed* without success — the failing-loop case).
+  (`tpot2cti/health.py`)
+- **`events_dropped` is now the true total** (`sum(drop_reasons.values())`), so
+  `events_read == events_parsed + events_dropped` holds even when the
+  self/benign filters fire; the per-reason split stays in `drop_reasons`.
+  (`tpot2cti/main.py`)
+- **Health status computation extracted into a socket-free `HealthStatus`
+  class**; `HealthServer` now owns one and delegates. Unit tests exercise the
+  logic without binding a port (verified to pass with `socket.bind` blocked).
+  (`tpot2cti/health.py`, `tests/test_health.py`)
+- Integration regression guard now also asserts `attack_patterns > 0`, so a
+  broken ATT&CK path can't make the bound pass vacuously.
+
 ### Fixed
 
 - **CORE: attacker-IP ATT&CK patterns are no longer re-emitted per session
