@@ -83,18 +83,56 @@ def test_stale_success_without_heartbeat_is_stale(state_db):
 
 
 def test_in_progress_heartbeat_keeps_it_healthy(state_db):
-    """The core fix: last completed cycle is stale, but a fresh heartbeat
-    (a cycle actively progressing) keeps /health at 200 / 'in-progress'."""
+    """A completed cycle older than the staleness window, but still within
+    the no-success ceiling and with a fresh heartbeat (a long cycle actively
+    progressing), keeps /health at 200 / 'in-progress'.
+
+    interval=900s → window=1800s (stale beyond this), ceiling=2700s.
+    2000s ago is stale-but-within-ceiling, so the heartbeat still rescues.
+    """
     cid = _record_success(state_db)
-    _backdate_cycle(state_db, cid, seconds_ago=7200)  # completed cycle is stale
-    state_db.heartbeat()                              # ...but we're working now
+    _backdate_cycle(state_db, cid, seconds_ago=2000)  # stale, but < 2700s ceiling
+    state_db.heartbeat()                              # ...and we're working now
     payload, code = _server(state_db, interval_s=900.0).compute_status()
     assert code == 200
     assert payload["status"] == "ok"
     assert payload["liveness"] == "in-progress"
-    assert payload["age_s"] > payload["stale_after_s"]  # cycle itself IS stale
+    assert payload["age_s"] > payload["stale_after_s"]        # cycle itself IS stale
+    assert payload["no_success_age_s"] <= payload["max_no_success_s"]
     assert payload["heartbeat_age_s"] is not None
     assert payload["heartbeat_age_s"] < 5.0
+
+
+def test_cycling_but_never_succeeding_goes_stale(state_db):
+    """Regression for the 2026-07-19 → 08-04 stall.
+
+    A process that keeps *starting* cycles (fresh heartbeat) but never
+    *completes* one must NOT stay green forever. Once the last success is
+    older than the no-success ceiling (3× interval), /health goes 503 with
+    liveness 'cycling-no-success' even though the heartbeat is fresh.
+    """
+    cid = _record_success(state_db)
+    _backdate_cycle(state_db, cid, seconds_ago=5000)  # > 2700s ceiling
+    state_db.heartbeat()                              # process still looping
+    payload, code = _server(state_db, interval_s=900.0).compute_status()
+    assert code == 503
+    assert payload["status"] == "stale"
+    assert payload["liveness"] == "cycling-no-success"
+    assert payload["heartbeat_age_s"] is not None and payload["heartbeat_age_s"] < 5.0
+    assert payload["no_success_age_s"] > payload["max_no_success_s"]
+
+
+def test_never_succeeded_past_ceiling_goes_stale(state_db):
+    """A fresh deploy that has never landed a successful cycle goes 503
+    once uptime passes the ceiling, even while heartbeating — measured from
+    process start, not from a (nonexistent) last success."""
+    srv = _server(state_db, interval_s=900.0)
+    srv._started_at -= 5000  # pretend the process has been up > ceiling
+    state_db.heartbeat()
+    payload, code = srv.compute_status()
+    assert code == 503
+    assert payload["liveness"] == "cycling-no-success"
+    assert payload["no_success_age_s"] > payload["max_no_success_s"]
 
 
 def test_stale_heartbeat_is_stale(state_db):

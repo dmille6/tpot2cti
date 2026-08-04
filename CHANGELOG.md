@@ -18,6 +18,17 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   call sites already guard with `if ap:` / `if not ap: continue`, so `None`
   is the correct contract. (`tpot2cti/stix/builder.py`)
 
+- **CORE: `/health` no longer stays green while cycles fail forever.** The
+  health check kept returning 200 as long as cycles *started* (the heartbeat
+  arm), so during the outage above it reported healthy for 16 days while no
+  cycle ever *completed*. The heartbeat arm now has a hard ceiling
+  (`NO_SUCCESS_CEILING_MULTIPLIER = 3.0` × cycle interval): if no cycle has
+  succeeded within it, `/health` returns 503 with `liveness:
+  "cycling-no-success"` even while the process keeps looping, so the Docker
+  healthcheck (`curl -f`) marks the container unhealthy within ~3 intervals.
+  A genuinely long single cycle stays under the ceiling and still won't flap.
+  (`tpot2cti/health.py`)
+
 - **CORE: `CycleState.get_max_state_bulk()` now chunks its `IN (...)` lookup.**
   The pre-dedup cross-cycle state lookup put one bound variable per emitted
   object into a single `WHERE stix_id IN (...)`. Combined with the runaway
