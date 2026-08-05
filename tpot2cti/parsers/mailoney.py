@@ -150,13 +150,19 @@ class MailoneyParser(BaseParser):
         )
 
     def _aggregate_session(self, session: AttackSession, events: list[ParsedEvent]) -> None:
-        """Roll up commands, data presence, and credentials onto the
-        AttackSession.
+        """Roll up protocol requests, data presence, and credentials onto
+        the AttackSession.
 
-        Commands are appended in chronological order, preserving every
-        verb (we don't dedup — repeated `RCPT TO` is itself a signal).
-        Credential pairs are deduplicated to avoid bloating the daily
-        Note when the same `AUTH PLAIN` is replayed by a scanner.
+        SMTP verbs go to `session.protocol_requests`, NOT `session.commands`.
+        They are verbs the attacker SENT to our SMTP listener; `commands` in
+        this codebase means commands they RAN on our system, and every
+        consumer reads it that way. See `AttackSession.protocol_requests`
+        and the identical ConPot defect.
+
+        Verbs are appended in chronological order, preserving every one (we
+        don't dedup — repeated `RCPT TO` is itself a signal). Credential
+        pairs are deduplicated to avoid bloating the daily Note when the
+        same `AUTH PLAIN` is replayed by a scanner.
         """
         seen_creds: set[tuple[str, str]] = set()
         any_data = False
@@ -164,7 +170,15 @@ class MailoneyParser(BaseParser):
         for e in events:
             meta = e.meta
             for verb in meta.get("commands") or []:
-                session.commands.append(str(verb))
+                # NOT `session.commands`. An SMTP verb the listener received
+                # is not a command anyone executed. Appending it there gave
+                # every SMTP probe +25 score (75 vs a true 50), prose reading
+                # "ran N shell command(s)", T1059 Command and Scripting
+                # Interpreter, and a Process SDO whose command_line was
+                # "EHLO\nMAIL\nRCPT\nDATA". The doc field is named
+                # `commands` because that is SMTP's word for a verb; it is
+                # not this codebase's word for executed code.
+                session.protocol_requests.append(str(verb))
             if meta.get("has_data"):
                 any_data = True
                 total_data_len += int(meta.get("data_len") or 0)

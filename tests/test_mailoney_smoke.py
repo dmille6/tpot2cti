@@ -39,7 +39,7 @@ def test_mailoney_smoke():
     drive_sessions = parser.correlate(drive_events)
     assert len(drive_sessions) == 1
     drive = drive_sessions[0]
-    print(f"drive-by:    commands={drive.commands} creds={len(drive.credentials_tried)} has_data={drive.meta.get('has_data')}")
+    print(f"drive-by:    protocol_requests={drive.protocol_requests} creds={len(drive.credentials_tried)} has_data={drive.meta.get('has_data')}")
 
     # ── Case 2: substantive by commands — MAIL/RCPT/DATA ───────────────
     sub_docs = [
@@ -60,8 +60,20 @@ def test_mailoney_smoke():
     sub_sessions = parser.correlate(sub_events)
     assert len(sub_sessions) == 1
     sub = sub_sessions[0]
-    print(f"substantive: commands={sub.commands} has_data={sub.meta.get('has_data')}")
-    assert "MAIL" in sub.commands and "RCPT" in sub.commands and "DATA" in sub.commands
+    print(f"substantive: protocol_requests={sub.protocol_requests} "
+          f"commands={sub.commands} has_data={sub.meta.get('has_data')}")
+    # These land on `protocol_requests`, NOT `commands`. This assertion used
+    # to require the opposite and so locked in the defect: an SMTP verb the
+    # listener RECEIVED was recorded as a command someone RAN, which gave
+    # every relay probe +25 score (75 vs a true 50), prose reading "ran N
+    # shell command(s)", T1059 Command and Scripting Interpreter, and a
+    # Process SDO whose command_line was "EHLO\nMAIL\nRCPT\nDATA".
+    assert ("MAIL" in sub.protocol_requests and "RCPT" in sub.protocol_requests
+            and "DATA" in sub.protocol_requests)
+    assert sub.commands == [], (
+        "a received SMTP verb is being reported as an executed command — "
+        "every downstream consumer believes that field"
+    )
 
     # ── Case 3: substantive by credentials — AUTH attempt ──────────────
     auth_docs = [
@@ -78,7 +90,7 @@ def test_mailoney_smoke():
     auth_sessions = parser.correlate(auth_events)
     assert len(auth_sessions) == 1
     auth = auth_sessions[0]
-    print(f"auth:        commands={auth.commands} creds={auth.credentials_tried}")
+    print(f"auth:        protocol_requests={auth.protocol_requests} creds={auth.credentials_tried}")
     assert ("postmaster", "password123") in auth.credentials_tried
 
     # ── Case 4: no session_id → window correlator path ─────────────────
@@ -95,6 +107,6 @@ def test_mailoney_smoke():
     win_sessions = parser.correlate(win_events)
     assert len(win_sessions) == 1, f"window correlator should collapse to 1 session, got {len(win_sessions)}"
     win = win_sessions[0]
-    print(f"window:      events={win.event_count} commands={win.commands}")
+    print(f"window:      events={win.event_count} protocol_requests={win.protocol_requests}")
 
     print("OK")

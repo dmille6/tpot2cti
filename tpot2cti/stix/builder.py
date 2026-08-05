@@ -336,6 +336,54 @@ def valid_domain(value: str) -> Optional[str]:
     return fqdn
 
 
+#: Rendering budget for `session.protocol_requests`. Mirrors
+#: `stix/rendering.py`'s Cowrie transcript budget, and for the same reason:
+#: bound the bundle without ever dropping evidence silently.
+_MAX_PROTOCOL_REQUESTS_RENDERED = 200
+_MAX_PROTOCOL_REQUEST_BYTES = 8000
+
+
+def _render_protocol_requests(requests: list[str]) -> str:
+    """Render received protocol requests as ONE fenced block, with an
+    explicit marker for anything omitted.
+
+    The first cut fenced each element separately and hard-capped at 5:
+
+        "\\n\\n".join(f"```\\n{r.strip()[:2000]}\\n```" for r in requests[:5])
+
+    That was sized for ConPot, whose elements are multi-KB HTTP blobs. It is
+    wrong for Mailoney, whose elements are four-character SMTP verbs: a
+    ten-verb session rendered EHLO/MAIL/RCPT/RCPT/RCPT and silently dropped
+    DATA, VRFY and RSET — the entire substance — while the Note's abstract
+    advertised ten. Worse, the parser deliberately does not dedup because a
+    repeated `RCPT TO` is itself a signal, so repeated verbs are exactly what
+    exhausted the five-slot budget. Twenty lines of fence chrome around
+    sixteen characters of content, and the analyst is never told.
+
+    Silent truncation is the defect class this whole change set is about, so
+    the cap is now generous, byte-bounded, and always announced.
+    """
+    kept = [r.strip() for r in requests[:_MAX_PROTOCOL_REQUESTS_RENDERED] if r.strip()]
+    if not kept:
+        return ""
+    omitted = len([r for r in requests if r.strip()]) - len(kept)
+
+    lines: list[str] = []
+    total = 0
+    for req in kept:
+        total += len(req.encode("utf-8")) + 1
+        if total > _MAX_PROTOCOL_REQUEST_BYTES:
+            lines.append("... [truncated for size]")
+            omitted += len(kept) - len(lines) + 1
+            break
+        lines.append(req)
+
+    block = "```\n" + "\n".join(lines) + "\n```"
+    if omitted > 0:
+        block += f"\n_({omitted} additional request(s) omitted)_"
+    return block
+
+
 def valid_url(value: str) -> Optional[str]:
     """Return the URL unchanged if it is an absolute, host-bearing URL.
 
@@ -3093,10 +3141,7 @@ class STIXBuilder:
         # This is what the old `commands` overload was actually for: the
         # evidence is kept, the false claim of execution is not.
         if session.protocol_requests:
-            blob = "\n\n".join(
-                f"```\n{r.strip()[:2000]}\n```"
-                for r in session.protocol_requests[:5] if r.strip()
-            )
+            blob = _render_protocol_requests(session.protocol_requests)
             if blob:
                 if note := self.build_session_note(
                     session,
