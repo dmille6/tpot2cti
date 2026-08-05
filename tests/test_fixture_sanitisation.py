@@ -14,14 +14,25 @@ from __future__ import annotations
 
 import base64
 import glob
+import os
 import re
 
 import pytest
 
 #: RFC 5737 documentation ranges — the only addresses fixtures may contain.
 ALLOWED_PREFIXES = ("192.0.2.", "198.51.100.", "203.0.113.")
-#: Not addresses, but equally identifying.
-FORBIDDEN_STRINGS = re.compile(r"(?i)examplecorp|digitalplumbing|\bctihost\b")
+#: Not addresses, but equally identifying: operator personas, internal
+#: hostnames, domains. These CANNOT be hard-coded here — writing the real
+#: strings into a public repo to check they are absent from a public repo is
+#: self-defeating, and a git-history rewrite scrubbed the previous literals,
+#: leaving this pattern matching placeholder text that will never appear.
+#:
+#: Set TPOT2CTI_FORBIDDEN_STRINGS to a comma-separated list locally (and in
+#: CI) with the values that actually matter for your deployment.
+_EXTRA = [s.strip() for s in
+          os.environ.get("TPOT2CTI_FORBIDDEN_STRINGS", "").split(",") if s.strip()]
+FORBIDDEN_STRINGS = re.compile(
+    "(?i)" + "|".join(re.escape(s) for s in _EXTRA)) if _EXTRA else None
 
 _IP = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _B64 = re.compile(r'"([A-Za-z0-9+/]{16,}={0,2})"')
@@ -67,5 +78,24 @@ def test_no_real_address_or_identifier_in_any_fixture(path):
                 f"{path}:{n} leaks {leaked} in {source}. Fixtures may only "
                 f"contain RFC 5737 documentation addresses {ALLOWED_PREFIXES}."
             )
-            found = FORBIDDEN_STRINGS.findall(text)
-            assert not found, f"{path}:{n} leaks identifier {found} in {source}"
+            if FORBIDDEN_STRINGS is not None:
+                found = FORBIDDEN_STRINGS.findall(text)
+                assert not found, f"{path}:{n} leaks identifier {found} in {source}"
+
+
+def test_the_identifier_check_is_wired_up_when_configured(monkeypatch, tmp_path):
+    """The IP check is unconditional; the identifier check depends on an env
+    var, so prove it actually engages rather than silently doing nothing —
+    an opt-in guard that never fires is worse than no guard, because it reads
+    as coverage."""
+    import importlib
+    monkeypatch.setenv("TPOT2CTI_FORBIDDEN_STRINGS", "acme-honeypot,secret-host")
+    import tests.test_fixture_sanitisation as mod
+    mod = importlib.reload(mod)
+    try:
+        assert mod.FORBIDDEN_STRINGS is not None
+        assert mod.FORBIDDEN_STRINGS.findall("running on ACME-Honeypot today")
+        assert not mod.FORBIDDEN_STRINGS.findall("nothing sensitive here")
+    finally:
+        monkeypatch.delenv("TPOT2CTI_FORBIDDEN_STRINGS", raising=False)
+        importlib.reload(mod)
