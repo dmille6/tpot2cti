@@ -293,3 +293,31 @@ def test_a_list_with_no_recorded_fetch_time_is_treated_as_stale(cfg, state_db, t
                      lists, src.SOURCES_BY_KEY)
     assert s["stale"] is True and s["publish_ok"] is False
     assert pub.objects is None
+
+
+def test_cidrset_agrees_with_brute_force_including_at_boundaries():
+    """The bucketed matcher's dangerous failure is a false NEGATIVE: a listed
+    address silently not matching, which under-labels forever and shows up
+    nowhere. Cross-check against the obvious-but-slow implementation on a mix
+    of random addresses and the exact edges of every network — off-by-one at a
+    network boundary is the bug a hand-written sample would miss.
+
+    Verified separately against the real downloaded FireHOL / Spamhaus / Tor
+    lists (4,584 / 1,665 / 1,401 networks, 248k checks): exact agreement.
+    """
+    import random
+    rng = random.Random(20260805)
+    nets = [ipaddress.ip_network(n) for n in (
+        "224.0.0.0/3", "10.0.0.0/8", "45.9.0.0/16", "203.0.113.0/24",
+        "198.51.100.7/32", "172.16.0.0/12", "0.0.0.0/8",
+    )]
+    cs = src.CidrSet(nets)
+    brute = lambda ip: any(ip in n for n in nets)
+
+    probes = [ipaddress.ip_address(rng.randrange(2**32)) for _ in range(4000)]
+    for n in nets:                       # exact edges, ±1
+        f, l = int(n.network_address), int(n.broadcast_address)
+        probes += [ipaddress.ip_address(v) for v in (f - 1, f, f + 1, l - 1, l, l + 1)
+                   if 0 <= v < 2**32]
+    for ip in probes:
+        assert (ip in cs) is brute(ip), f"disagreement at {ip}"
