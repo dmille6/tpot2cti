@@ -228,8 +228,11 @@ def extract_jndi(text: str) -> list[JndiPayload]:
     for m in _JNDI.finditer(decoded):
         scheme = m.group("scheme").lower()
         # Trim the trailing '}' that closes the outer obfuscation wrapper
-        # and any stray delimiters the header may have carried.
-        rest = m.group("rest").rstrip("}\"'),;")
+        # and any stray delimiters the header may have carried — but never
+        # a '}' that closes a surviving ``${...}`` template. A payload
+        # ending in one (``.../${sys:java.version}}``) would otherwise be
+        # reported as a URL that was never sent, under the wrong id.
+        rest = _rstrip_unbalanced(m.group("rest"))
         if not rest:
             continue
         url = f"{scheme}://{rest}"
@@ -241,6 +244,29 @@ def extract_jndi(text: str) -> list[JndiPayload]:
             raw=text, decoded=decoded,
         ))
     return out
+
+
+#: Trailing characters that are wrapper/delimiter noise rather than part
+#: of the URL.
+_TRAILING_NOISE = "}\"'),;"
+
+
+def _rstrip_unbalanced(rest: str) -> str:
+    """Strip trailing delimiters, keeping braces that close a template.
+
+    ``rest`` may end in the outer obfuscation wrapper's ``}`` plus stray
+    quoting from the header it rode in. It may ALSO end in the ``}`` of a
+    surviving ``${...}`` lookup that is genuinely part of the URL. We keep
+    exactly as many closing braces as there are unclosed ``${`` openings.
+    """
+    opens = rest.count("${")
+    while rest and rest[-1] in _TRAILING_NOISE:
+        if rest[-1] == "}":
+            # Closing braces still needed to balance the templates.
+            if rest.count("}") <= opens:
+                break
+        rest = rest[:-1]
+    return rest
 
 
 def _host_of(url: str) -> Optional[str]:

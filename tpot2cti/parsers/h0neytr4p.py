@@ -295,7 +295,19 @@ class H0neytr4pParser(BaseParser):
         xff = doc.get("header_x-forwarded-for") or doc.get("http_x_forwarded_for")
         if xff is not None and str(xff) == raw_src:
             event.meta["src_ip_from_xff"] = True
-        if not self._is_ip(raw_src):
+        # Because src_ip IS the XFF header, it arrives in XFF's syntax,
+        # not as a bare address: `client, proxy1, proxy2` behind any
+        # proxy chain, sometimes quoted or bracketed. Rejecting the whole
+        # value would discard a usable client address over punctuation,
+        # which contradicts the reason we keep a plausible XFF at all.
+        # Normalize to the first hop — the originating client per RFC
+        # 7239 — and record the original whenever we changed anything.
+        normalized = self._normalize_src_ip(raw_src)
+        if normalized is not None and normalized != raw_src:
+            event.meta["src_ip_raw"] = raw_src[:REQUEST_BODY_CAP]
+            event.meta["src_ip_normalized_from_chain"] = True
+            event.src_ip = normalized
+        elif normalized is None:
             event.meta["src_ip_invalid"] = True
             event.meta["src_ip_raw"] = raw_src[:REQUEST_BODY_CAP]
 
@@ -306,14 +318,14 @@ class H0neytr4pParser(BaseParser):
         # arrives obfuscated and sprayed across many fields at once
         # (src_ip plus ~10 header_* values in the observed sample), so
         # scan them all and dedupe by recovered URL.
-        jndi = self._extract_jndi(doc, raw_src, uri, body_truncated, user_agent)
+        jndi, jndi_truncated = self._extract_jndi(doc)
         if jndi:
             event.meta["jndi_payloads"] = [j.to_dict() for j in jndi]
-            if len(jndi) >= _MAX_JNDI_PER_EVENT:
+            if jndi_truncated:
                 # No silent caps: say so where an operator can see it.
                 event.meta["jndi_truncated"] = True
                 logger.info(
-                    f"h0neytr4p: JNDI extraction hit the per-event cap "
+                    f"h0neytr4p: JNDI extraction exceeded the per-event cap "
                     f"({_MAX_JNDI_PER_EVENT}) on {event.sensor_hostname}; "
                     f"some endpoint variants not recorded"
                 )
@@ -442,6 +454,35 @@ class H0neytr4pParser(BaseParser):
                     hits.append(pat.pattern)
         return hits
 
+    @classmethod
+    def _normalize_src_ip(cls, raw: str) -> Optional[str]:
+        """Reduce an XFF-shaped value to its first-hop address, or None.
+
+        Handles the forms XFF actually arrives in — ``client, proxy1``,
+        quoted values, ``[::1]``, and a trailing ``:port`` — and returns
+        None for anything that still isn't an address (the Log4Shell
+        payload case). Returns the input unchanged when it is already a
+        bare address, so the common path costs one parse.
+        """
+        if cls._is_ip(raw):
+            return raw
+        # First hop only; the rest of the chain is intermediary proxies.
+        candidate = raw.split(",", 1)[0].strip().strip('"\'')
+        if cls._is_ip(candidate):
+            return candidate
+        # `[2001:db8::1]:443` / `[2001:db8::1]`
+        if candidate.startswith("["):
+            inner = candidate[1:].split("]", 1)[0]
+            if cls._is_ip(inner):
+                return inner
+        # `1.2.3.4:5678` — only strip a port when exactly one colon is
+        # present, so a bare IPv6 address is never mangled.
+        if candidate.count(":") == 1:
+            head = candidate.split(":", 1)[0]
+            if cls._is_ip(head):
+                return head
+        return None
+
     @staticmethod
     def _is_ip(value: str) -> bool:
         """True when ``value`` parses as an IPv4/IPv6 address.
@@ -457,43 +498,55 @@ class H0neytr4pParser(BaseParser):
 
     @staticmethod
     def _header_values(doc: dict) -> str:
-        """Newline-joined values of the legacy schema's ``header_*``
-        fields, for hint scanning. Empty on the modern schema, which
-        does not break out individual headers."""
+        """Newline-joined request-header values, for hint scanning.
+
+        The legacy schema breaks headers out as ``header_<name>``; the
+        modern one folds a fixed few into ``http_*`` fields and drops the
+        rest. Reading both keeps the hint scan working on either.
+        """
         return "\n".join(
             str(v) for k, v in doc.items()
-            if k.startswith("header_") and isinstance(v, (str, int, float))
+            if (k.startswith("header_") or k.startswith("http_"))
+            and isinstance(v, (str, int, float))
         )
 
     @classmethod
-    def _extract_jndi(
-        cls, doc: dict, raw_src: str, uri: str, body: str, user_agent: str,
-    ) -> list:
-        """Recover distinct JNDI endpoints from every attacker-controlled
-        field on the document.
+    def _extract_jndi(cls, doc: dict) -> tuple[list, bool]:
+        """Recover distinct JNDI endpoints from the whole document.
 
-        Deduped by recovered URL and capped: a single request carried the
-        same payload in 11 fields in the observed sample, and we want one
-        C2 observable out of it, not eleven.
+        Returns ``(payloads, truncated)``.
+
+        Scans **every top-level string value** rather than an allowlist of
+        field names. A Log4Shell probe sprays whatever fields it can
+        reach, and the two live schemas expose those fields under
+        different names — the legacy one as ``header_*``, the modern one
+        as ``http_referer`` / ``http_host`` / ``sni`` and friends. An
+        allowlist silently missed every modern-schema header, which is
+        ~99.6% of live traffic: a Referer-borne payload was recovered on
+        one sensor and invisible on all the others. Nothing the honeypot
+        itself writes contains ``${jndi:``, so scanning broadly is safe,
+        and the ``"${" not in value`` pre-check keeps it cheap.
+
+        Deduped by recovered URL, so one payload sprayed across a dozen
+        headers yields one endpoint.
         """
         seen: set[str] = set()
         out: list = []
-        candidates = [raw_src, uri, body, str(user_agent)]
-        candidates.extend(
-            str(v) for k, v in doc.items()
-            if k.startswith("header_") and isinstance(v, str)
-        )
-        for value in candidates:
-            if not value or "${" not in value:
+        for value in doc.values():
+            if not isinstance(value, str) or "${" not in value:
                 continue
             for payload in extract_jndi(value):
                 if payload.url in seen:
                     continue
                 seen.add(payload.url)
                 out.append(payload)
-                if len(out) >= _MAX_JNDI_PER_EVENT:
-                    return out
-        return out
+        # Truncate AFTER collecting, so the flag means "we actually
+        # dropped something" rather than "we happened to hit the cap
+        # exactly". Candidate count is bounded by the document's field
+        # count, so collecting first is safe.
+        if len(out) > _MAX_JNDI_PER_EVENT:
+            return out[:_MAX_JNDI_PER_EVENT], True
+        return out, False
 
     @staticmethod
     def _safe_int(value) -> Optional[int]:
