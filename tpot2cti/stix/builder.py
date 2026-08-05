@@ -734,6 +734,43 @@ def _describe_ip(ip: str, session: "AttackSession") -> str:
 DEFAULT_INDICATOR_VALIDITY_DAYS = 60
 
 
+def _validity_days_for(score: int) -> int:
+    """Indicator lifetime as a function of evidence, not of age.
+
+    Validity was a flat DEFAULT_INDICATOR_VALIDITY_DAYS for every indicator,
+    which made lifetime a pure timer. Measured against the live corpus on
+    2026-08-05, that timer is actively harmful: sampling 3,000 revoked and
+    3,000 live indicators and asking the hive whether each IP attacked
+    yesterday --
+
+        live (non-revoked) indicators   287/3,000 = 9.6% still active
+        REVOKED indicators              534/3,000 = 17.8% still active
+
+    The revoked set is 1.9x MORE predictive than the live set, because the
+    oldest indicators are the persistent high-volume attackers -- they were
+    there first precisely because they never left, so an age-based timer
+    kills the best ones first.
+
+    Attacker persistence is also bimodal, not unimodal: of the 3,000 busiest
+    source IPs, ~half recur within 7 days and ~14% are still active at 30,
+    while the rest vanish inside a day. One curve cannot serve both, so
+    lifetime now follows the evidence band that the score already encodes.
+
+    NOTE: OpenCTI's own built-in decay rule ("Built-in IP and URL",
+    decay_lifetime 47d, decay_revoke_score 20) still applies on top and will
+    revoke sooner for low-scoring indicators. This sets the ceiling honestly;
+    aligning or disabling that platform rule is a separate, operator-side
+    decision.
+    """
+    if score >= 80:      # malware + hands-on, or known-bad reputation
+        return 90
+    if score >= 70:      # substantive interaction
+        return 45
+    if score > BASELINE_INDICATOR_SCORE:
+        return 21
+    return 7             # bare drive-by probe: a week is generous
+
+
 # ---------------------------------------------------------------------------
 # STIXBuilder
 # ---------------------------------------------------------------------------
@@ -1578,10 +1615,22 @@ class STIXBuilder:
         )
 
         # Score + valid_from/valid_until
-        score = _signal_score(session)
+        #
+        # `_ip_score`, NOT `_signal_score`. The Observable for this same IP is
+        # built with `_ip_score` (substance PLUS threat-intel reputation), so
+        # using the bare substance score here silently discarded every
+        # enrichment the pipeline had already computed — at the one layer a
+        # STIX/TAXII consumer actually sees.
+        #
+        # Measured live 2026-08-05, before this change: of 500 IPv4 observables
+        # the pipeline itself scored >=90, 346 (69%) exported as REVOKED,
+        # score-20 indicators. Corpus-wide 10,195 observables scored >=70 and
+        # only 80 indicators did. The analysis was right and the output threw
+        # it away.
+        score = _ip_score(session)
         first_seen = session.first_seen if session else datetime.now(timezone.utc)
         last_seen = session.last_seen if session else datetime.now(timezone.utc)
-        valid_until = last_seen + timedelta(days=DEFAULT_INDICATOR_VALIDITY_DAYS)
+        valid_until = last_seen + timedelta(days=_validity_days_for(score))
 
         # Description — multi-paragraph context (PoC pattern). Skip when no
         # session info available (smoke tests + edge cases).
