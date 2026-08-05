@@ -60,12 +60,18 @@ class _FakeES:
 class _CapturingPublisher:
     """Captures the objects run_cycle hands to publish() and reports OK."""
 
-    def __init__(self):
+    def __init__(self, errors=None):
         self.objects: list[dict] = []
+        self._errors = list(errors or [])
 
     def publish(self, objects, cycle_id=None):
         self.objects = list(objects)
-        return SimpleNamespace(ok=True, errors=[], cycle_id=cycle_id)
+        # Mirrors the REAL PublishResult: it reports failure through `errors`
+        # and has no `ok` attribute. The previous fake returned `ok=True`, a
+        # shape the publisher never produces — so it could not have caught the
+        # bug where CORE read `.ok` and treated every failure as success.
+        return SimpleNamespace(cycle_id=cycle_id, pass_counts={},
+                               errors=list(self._errors))
 
 
 def _run(cfg, state_db, docs):
@@ -188,3 +194,24 @@ def test_query_exclusion_and_unparsed_breakdown_reach_state(cfg, state_db):
     assert _json.loads(persisted).get("Suricata:flow") == 1
     assert state_db.get("last_cycle_query_excluded") is not None, \
         "query_excluded documented as durable but never written"
+
+
+def test_a_failed_publish_is_not_recorded_as_success(cfg, state_db):
+    """CORE read `getattr(result, "ok", True)`, but PublishResult has no `ok` —
+    so every publish, including total failures, evaluated to success and
+    advanced `last_run` past data that never landed. The old fake returned
+    `ok=True`, a shape the real publisher never produces, so the suite could
+    not have caught it."""
+    from dataclasses import fields
+    from tpot2cti.publisher import PublishResult
+    assert "ok" not in [f.name for f in fields(PublishResult)], \
+        "PublishResult grew an `ok` field — revisit how success is detected"
+
+    docs = [json.loads(l) for l in
+            (_FIXTURES / "cowrie.jsonl").read_text().splitlines() if l.strip()]
+    pub = _CapturingPublisher(errors=["Pass 'entities' failed: 500"])
+    summary = run_cycle(cfg, state_db, _FakeES(docs), lambda: STIXBuilder(cfg), pub)
+
+    assert summary["publish_ok"] is False, "a failed publish reported success"
+    assert state_db.get_last_run() is None, \
+        "cursor advanced past a publish that failed — silent data loss"
