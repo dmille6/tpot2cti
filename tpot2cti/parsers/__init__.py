@@ -87,13 +87,64 @@ def registered_types() -> list[str]:
     return sorted(k for k in _PARSERS.keys() if k != FALLBACK_KEY)
 
 
+#: How often `type` had to be recovered from the source log path, by
+#: (reported type -> recovered type). Surfaced in the cycle summary: a
+#: recovery that nobody counts is indistinguishable from data we never had.
+TYPE_RECOVERIES: "dict[tuple[str, str], int]" = {}
+
+
+def _type_from_path(doc: dict) -> Optional[str]:
+    """Recover the honeypot name from the source log path.
+
+    T-Pot's `type` is taken from the honeypot's own output, so a honeypot
+    that reports a *field of its record* rather than its name mislabels
+    every such doc. Measured on the live hive, 2026-08-05:
+
+        type=ssh-rsa / ssh-ed25519 / ssh-dss   -> /data/cowrie/log/cowrie.json
+            4,192 docs in 35 days, ALL of them `cowrie.login.success` —
+            successful public-key root logins carrying the attacker's key
+            and fingerprint. The single highest-value event Cowrie emits.
+        type=invalidJSONResponse / contentGenerationError
+                                               -> /data/galah/log/galah.json
+            12,351 docs where Galah's LLM backend failed. One sampled
+            "error" doc still carried a live `busybox wget ... | sh`
+            payload in the request URI.
+
+    Both sets were in TPOT2CTI_IGNORE_TYPES, so they were discarded
+    outright. `path` was 100% consistent across all 16,543 docs.
+
+    The mapping is derived, not hardcoded: `/data/<name>/...` is matched
+    case-insensitively against the registered parsers, so a honeypot added
+    later is covered without touching this function.
+    """
+    path = str(doc.get("path") or "")
+    if not path:
+        return None
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2 or parts[0] != "data":
+        return None
+    candidate = parts[1].lower()
+    for registered in _PARSERS:
+        if registered != FALLBACK_KEY and registered.lower() == candidate:
+            return registered
+    return None
+
+
 def dispatch(doc: dict) -> Optional[ParsedEvent]:
     """One-stop helper: pick the parser for a doc, run parse(), return
     the ParsedEvent (or None if the doc was malformed / skipped).
 
     Convenience for the importer's main loop.
     """
-    type_name = doc.get("type") or ""
+    type_name = str(doc.get("type") or "")
+    if type_name not in _PARSERS:
+        # Only ever a fallback: a `type` that already names a registered
+        # parser is trusted as-is, so this cannot re-route good docs.
+        if recovered := _type_from_path(doc):
+            TYPE_RECOVERIES[(type_name, recovered)] = (
+                TYPE_RECOVERIES.get((type_name, recovered), 0) + 1
+            )
+            type_name = recovered
     parser = get_parser(str(type_name))
     if parser is None:
         return None
