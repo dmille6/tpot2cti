@@ -305,3 +305,81 @@ def test_classification_is_recorded_only_after_a_successful_publish(cfg, state_d
 
     retry = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=True))
     assert retry["fleet_scan"] == 1, "must retry after a failed publish"
+
+
+def _scanners(n, now):
+    """n distinct fan-out scanners, deliberately spanning octet widths so the
+    TEXT column's lexicographic order differs from numeric order."""
+    return [(f"45.9.{i}.{i % 7}", p, "s1", 1, 1, 0, 0, 0, 0, now, now, None)
+            for i in range(n) for p in ("Cowrie", "Dionaea", "ConPot")]
+
+
+def _sweep(cfg, state_db, db, page, max_cycles=40, pub=None):
+    from tpot2cti.stix.builder import STIXBuilder
+    orig, nf.MAX_PER_CYCLE = nf.MAX_PER_CYCLE, page
+    seen, cycles = 0, 0
+    try:
+        while cycles < max_cycles:
+            s = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), pub or _Pub())
+            seen += s["fleet_scan"]
+            cycles += 1
+            if s["sweep_complete"]:
+                break
+        return seen, cycles
+    finally:
+        nf.MAX_PER_CYCLE = orig
+
+
+def test_sweep_is_complete_when_population_is_an_exact_multiple_of_the_page(cfg, state_db, tmp_path):
+    """The sweep resets only on a SHORT page. At an exact multiple the last
+    full page looks like 'more to come', so completion depends on one extra
+    empty read — verify it actually happens instead of stalling."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(20, now))
+    seen, cycles = _sweep(cfg, state_db, db, page=10)
+    assert seen == 20, f"exact-multiple population lost addresses: {seen}/20"
+    assert cycles == 3, "expected 2 full pages plus the empty page that resets"
+
+
+def test_lexicographic_cursor_does_not_skip_addresses(cfg, state_db, tmp_path):
+    """src_ip is TEXT, so '45.9.10.x' sorts before '45.9.9.x'. The cursor is
+    only safe because WHERE and ORDER BY share that collation — if they ever
+    diverge, addresses vanish silently."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(30, now))
+    seen, _ = _sweep(cfg, state_db, db, page=7)
+    assert seen == 30, f"lexicographic ordering skipped addresses: {seen}/30"
+
+
+def test_a_persistent_publish_failure_does_not_advance_past_lost_data(cfg, state_db, tmp_path):
+    """Advancing on a failed publish is how a cursor walks past data that never
+    landed — the defect this project already shipped once."""
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(30, now))
+    orig, nf.MAX_PER_CYCLE = nf.MAX_PER_CYCLE, 10
+    try:
+        for _ in range(3):
+            s = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=False))
+            assert s["publish_ok"] is False
+        assert (state_db.get(nf.SWEEP_CURSOR_KEY) or "") == "", \
+            "cursor advanced past a page that never published"
+        # once publishing recovers, the full sweep still covers everything
+        seen, _ = _sweep(cfg, state_db, db, page=10)
+        assert seen == 30, f"data lost after recovery: {seen}/30"
+    finally:
+        nf.MAX_PER_CYCLE = orig
+
+
+def test_a_read_failure_leaves_the_cursor_untouched(cfg, state_db, tmp_path):
+    from tpot2cti.stix.builder import STIXBuilder
+    state_db.set(nf.SWEEP_CURSOR_KEY, "45.9.5.5")
+    nf.run_cycle(cfg, state_db, str(tmp_path / "gone.db"),
+                 lambda: STIXBuilder(cfg), _Pub())
+    assert state_db.get(nf.SWEEP_CURSOR_KEY) == "45.9.5.5"
