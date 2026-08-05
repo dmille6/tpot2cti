@@ -404,3 +404,32 @@ def test_a_future_timestamp_is_not_infinitely_fresh(state_db):
     future = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
     state_db.set("bl_fetched_at:firehol", future)
     assert bl.age_hours(state_db, "firehol") is None
+
+
+def test_a_family_failing_the_quality_gate_yields_NEITHER_sdo_NOR_edge(builder):
+    """Building the edge from a re-derived malware id is only safe if it can
+    never disagree with the builder. A family the gate rejects must produce
+    nothing at all — an edge to an SDO that was never emitted is a dangling
+    reference, which is worse than a missing one."""
+    # A distinct address per case: the builder dedups an observable it already
+    # emitted this cycle, so reusing one IP would mask the assertion.
+    for n, junk in enumerate(("generic", "trojan", "gen42", "malware"), start=1):
+        ip = f"45.9.1.{n}"
+        objs = bl.build_objects(builder, ip, [("feodo", {"families": {ip: junk}})],
+                                src.SOURCES_BY_KEY)
+        kinds = [o["type"] for o in objs]
+        assert kinds == ["ipv4-addr"], f"{junk!r} produced {kinds}"
+
+
+def test_the_edge_target_matches_the_builders_own_malware_id(builder):
+    """Pin the derivation itself: blocklists computes the target id separately
+    from build_malware, so the two must agree by construction."""
+    from tpot2cti.stix.builder import normalize_malware_family
+    from tpot2cti.stix_ids import generate_malware_id
+    objs = bl.build_objects(builder, "45.9.1.2",
+                            [("feodo", {"families": {"45.9.1.2": "QakBot"}})],
+                            src.SOURCES_BY_KEY)
+    mal = next(o for o in objs if o["type"] == "malware")
+    rel = next(o for o in objs if o["type"] == "relationship")
+    assert rel["target_ref"] == mal["id"]
+    assert mal["id"] == generate_malware_id(normalize_malware_family("QakBot"))
