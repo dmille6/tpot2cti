@@ -283,16 +283,35 @@ def _compute_window(
         if last_run.tzinfo is None:
             last_run = last_run.replace(tzinfo=timezone.utc)
         # Cap pathologically-long windows — if the importer was down for
-        # a week, we don't want to pull a week of events in one cycle.
-        # 24h is the cap; the catch-up will happen across multiple cycles.
+        # a week, we don't want to pull a week of events in one cycle. 24h
+        # is the cap, and the catch-up then walks forward one cap per cycle.
+        #
+        # This used to `return now - max_window, now`, which does NOT catch
+        # up — it jumps to the present and the cursor then advances past
+        # everything in between, so the gap is skipped permanently and
+        # silently. The comment claimed catch-up happened "across multiple
+        # cycles"; it never did. Measured cost: the 2026-07-19 outage left
+        # 80,260,536 documents unread across 17 daily indices, and the
+        # recovery documented in CHANGELOG ("manual cursor rewind") could
+        # not work either, because rewinding last_run just re-triggered
+        # this same jump on the next cycle.
+        #
+        # Anchoring the window to last_run instead makes a rewind actually
+        # replay the gap, one 24h step per cycle. Replay is safe: every id
+        # is a deterministic UUID5 (tpot2cti/stix_ids.py) and the publisher
+        # keeps max(score) with label union across cycles, so re-covering a
+        # window converges rather than duplicating.
         max_window = timedelta(hours=24)
         if now - last_run > max_window:
+            window_end = last_run + max_window
             logger.warning(
                 f"last_run is {(now - last_run).total_seconds() / 3600:.1f}h "
-                f"old; capping window to {max_window} to avoid an overlarge "
-                f"single-cycle pull"
+                f"old; catching up one {max_window} step at a time — this "
+                f"cycle covers [{last_run.isoformat()}, "
+                f"{window_end.isoformat()}), still "
+                f"{(now - window_end).total_seconds() / 3600:.1f}h behind"
             )
-            return now - max_window, now
+            return last_run, window_end
         return last_run, now
 
     lookback = cfg.cycle.initial_lookback_hours
