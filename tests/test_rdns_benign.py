@@ -293,3 +293,28 @@ def test_a_filter_nobody_initialised_still_works():
         [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
                      rdns_suffixes=("shadowserver.io",))], resolver=r)
     assert f.match(_event("184.105.139.69", asn=None, org=None)) == "shadowserver"
+
+
+def test_the_wall_clock_bound_survives_a_resolver_without_an_elapsed_attribute():
+    """The bound must not depend on the resolver exposing a counter. Reading
+    `getattr(resolver, "elapsed", 0.0)` would return 0.0 for any duck-typed
+    resolver and silently disable the only real stall bound — no error, no
+    signal, exactly the failure shape this codebase keeps hitting."""
+    import time as _t
+
+    class _Bare:                      # deliberately has no `elapsed`
+        def __init__(self): self.calls = 0
+        def name_for(self, ip):
+            self.calls += 1
+            _t.sleep(0.01)
+            return None
+
+    bare = _Bare()
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="x", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("example.com",))], resolver=bare)
+    f.begin_cycle(10_000, time_budget=0.05)
+    for i in range(500):
+        f.match(_event(f"45.9.{i // 256}.{i % 256}", asn=None, org=None))
+    assert bare.calls < 500, "no elapsed attribute silently disabled the bound"
+    assert f.rdns_skipped_budget > 0

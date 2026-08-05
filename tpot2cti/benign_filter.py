@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,6 +147,7 @@ class BenignScannerFilter:
         # Exhaustion is never silent either: rdns_skipped_budget is reported.
         self._rdns_budget = DEFAULT_RDNS_BUDGET
         self._rdns_time_budget = DEFAULT_RDNS_TIME_BUDGET
+        self._rdns_elapsed = 0.0
         self.rdns_skipped_budget = 0
         # Precompute an ASN → vendor lookup for the fast path.
         self._asn_to_vendor: dict[int, str] = {}
@@ -165,6 +167,7 @@ class BenignScannerFilter:
         """Reset the per-cycle rDNS budgets and the skip counter."""
         self._rdns_budget = max(0, int(budget))
         self._rdns_time_budget = max(0.0, float(time_budget))
+        self._rdns_elapsed = 0.0
         self.rdns_skipped_budget = 0
         if self._resolver is not None and hasattr(self._resolver, "reset_stats"):
             self._resolver.reset_stats()
@@ -261,19 +264,26 @@ class BenignScannerFilter:
             hit, known = cached(event.src_ip)
             if known:
                 return self._vendor_for(hit)
-        spent = getattr(self._resolver, "elapsed", 0.0)
-        if self._rdns_budget <= 0 or spent >= self._rdns_time_budget:
+        # Time the calls HERE rather than reading an attribute off the
+        # resolver: `getattr(resolver, "elapsed", 0.0)` would silently return
+        # 0.0 for any resolver that does not expose it, disabling the only real
+        # stall bound with no error and no signal. The filter owns the budget,
+        # so the filter measures it.
+        if self._rdns_budget <= 0 or self._rdns_elapsed >= self._rdns_time_budget:
             # Fail OPEN: out of budget means "we do not know", so the event is
             # kept. Under-filtering is visible and fixable; dropping a real
             # attacker because a resolver was slow is data loss.
             self.rdns_skipped_budget += 1
             return None
         self._rdns_budget -= 1
+        started = time.monotonic()
         try:
             name = self._resolver.name_for(event.src_ip)
         except Exception:
             # An injected or misbehaving resolver must never break ingest.
             return None
+        finally:
+            self._rdns_elapsed += time.monotonic() - started
         return self._vendor_for(name)
 
     def _vendor_for(self, name: Optional[str]) -> Optional[str]:
