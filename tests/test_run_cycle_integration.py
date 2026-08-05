@@ -162,3 +162,29 @@ def test_attack_patterns_are_technique_bounded_not_per_event(cfg, state_db):
         f"attack-patterns ({aps}) scaling with events/IPs ({ipv4}) — the "
         f"2026-07-19 per-session re-emission bug has regressed"
     )
+
+
+def test_query_exclusion_and_unparsed_breakdown_reach_state(cfg, state_db):
+    """Both reviewers flagged the previous version of this test: it asserted on
+    `inspect.getsource` text, verified nothing behavioural, and passed while the
+    persistence it claimed to check did not exist anywhere in the codebase. A
+    counter that documents a data EXCLUSION is the only evidence the exclusion
+    happened, so this reads the rows back."""
+    import json as _json
+    docs = [json.loads(l) for l in
+            (_FIXTURES / "cowrie.jsonl").read_text().splitlines() if l.strip()]
+    # one doc the parser cannot use, to populate the breakdown
+    docs.append({"type": "Suricata", "src_ip": "198.51.100.21",
+                 "event_type": "flow", "@timestamp": docs[0]["@timestamp"],
+                 "t-pot_hostname": "sensor01"})
+    summary, _ = _run(cfg, state_db, docs)
+
+    assert "unparsed_by_source" in summary
+    assert summary["unparsed_by_source"].get("Suricata:flow") == 1, \
+        "Suricata must be split by event_type, not lumped under one key"
+
+    persisted = state_db.get("last_cycle_unparsed_by_source")
+    assert persisted is not None, "breakdown documented as durable but never written"
+    assert _json.loads(persisted).get("Suricata:flow") == 1
+    assert state_db.get("last_cycle_query_excluded") is not None, \
+        "query_excluded documented as durable but never written"
