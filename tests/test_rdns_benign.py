@@ -318,3 +318,63 @@ def test_the_wall_clock_bound_survives_a_resolver_without_an_elapsed_attribute()
         f.match(_event(f"45.9.{i // 256}.{i % 256}", asn=None, org=None))
     assert bare.calls < 500, "no elapsed attribute silently disabled the bound"
     assert f.rdns_skipped_budget > 0
+
+
+def test_a_resolver_without_cached_name_for_cannot_kill_the_cycle():
+    """The audit-trail code used to call `cached_name_for` unguarded from
+    inside the ES stream loop, reaching into `benign_filter._resolver`. That
+    loop's handler re-raises, so an AttributeError there KILLS the cycle — on a
+    public injection point (`from_yaml(resolver=...)`). Samples are now
+    recorded where the match happens, so no caller touches the resolver."""
+    class _Bare:
+        def name_for(self, ip): return "scan-03.shadowserver.io"
+
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("shadowserver.io",))], resolver=_Bare())
+    f.begin_cycle(10)
+    assert f.match(_event("184.105.139.69", asn=None, org=None)) == "shadowserver"
+    assert f.rdns_samples == [{"ip": "184.105.139.69",
+                               "name": "scan-03.shadowserver.io",
+                               "vendor": "shadowserver"}]
+
+
+def test_begin_cycle_resets_the_time_budget_or_rdns_dies_after_cycle_one():
+    """Lifecycle, not enforcement. If `begin_cycle` stops resetting the elapsed
+    accumulator, the budget is already spent on cycle 2 and rDNS goes SILENTLY
+    dead for the life of the process — while every enforcement test still
+    passes. Removing the reset previously passed all 649 tests."""
+    import time as _t
+
+    class _Slow:
+        def __init__(self): self.calls = 0
+        def name_for(self, ip):
+            self.calls += 1
+            _t.sleep(0.02)
+            return None
+
+    slow = _Slow()
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="x", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("example.com",))], resolver=slow)
+    for cycle in range(3):
+        f.begin_cycle(100, time_budget=0.05)
+        before = slow.calls
+        for i in range(20):
+            f.match(_event(f"45.9.{cycle}.{i}", asn=None, org=None))
+        assert slow.calls > before, f"rDNS went dead on cycle {cycle + 1}"
+        assert f._rdns_elapsed < 1.0, "elapsed carried over between cycles"
+
+
+def test_samples_are_bounded_and_reset_each_cycle():
+    class _Bare:
+        def name_for(self, ip): return "scan-03.shadowserver.io"
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("shadowserver.io",))], resolver=_Bare())
+    f.begin_cycle(1000)
+    for i in range(200):
+        f.match(_event(f"45.9.{i // 256}.{i % 256}", asn=None, org=None))
+    assert len(f.rdns_samples) == 25
+    f.begin_cycle(1000)
+    assert f.rdns_samples == []

@@ -560,10 +560,6 @@ def run_cycle(
             # tpot2cti/data/benign_scanners.yaml for the source list.
             if benign_filter is not None:
                 benign_vendor = benign_filter.match(event)
-                if benign_vendor and getattr(benign_filter, "_resolver", None):
-                    nm, known = benign_filter._resolver.cached_name_for(event.src_ip)
-                    if known and nm:
-                        benign_stats.record_sample(event.src_ip, nm, benign_vendor)
                 if benign_vendor:
                     benign_stats.record(benign_vendor)
                     continue
@@ -654,12 +650,16 @@ def run_cycle(
         # documenting durability that does not exist is the failure this
         # project keeps repeating.
         state.set("last_cycle_query_excluded", json.dumps(query_excluded))
-        state.set("last_cycle_benign_dropped", json.dumps(benign_stats.to_log_dict()))
+        _bd = benign_stats.to_log_dict()
+        _bd["rdns_samples"] = list(getattr(benign_filter, "rdns_samples", []))
+        state.set("last_cycle_benign_dropped", json.dumps(_bd))
         state.set("last_cycle_unparsed_by_source",
                   json.dumps(dict(unparsed_by_source.most_common(30))))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug(f"cycle {cycle_id}: could not persist drop reasons: {e}")
 
+    _r = getattr(benign_filter, "_resolver", None)
+    _rdns_stats = _r.stats() if hasattr(_r, "stats") else {}
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
         f"events_dropped={events_dropped} drops={drop_reasons} "
@@ -667,6 +667,7 @@ def run_cycle(
         f"unparsed_by_source={dict(unparsed_by_source.most_common(8))} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"rdns_skipped_budget={getattr(benign_filter, 'rdns_skipped_budget', 0)} "
+        f"rdns={_rdns_stats} "
         f"types={sorted(parsed_by_type.keys())}"
     )
     state.heartbeat()  # ES stream done — still alive before build/publish.

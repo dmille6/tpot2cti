@@ -118,8 +118,15 @@ DEFAULT_RDNS_BUDGET = int(os.environ.get("TPOT2CTI_BENIGN_RDNS_BUDGET", "2000"))
 #: allowed a 58 ms lookup; 87 of 600 live addresses exceeded 1 s, max 11.5 s),
 #: so a count budget alone bounds nothing. 60 s is ~1% of a 2 h cycle, and
 #: overshoot is at most one in-flight lookup.
+#: Raised from 60s after measuring the real arrival rate: 220 new addresses per
+#: 2h cycle (peak day 344), at ~403 ms mean resolution. 60s covered only 68% of
+#: them, so a scanner's first cycle or two could still be published. 180s is
+#: ~2.5% of a cycle and covers the peak with headroom.
 DEFAULT_RDNS_TIME_BUDGET = float(
-    os.environ.get("TPOT2CTI_BENIGN_RDNS_TIME_BUDGET", "60"))
+    os.environ.get("TPOT2CTI_BENIGN_RDNS_TIME_BUDGET", "180"))
+
+#: Bound on the per-cycle drop sample.
+_MAX_RDNS_SAMPLES = 25
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +156,10 @@ class BenignScannerFilter:
         self._rdns_time_budget = DEFAULT_RDNS_TIME_BUDGET
         self._rdns_elapsed = 0.0
         self.rdns_skipped_budget = 0
+        #: Bounded sample of rDNS-based drops, recorded where the match happens
+        #: so the caller never has to reach into the resolver. Only rDNS
+        #: matches are sampled: an ASN/org match has no name to report.
+        self.rdns_samples: list[dict] = []
         # Precompute an ASN → vendor lookup for the fast path.
         self._asn_to_vendor: dict[int, str] = {}
         for r in rules:
@@ -169,6 +180,7 @@ class BenignScannerFilter:
         self._rdns_time_budget = max(0.0, float(time_budget))
         self._rdns_elapsed = 0.0
         self.rdns_skipped_budget = 0
+        self.rdns_samples = []
         if self._resolver is not None and hasattr(self._resolver, "reset_stats"):
             self._resolver.reset_stats()
 
@@ -263,7 +275,7 @@ class BenignScannerFilter:
         if cached is not None:
             hit, known = cached(event.src_ip)
             if known:
-                return self._vendor_for(hit)
+                return self._vendor_for(hit, event.src_ip)
         # Time the calls HERE rather than reading an attribute off the
         # resolver: `getattr(resolver, "elapsed", 0.0)` would silently return
         # 0.0 for any resolver that does not expose it, disabling the only real
@@ -284,14 +296,17 @@ class BenignScannerFilter:
             return None
         finally:
             self._rdns_elapsed += time.monotonic() - started
-        return self._vendor_for(name)
+        return self._vendor_for(name, event.src_ip)
 
-    def _vendor_for(self, name: Optional[str]) -> Optional[str]:
+    def _vendor_for(self, name: Optional[str], ip: Optional[str] = None) -> Optional[str]:
         if not name:
             return None
         for rule in self._rdns_rules:
             for suffix in rule.rdns_suffixes:
                 if suffix_matches(name, suffix):
+                    if ip and len(self.rdns_samples) < _MAX_RDNS_SAMPLES:
+                        self.rdns_samples.append(
+                            {"ip": ip, "name": name, "vendor": rule.vendor})
                     return rule.vendor
         return None
 
