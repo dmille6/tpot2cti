@@ -121,3 +121,163 @@ def test_rejections_are_counted(builder):
     assert builder.build_domain("huangxcdh.html") is None
     assert builder.rejected_urls == 2
     assert builder.rejected_domains == 1
+
+
+# ── review findings, 2026-08-05 ──────────────────────────────────────────
+# Every test below is a defect that six independent reviews found in the
+# first cut of this branch. They are regression locks, not coverage padding.
+
+def test_a_rejected_download_url_leaves_no_dangling_relationship(builder):
+    """THE BLOCKER. `_link_download_chain` anchored the URL->File edge on
+    `generate_url_id(url)` unconditionally. That was safe only while
+    build_url accepted everything; once it can refuse, the edge points at an
+    SCO that is never published — a dangling ref, which
+    LESSONS_LEARNED_FROM_V0 §3 calls the costliest failure in this project."""
+    from datetime import datetime, timezone
+    from tpot2cti.parsers.base import AttackSession
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    s = AttackSession(src_ip="198.51.100.9", session_id="s1",
+                      sensor_hostname="sensor01", event_type="Cowrie",
+                      first_seen=now, last_seen=now)
+    sha = "a" * 64
+    s.malware_hashes.append(sha)
+    s.downloads = [{"sha256": sha, "url": "/admin.php"}]   # bare path, refused
+
+    objs = builder._link_download_chain(s)
+    ids = {o["id"] for o in objs}
+    for o in objs:
+        for ref in ("source_ref", "target_ref"):
+            if ref in o and o[ref].startswith("url--"):
+                assert o[ref] in ids, (
+                    f"dangling ref: {o[ref]} is referenced but never emitted"
+                )
+    # `_link_download_chain` emits edges only (the File SCO is built by the
+    # caller from session.malware_hashes), so the refused URL must cost
+    # exactly this one edge and nothing else.
+    assert not [o for o in objs if o["type"] == "relationship"
+                and o["source_ref"].startswith("url--")], (
+        "the URL->File edge was emitted for a URL that was never published"
+    )
+
+
+def test_a_valid_download_url_still_gets_its_edge(builder):
+    """The positive control. Without it the test above passes vacuously the
+    moment `_link_download_chain` stops emitting anything at all."""
+    from datetime import datetime, timezone
+    from tpot2cti.parsers.base import AttackSession
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    s = AttackSession(src_ip="198.51.100.9", session_id="s2",
+                      sensor_hostname="sensor01", event_type="Cowrie",
+                      first_seen=now, last_seen=now)
+    sha = "b" * 64
+    s.malware_hashes.append(sha)
+    s.downloads = [{"sha256": sha, "url": "http://evil.example/x.sh"}]
+
+    objs = builder._link_download_chain(s)
+    ids = {o["id"] for o in objs}
+    rels = [o for o in objs if o["type"] == "relationship"
+            and o["source_ref"].startswith("url--")]
+    assert rels, "the URL->File edge disappeared for a perfectly good URL"
+    assert all(r["source_ref"] in ids for r in rels)
+
+
+def test_whitespace_padding_cannot_split_a_url_across_two_ids(builder):
+    """valid_url strips; hashing the raw string anchored the edge on a
+    different id than the SCO was published under."""
+    from tpot2cti.stix_ids import generate_url_id
+    from tpot2cti.stix.builder import valid_url
+    padded = "  http://evil.example/x  "
+    assert valid_url(padded) == "http://evil.example/x"
+    assert generate_url_id(valid_url(padded)) == \
+        generate_url_id("http://evil.example/x")
+
+
+# ── false rejections of real IoCs ────────────────────────────────────────
+
+def test_tftp_droppers_survive():
+    """`_CMD_URL_RE` is written to extract tftp:// out of command
+    transcripts — its own comment says "wget/curl/tftp droppers". If the
+    scheme sets drift, the extractor mints a URL the validator throws away,
+    silently, on the highest-confidence intel path there is."""
+    from tpot2cti.stix.builder import _CMD_URL_RE, _URL_SCHEMES
+    assert valid_url("tftp://185.62.190.11/bins.sh") is not None
+    for scheme in ("http", "https", "ftp", "tftp"):
+        assert scheme in _URL_SCHEMES, f"{scheme} extracted but not accepted"
+        assert _CMD_URL_RE.match(f"{scheme}://h.example/x"), scheme
+
+
+def test_onion_addresses_are_not_malformed():
+    """RFC 7686 reserves .onion, so it is absent from the IANA root BY
+    DESIGN — the same argument that already admits example/test/invalid."""
+    assert valid_domain("3g2upl4pq6kufc4m.onion") == "3g2upl4pq6kufc4m.onion"
+    assert valid_url("http://3g2upl4pq6kufc4m.onion/") is not None
+
+
+def test_every_shipped_punycode_tld_is_actually_reachable():
+    """All 151 xn-- entries in iana_tlds.txt were unreachable dead weight:
+    _DOMAIN_RE ended in [a-z]{2,63}, which no A-label can ever match. The
+    file shipped them, so the intent was plainly to accept them."""
+    from tpot2cti.stix.builder import IANA_TLDS
+    puny = sorted(t for t in IANA_TLDS if t.startswith("xn--"))
+    assert puny, "no punycode TLDs shipped — has the list been truncated?"
+    unreachable = [t for t in puny if valid_domain(f"example.{t}") is None]
+    assert not unreachable, (
+        f"{len(unreachable)} of {len(puny)} punycode TLDs are unreachable, "
+        f"e.g. {unreachable[:3]}"
+    )
+    assert valid_domain("shop.xn--p1ai") == "shop.xn--p1ai"
+
+
+# ── the JNDI exemption must stay an exemption ────────────────────────────
+
+def test_the_jndi_exemption_is_not_a_general_bypass():
+    """Keyed on the scheme alone, ANY attacker-controlled string carrying a
+    JNDI scheme skipped host validation entirely. Only an unresolved
+    template justifies the skip, because only a template is un-validatable
+    by construction."""
+    for bypass in ("ldap://ANYTHING-AT-ALL", "ldap://----/x",
+                   "ldap://azenv.nethttp/x", "nds://../../etc/passwd",
+                   "dns://Mozilla-5.0-compatible-Bot/x"):
+        assert valid_url(bypass) is None, f"{bypass} bypassed host validation"
+
+
+def test_a_templated_jndi_host_is_still_kept_verbatim():
+    """The exemption's actual justification: an exfil payload embeds an
+    unresolved Log4j template in the hostname so the victim leaks its Java
+    version over DNS. The URL is the evidence and cannot be validated."""
+    exfil = "ldap://x-${sys:java.version}.c2.example/a"
+    assert valid_url(exfil) == exfil
+
+
+def test_a_jndi_url_with_an_ordinary_host_takes_the_normal_path():
+    """Narrowing the exemption must not start refusing good Log4Shell C2."""
+    assert valid_url("ldap://c2.malicious.example/Exploit") is not None
+    assert valid_url("rmi://c2.malicious.example:1099/Exploit") is not None
+
+
+# ── ports ────────────────────────────────────────────────────────────────
+
+def test_invalid_ports_are_refused():
+    """urlsplit does not validate the port until `.port` is touched."""
+    assert valid_url("http://evil.example:65536/a") is None
+    assert valid_url("http://evil.example:bad/a") is None
+    assert valid_url("http://evil.example:8080/a") is not None
+
+
+# ── the counters must actually reach the operator ────────────────────────
+
+def test_rejection_counters_are_surfaced_in_the_cycle_summary():
+    """The counters existed but had no reader outside the test file. A
+    counter nothing reports is the silent-drop defect with extra steps."""
+    import inspect
+    from tpot2cti import main
+    src = inspect.getsource(main.run_cycle)
+    assert '"rejected_urls": builder.rejected_urls' in src, (
+        "rejected_urls is not in the cycle summary dict"
+    )
+    assert '"rejected_domains": builder.rejected_domains' in src, (
+        "rejected_domains is not in the cycle summary dict"
+    )
+    assert "rejected_urls={builder.rejected_urls}" in src, (
+        "rejected_urls is not in the cycle-complete log line"
+    )

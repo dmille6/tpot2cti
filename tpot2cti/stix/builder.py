@@ -242,8 +242,13 @@ def _session_is_recon_only(commands) -> bool:
 #: with a port (':'), path ('/'), or whitespace, and bare single labels. Used
 #: by build_domain so a junk TLS-SNI / HTTP-Host never reaches OpenCTI as a
 #: malformed domain-name SCO (which would also dangle any resolves-to edge).
+#: The trailing label accepts either a pure-alphabetic TLD or an A-label
+#: (`xn--…`). Without the second alternative NO punycode TLD can ever match,
+#: which silently made all 151 `xn--` entries shipped in `iana_tlds.txt`
+#: unreachable dead weight — `shop.xn--p1ai` (.рф) was rejected as malformed.
 _DOMAIN_RE = re.compile(
-    r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+    r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$"
 )
 
 #: The IANA root zone, shipped in-repo. The regex above ends in `[a-z]{2,63}`,
@@ -285,7 +290,11 @@ def _load_tlds() -> frozenset[str]:
 #: sanitised corpora — which are required to use them — keep working. They are
 #: non-resolvable by definition, so accepting them costs nothing in production;
 #: rejecting them would break the convention every sanitised fixture relies on.
-_RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost"})
+#: `onion` is here for the same reason and by the same rule: RFC 7686 reserves
+#: it as a special-use name, so it is absent from the IANA root BY DESIGN and
+#: will never appear there. Rejecting it would silently discard Tor C2 and
+#: leak-site addresses, which are genuine high-value IoCs.
+_RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost", "onion"})
 
 IANA_TLDS = _load_tlds() | _RESERVED_TLDS
 
@@ -302,7 +311,13 @@ IANA_TLDS = _load_tlds() | _RESERVED_TLDS
 _JNDI_SCHEMES = frozenset({
     "ldap", "ldaps", "rmi", "dns", "iiop", "nis", "corba", "nds",
 })
-_URL_SCHEMES = frozenset({"http", "https", "ftp"}) | _JNDI_SCHEMES
+#: `tftp` is NOT optional: `_CMD_URL_RE` (line 107) is written to extract
+#: `(?:https?|ftp|tftp)://` out of command transcripts — its own comment says
+#: "wget/curl/tftp droppers". Omitting it here means the extractor mints a
+#: tftp dropper URL and this validator silently discards it, on the one path
+#: (a URL inside a real shell-command transcript) that produces this
+#: pipeline's highest-confidence intel. The two sets must stay in step.
+_URL_SCHEMES = frozenset({"http", "https", "ftp", "tftp"}) | _JNDI_SCHEMES
 
 
 def valid_domain(value: str) -> Optional[str]:
@@ -342,7 +357,7 @@ def valid_url(value: str) -> Optional[str]:
     if scheme not in _URL_SCHEMES or not parts.netloc:
         return None
 
-    if scheme in _JNDI_SCHEMES:
+    if scheme in _JNDI_SCHEMES and "${" in parts.netloc:
         # A JNDI URL is EVIDENCE, not an IoC, and its host is frequently not a
         # resolvable name on purpose: exfil payloads embed an unresolved Log4j
         # template inside the hostname
@@ -351,7 +366,27 @@ def valid_url(value: str) -> Optional[str]:
         # payload verbatim — the only record of what was actually attempted.
         # The resolvable C2 zone is extracted separately by log4shell.py and
         # published as the Domain-Name observable, which IS the IoC.
+        #
+        # The `${` test is what keeps this an exemption rather than a hole.
+        # Keyed on the scheme alone it was a general bypass of host validation
+        # for any attacker-controlled string that happened to carry a JNDI
+        # scheme — `ldap://ANYTHING-AT-ALL` was accepted verbatim. Only an
+        # UNRESOLVED TEMPLATE justifies skipping the check, because only a
+        # template is un-validatable by construction. A JNDI URL with an
+        # ordinary host (`ldap://c2.malicious.example/Exploit`) is still a
+        # perfectly good IoC and falls through to normal validation below.
         return raw
+
+    # urlsplit does NOT validate the port until `.port` is touched, so
+    # `http://evil.example:65536/a` and `:bad` sail through otherwise. This
+    # MUST come after the JNDI exemption: a template in the hostname
+    # (`ldap://x-${sys:java.version}.c2.example/a`) contains a colon, so
+    # urlsplit reads everything after it as a port and raises — which would
+    # discard the exfil payload this function exists to preserve.
+    try:
+        parts.port
+    except ValueError:
+        return None
 
     host = (parts.hostname or "").strip().lower()
     if not host:
@@ -1933,12 +1968,28 @@ class STIXBuilder:
             if not (sha and url) or (url, sha) in seen_pairs:
                 continue
             seen_pairs.add((url, sha))
-            # Ensure the URL observable exists (dedup-safe); the relationship
-            # references its deterministic id either way.
-            if u := self.build_url(url, session=session):
+            # build_url returns None for BOTH "already emitted in this bundle"
+            # and "failed validation". Only the first is safe to anchor an
+            # edge on — referencing a URL that was never built, and never will
+            # be, is a dangling ref. `_emitted_ids` tells the two apart; this
+            # mirrors the domain path in build_unattributed_payload_objects.
+            #
+            # The id must come from the CANONICAL value, not the raw input:
+            # valid_url strips surrounding whitespace, so hashing `url` would
+            # anchor on a different id than the SCO was published under.
+            canon = valid_url(url)
+            u = self.build_url(url, session=session)
+            if u:
                 out.append(u)
+            if canon is None:
+                continue
+            url_id = generate_url_id(canon)
+            if not (u or url_id in self._emitted_ids):
+                continue
+            # The File SDO stands on its own, so a rejected URL costs only
+            # this edge — the hash is still published.
             if rel := self.build_relationship(
-                generate_url_id(url), "related-to", generate_file_id(sha),
+                url_id, "related-to", generate_file_id(sha),
                 description=f"File sha256:{sha[:16]}… downloaded from {url[:80]}",
             ):
                 out.append(rel)
@@ -2686,6 +2737,28 @@ class STIXBuilder:
             # shared by the whole group by construction.
             url, payload = sorted(urls.items())[0]
             extra_urls = sorted(u for u in urls if u != url)
+            # EVERY edge in this group anchors on the URL's id — resolves-to,
+            # the CVE and attack-pattern edges, the Sighting, and the Note's
+            # object_refs. If the representative URL fails validation there is
+            # nothing to anchor to, and emitting the group anyway would hang
+            # the whole graph off an SCO that is never published.
+            #
+            # A payload with no netloc at all (`${jndi:ldap:///Exploit}`)
+            # names no C2 endpoint, so there is genuinely nothing to record
+            # here. Skipping costs the Sighting and the CVE edge for that
+            # group; publishing dangling refs costs a MISSING_REFERENCE_ERROR
+            # storm, which LESSONS_LEARNED_FROM_V0 §3 calls the costliest
+            # failure in this project. Loud, because a rising count here means
+            # the payload extractor is producing anchors we cannot publish.
+            canon_url = valid_url(url)
+            if canon_url is None:
+                self.rejected_urls += 1
+                logger.warning(
+                    "unattributed salvage: group %r skipped — representative "
+                    "URL %r failed validation, so the Sighting/CVE/Note graph "
+                    "has no anchor", key, url[:120],
+                )
+                continue
             # Synthetic session purely as a carrier for the shared
             # build_* helpers (timestamps, sensor, deterministic ids).
             # Its src_ip is a LABEL, never an address — nothing on this
@@ -2713,8 +2786,10 @@ class STIXBuilder:
             # object would then discard the Domain, CVE, Sighting and Note
             # for an endpoint we DID observe, purely because the SCO was
             # already present. The id is deterministic, so referencing it
-            # is always valid.
-            url_id = generate_url_id(url)
+            # is always valid — but ONLY because the group was skipped above
+            # if the URL could not be validated, and only if the id is taken
+            # from the canonical (stripped) value the SCO is published under.
+            url_id = generate_url_id(canon_url)
             if u := self.build_url(url, session=session):
                 out.append(u)
             # The per-header URL variants are real observations, so emit
