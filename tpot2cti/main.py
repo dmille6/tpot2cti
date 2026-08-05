@@ -355,6 +355,13 @@ _EXCLUDED_SRC_NETS = [
 ]
 
 
+#: Per-cycle cap on retained unattributable payload-bearing events.
+#: Each retains its raw + decoded payload text, so this bounds cycle
+#: memory during a mass Log4Shell campaign or a long catch-up window.
+#: Live volume is ~33 over seven weeks, so this is pure headroom.
+_MAX_UNATTRIBUTED_PER_CYCLE = 2000
+
+
 def _is_internal_src(ip: str) -> bool:
     """True if src_ip is internal/own-infra and must not become an indicator:
     RFC1918 / link-local (incl 169.254.169.254 Azure IMDS) / loopback /
@@ -434,6 +441,7 @@ def run_cycle(
     # Events rejected for an unusable src_ip that still carry salvageable
     # payload intelligence (see the source-address gate below).
     unattributed_events: list[ParsedEvent] = []
+    unattributed_capped = False
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
 
@@ -479,8 +487,25 @@ def run_cycle(
                 # be intelligence (a live Log4Shell C2 endpoint is worth
                 # more than the spoofed address it arrived in). Salvage
                 # it into a sensor-anchored graph rather than dropping it.
+                #
+                # Bounded: each retained event carries its raw + decoded
+                # payload text, and a long catch-up window during a mass
+                # Log4Shell campaign would otherwise grow this list without
+                # limit — the unbounded-per-cycle-accumulation shape behind
+                # the 2026-07-19 outage. The builder groups by C2 host, so
+                # the cap costs repeat observations of an endpoint we have
+                # already captured, never a distinct one in practice.
                 if event.meta.get("jndi_payloads"):
-                    unattributed_events.append(event)
+                    if len(unattributed_events) < _MAX_UNATTRIBUTED_PER_CYCLE:
+                        unattributed_events.append(event)
+                    elif not unattributed_capped:
+                        unattributed_capped = True
+                        logger.warning(
+                            f"cycle {cycle_id}: more than "
+                            f"{_MAX_UNATTRIBUTED_PER_CYCLE} unattributable "
+                            f"payload-bearing events; salvaging the first "
+                            f"{_MAX_UNATTRIBUTED_PER_CYCLE} only"
+                        )
                 logger.debug(
                     f"cycle {cycle_id}: rejected non-address src_ip from "
                     f"{event.event_type} on {event.sensor_hostname}: "
