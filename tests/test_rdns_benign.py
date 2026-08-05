@@ -378,3 +378,50 @@ def test_samples_are_bounded_and_reset_each_cycle():
     assert len(f.rdns_samples) == 25
     f.begin_cycle(1000)
     assert f.rdns_samples == []
+
+
+# ── an ASN identifies the landlord, not the tenant ───────────────────────
+
+#: Cloud, hosting and transit ASNs. Attackers rent from all of these, so
+#: allowlisting one deletes real attacks. Measured before AS396982 was removed:
+#: 150,821 events from 2,879 addresses in 7 days, 7,919 of them from 439
+#: addresses on INTERACTIVE honeypots (6,918 Cowrie SSH sessions).
+_TENANTED_ASNS = {
+    396982: "Google Cloud Platform",
+    14061: "DigitalOcean",
+    8075:  "Microsoft / Azure",
+    16509: "Amazon AWS",
+    14618: "Amazon AWS",
+    16276: "OVH",
+    24940: "Hetzner",
+    63949: "Akamai / Linode",
+    20473: "Vultr / Choopa",
+    6939:  "Hurricane Electric (transit)",
+}
+
+
+def test_no_cloud_or_transit_asn_is_allowlisted():
+    """An ASN identifies the LANDLORD, not the tenant, and that cuts both ways:
+    Shadowserver rents Hurricane Electric so ASN rules cannot SEE it, and
+    attackers rent Google Cloud so an ASN rule there DELETES them. The second
+    is worse — silent loss of exactly the traffic this project collects.
+
+    This is the enforceable half of a rule that was previously only prose, and
+    prose did not stop AS396982 from being added."""
+    f = BenignScannerFilter.from_yaml()
+    offenders = {asn: (name, f._asn_to_vendor[asn])
+                 for asn, name in _TENANTED_ASNS.items()
+                 if asn in f._asn_to_vendor}
+    assert not offenders, (
+        f"tenanted ASN(s) allowlisted, which DELETES attacker traffic: "
+        f"{offenders}. Identify these vendors by forward-confirmed rDNS "
+        f"instead — but only where the TENANT chose the name. A landlord's "
+        f"automatic PTR (e.g. *.bc.googleusercontent.com, assigned to every "
+        f"Compute Engine VM including an attacker's) identifies nobody."
+    )
+
+
+def test_googles_own_network_is_still_allowlisted():
+    """Removing the cloud ASN must not have removed Googlebot."""
+    f = BenignScannerFilter.from_yaml()
+    assert f._asn_to_vendor.get(15169) == "google"
