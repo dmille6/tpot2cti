@@ -466,7 +466,14 @@ def run_cycle(
             # payload in src_ip. 30 such rows reached the live state DB
             # and produced zero observables with zero recorded drops —
             # the silent-loss shape this project keeps re-learning.
-            if canonical_ip(event.src_ip) is None:
+            #
+            # An ABSENT src_ip is a different case and is deliberately NOT
+            # gated here: the fallback parser documents that a doc with no
+            # src_ip still parses, and build_fallback_event emits a
+            # sensor-anchored Note for it. That path predates this gate
+            # and stays intact. Only a src_ip that is present but is not
+            # an address is rejected.
+            if event.src_ip and canonical_ip(event.src_ip) is None:
                 events_dropped_bad_src_ip += 1
                 # The event is unattributable, but its PAYLOAD may still
                 # be intelligence (a live Log4Shell C2 endpoint is worth

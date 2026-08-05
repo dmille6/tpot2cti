@@ -2559,10 +2559,17 @@ class STIXBuilder:
 
             out.extend(self.build_sensor_context(first.sensor_hostname))
 
-            u = self.build_url(url, session=session)
-            if not u:
-                continue
-            out.append(u)
+            # The URL's id, NOT the built object, anchors this graph.
+            # build_url returns None when _dedup has already emitted that
+            # URL in this bundle — which happens whenever a normal web
+            # session referenced the same value. Keying off the returned
+            # object would then discard the Domain, CVE, Sighting and Note
+            # for an endpoint we DID observe, purely because the SCO was
+            # already present. The id is deterministic, so referencing it
+            # is always valid.
+            url_id = generate_url_id(url)
+            if u := self.build_url(url, session=session):
+                out.append(u)
             # The per-header URL variants are real observations, so emit
             # them too — but under this one group's Sighting/Note rather
             # than a graph each.
@@ -2581,7 +2588,7 @@ class STIXBuilder:
                 if d:
                     out.append(d)
                     if rel := self.build_relationship(
-                        u["id"], "resolves-to", d["id"],
+                        url_id, "resolves-to", d["id"],
                         description=f"C2 endpoint {url[:120]} resolves to {host}",
                     ):
                         out.append(rel)
@@ -2599,7 +2606,7 @@ class STIXBuilder:
                     ),
                 )
                 if v and (rel := self.build_relationship(
-                    u["id"], "related-to", v["id"],
+                    url_id, "related-to", v["id"],
                     description=f"C2 endpoint delivered in a {cve} payload",
                 )):
                     out.append(v)
@@ -2615,13 +2622,13 @@ class STIXBuilder:
                 if ap:
                     out.append(ap)
                     if rel := self.build_relationship(
-                        u["id"], "related-to", ap["id"],
+                        url_id, "related-to", ap["id"],
                         description=f"C2 endpoint used by {attack_type}",
                     ):
                         out.append(rel)
 
             if sighting := self.build_sighting(
-                u["id"], first.sensor_hostname, session,
+                url_id, first.sensor_hostname, session,
                 count=len(group),
                 description=(
                     f"{len(group)} exploitation attempt(s) carrying this C2 "
@@ -2636,7 +2643,7 @@ class STIXBuilder:
                 session,
                 self._unattributed_note_body(url, extra_urls, payload, group),
                 abstract=f"Unattributed {first.event_type} payload → {key[:80]}",
-                object_refs=[u["id"]],
+                object_refs=[url_id],
             )
             if note:
                 out.append(note)

