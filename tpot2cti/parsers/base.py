@@ -109,6 +109,16 @@ class AttackSession:
     # Substance signals
     auth_success: bool = False
     commands: list[str] = field(default_factory=list)
+    #: Raw protocol request blobs — an HTTP request ConPot received, say.
+    #: DELIBERATELY separate from `commands`: a request is something the
+    #: attacker SENT, a command is something they RAN. ConPot used to append
+    #: request blobs to `commands` purely to reuse Note rendering, and every
+    #: downstream consumer then believed them: +25 score, prose reading "ran N
+    #: shell command(s)", indicator text "N command(s) executed", Process SDOs,
+    #: URL harvesting, and — worst — escaping `_is_bare_scan()`, the gate whose
+    #: entire job is keeping drive-by probes at observable-only. The field name
+    #: was the assertion.
+    protocol_requests: list[str] = field(default_factory=list)
     malware_hashes: list[str] = field(default_factory=list)  # sha256s
     urls: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)

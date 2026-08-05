@@ -179,12 +179,13 @@ class ConPotParser(BaseParser):
                 s.meta.setdefault("protocol", proto)
             if request := ev.meta.get("request"):
                 s.meta.setdefault("request", request)
-                # The publisher renders session.commands into Notes for
-                # other parsers; reuse the same shape here so the
-                # builder can produce a uniform "request blob" Note
-                # without a ConPot-specific code path.  See
-                # docs/LESSONS_LEARNED_FROM_V0.md §6 on Note shape reuse.
-                s.commands.append(str(request))
+                # NOT `commands`. This is an HTTP request ConPot received, not
+                # a command anyone executed. It was appended to `commands` to
+                # reuse Note rendering, and six consumers then treated it as
+                # execution — including `_is_bare_scan()`, so every ConPot
+                # probe escaped the drive-by gate and collected +25 score plus
+                # prose claiming shell activity. Note reuse was not worth that.
+                s.protocol_requests.append(str(request))
             if ev.meta.get("request_truncated"):
                 s.meta["request_truncated"] = True
             sessions.append(s)

@@ -2787,6 +2787,7 @@ class STIXBuilder:
                 ):
                     out.append(rel)
 
+
         for sha256 in session.malware_hashes:
             f = self.build_file(sha256, session=session)
             if not f:
@@ -2879,6 +2880,31 @@ class STIXBuilder:
             return out
         ipv4_id = attacker_ip_observable_id(session.src_ip)
         ind_id = attacker_ip_indicator_id(session.src_ip)
+
+        # Raw protocol requests are preserved as a Note, never as a Process.
+        # This is what the old `commands` overload was actually for: the
+        # evidence is kept, the false claim of execution is not.
+        if session.protocol_requests:
+            blob = "\n\n".join(
+                f"```\n{r.strip()[:2000]}\n```"
+                for r in session.protocol_requests[:5] if r.strip()
+            )
+            if blob:
+                if note := self.build_session_note(
+                    session,
+                    body_md=(
+                        f"Raw protocol request(s) received by "
+                        f"{session.event_type} from {session.src_ip}. These "
+                        f"were SENT to the sensor; nothing was executed.\n\n"
+                        + blob
+                    ),
+                    abstract=(
+                        f"{len(session.protocol_requests)} protocol request(s) "
+                        f"to {session.event_type} from {session.src_ip}"
+                    ),
+                    object_refs=[ipv4_id],
+                ):
+                    out.append(note)
 
         interacted = (
             bool(session.commands)
