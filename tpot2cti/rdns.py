@@ -156,6 +156,18 @@ class ForwardConfirmedRDNS:
         self._remember(ip, name, now + ttl)
         return name
 
+    def cached_name_for(self, ip: str) -> tuple[Optional[str], bool]:
+        """Return `(name, True)` if this address is already cached.
+
+        Lets a caller answer from cache WITHOUT spending a lookup budget — a
+        single busy scanner would otherwise consume the whole cycle's budget on
+        repeat visits and starve genuinely new addresses.
+        """
+        hit = self._cache.get(ip)
+        if hit is not None and hit[1] > time.monotonic():
+            return hit[0], True
+        return None, False
+
     def _remember(self, ip: str, name: Optional[str], expires: float) -> None:
         if len(self._cache) >= self._max_entries:
             # Drop the entries closest to expiry. Cheap enough at this size and

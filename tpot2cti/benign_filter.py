@@ -92,6 +92,13 @@ DEFAULT_YAML_PATH = Path(__file__).parent / "data" / "benign_scanners.yaml"
 #: own allowlist without forking the repo).
 ENV_YAML_PATH = "TPOT2CTI_BENIGN_SCANNERS_YAML"
 
+#: New rDNS resolutions allowed per cycle. Each costs up to two blocking DNS
+#: operations (PTR, then forward confirmation), so this bounds the worst-case
+#: ingest stall: 500 x 2 x 1.0s timeout = ~17 min absolute worst case, against
+#: a typical ~1,100 new addresses/day and a measured peak of 3,118. Cache hits
+#: are free and never spend budget, so in steady state almost nothing does.
+DEFAULT_RDNS_BUDGET = int(os.environ.get("TPOT2CTI_BENIGN_RDNS_BUDGET", "500"))
+
 
 # ---------------------------------------------------------------------------
 # Filter
@@ -106,6 +113,17 @@ class BenignScannerFilter:
         # exactly as before, matching on ASN/org only.
         self._resolver = resolver
         self._rdns_rules = [r for r in rules if r.rdns_suffixes]
+        #: Remaining NEW resolutions allowed this cycle. Each miss costs up to
+        #: two blocking DNS operations (PTR, then forward confirmation), so an
+        #: unbounded filter facing a burst of new addresses — the measured peak
+        #: is 3,118/day — could stall ingest for tens of minutes. Cached
+        #: addresses are free and never consume budget.
+        # Non-zero default so a filter nobody called begin_cycle() on still
+        # works. Defaulting to 0 would make a forgotten call a silent no-op —
+        # the filter would quietly stop catching scanners with nothing to show
+        # for it, which is the failure shape this codebase keeps hitting.
+        # Exhaustion is never silent either: rdns_skipped_budget is reported.
+        self._rdns_budget = DEFAULT_RDNS_BUDGET
         self.rdns_skipped_budget = 0
         # Precompute an ASN → vendor lookup for the fast path.
         self._asn_to_vendor: dict[int, str] = {}
@@ -119,6 +137,11 @@ class BenignScannerFilter:
                         f"using {r.vendor!r}"
                     )
                 self._asn_to_vendor[asn] = r.vendor
+
+    def begin_cycle(self, budget: int) -> None:
+        """Reset the per-cycle rDNS lookup budget and its skip counter."""
+        self._rdns_budget = max(0, int(budget))
+        self.rdns_skipped_budget = 0
 
     @classmethod
     def from_yaml(cls, path: Optional[Path | str] = None,
@@ -185,14 +208,17 @@ class BenignScannerFilter:
             vendor = self._asn_to_vendor.get(event.src_asn)
             if vendor:
                 return vendor
-        # Slow path: case-insensitive substring on org name
+        # Slow path: case-insensitive substring on org name.
+        # NOTE: an empty org must NOT short-circuit the function — it only
+        # skips this loop. Returning here would mean any event whose GeoIP
+        # enrichment lacks an org never reaches the rDNS path at all, which is
+        # exactly the population rDNS exists to serve.
         org = (event.src_as_org or "").lower()
-        if not org:
-            return None
-        for rule in self._rules:
-            for kw in rule.org_keywords:
-                if kw in org:
-                    return rule.vendor
+        if org:
+            for rule in self._rules:
+                for kw in rule.org_keywords:
+                    if kw in org:
+                        return rule.vendor
 
         # Slowest path: forward-confirmed reverse DNS. Only reached when ASN
         # and org both failed, which is the case for every scanner running on
@@ -202,7 +228,28 @@ class BenignScannerFilter:
     def _match_rdns(self, event: ParsedEvent) -> Optional[str]:
         if self._resolver is None or not self._rdns_rules:
             return None
-        name = self._resolver.name_for(event.src_ip)
+        # Already-resolved addresses cost nothing, so check the cache before
+        # spending budget: a busy scanner must not exhaust it on repeat visits.
+        cached = getattr(self._resolver, "cached_name_for", None)
+        if cached is not None:
+            hit, known = cached(event.src_ip)
+            if known:
+                return self._vendor_for(hit)
+        if self._rdns_budget <= 0:
+            # Fail OPEN: out of budget means "we do not know", so the event is
+            # kept. Under-filtering is visible and fixable; dropping a real
+            # attacker because a resolver was slow is data loss.
+            self.rdns_skipped_budget += 1
+            return None
+        self._rdns_budget -= 1
+        try:
+            name = self._resolver.name_for(event.src_ip)
+        except Exception:
+            # An injected or misbehaving resolver must never break ingest.
+            return None
+        return self._vendor_for(name)
+
+    def _vendor_for(self, name: Optional[str]) -> Optional[str]:
         if not name:
             return None
         for rule in self._rdns_rules:

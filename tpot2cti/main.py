@@ -58,7 +58,11 @@ from tpot2cti.es_client import TpotESClient
 from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
-from tpot2cti.benign_filter import BenignScannerFilter, FilterStats
+from tpot2cti.benign_filter import (
+    DEFAULT_RDNS_BUDGET,
+    BenignScannerFilter,
+    FilterStats,
+)
 from tpot2cti.env import truthy_env
 from tpot2cti.rdns import ForwardConfirmedRDNS
 from tpot2cti.parsers import dispatch, get_parser
@@ -457,6 +461,9 @@ def run_cycle(
     unattributed_capped = False
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
+    if benign_filter is not None:
+        # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
+        benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
 
     try:
         for doc in es.stream_events(
@@ -654,6 +661,7 @@ def run_cycle(
         f"query_excluded={query_excluded} "
         f"unparsed_by_source={dict(unparsed_by_source.most_common(8))} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
+        f"rdns_skipped_budget={getattr(benign_filter, 'rdns_skipped_budget', 0)} "
         f"types={sorted(parsed_by_type.keys())}"
     )
     state.heartbeat()  # ES stream done — still alive before build/publish.

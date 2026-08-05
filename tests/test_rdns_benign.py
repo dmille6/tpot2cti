@@ -106,6 +106,11 @@ def _event(ip, asn=6939, org="Hurricane Electric LLC"):
                        src_asn=asn, src_as_org=org)
 
 
+# NOTE: the default org here is deliberate — it is the LANDLORD's name, which
+# is the whole point. An earlier version of these tests let that default hide
+# a bug where an empty org short-circuited the rDNS path entirely.
+
+
 def test_shadowserver_on_rented_infrastructure_is_now_matched():
     """The live defect: 17 addresses were reaching `targeted:substantive`.
     Shadowserver scans from Hurricane Electric (AS6939), so ASN and org rules
@@ -170,3 +175,61 @@ def test_the_dns_timeout_does_not_leak_into_the_rest_of_the_process():
         assert probe.gettimeout() == before
     finally:
         probe.close()
+
+
+# ── the empty-org path, and the budget ───────────────────────────────────
+
+def test_rdns_runs_even_when_geoip_has_no_org():
+    """`match()` used to `return None` the moment the org string was empty,
+    which skipped the rDNS path entirely — for exactly the population it exists
+    to serve. The original test suite hid this because its helper always
+    supplied an org."""
+    dns, r = _r(ptr={"184.105.139.69": "scan-03.shadowserver.io"},
+                fwd={"scan-03.shadowserver.io": ["184.105.139.69"]})
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("shadowserver.io",))], resolver=r)
+    f.begin_cycle(10)
+    assert f.match(_event("184.105.139.69", asn=None, org=None)) == "shadowserver"
+    assert f.match(_event("184.105.139.69", asn=None, org="")) == "shadowserver"
+
+
+def test_the_lookup_budget_is_bounded_and_fails_open():
+    """Each miss costs up to two blocking DNS calls. Unbounded, a burst of new
+    addresses (measured peak 3,118/day) could stall ingest for tens of minutes.
+    Exhaustion must KEEP events, not drop them."""
+    dns, r = _r(ptr={}, fwd={})
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="x", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("example.com",))], resolver=r)
+    f.begin_cycle(3)
+    for i in range(20):
+        assert f.match(_event(f"45.9.0.{i}", asn=None, org=None)) is None
+    assert dns.reverse_calls == 3, "budget did not bound the lookups"
+    assert f.rdns_skipped_budget == 17, "skips must be counted, not silent"
+
+
+def test_cache_hits_do_not_spend_budget():
+    """A single busy scanner would otherwise consume the whole cycle's budget
+    on repeat visits and starve genuinely new addresses."""
+    dns, r = _r(ptr={"184.105.139.69": "scan-03.shadowserver.io"},
+                fwd={"scan-03.shadowserver.io": ["184.105.139.69"]})
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("shadowserver.io",))], resolver=r)
+    f.begin_cycle(1)
+    for _ in range(100):
+        assert f.match(_event("184.105.139.69", asn=None, org=None)) == "shadowserver"
+    assert dns.reverse_calls == 1
+    assert f.rdns_skipped_budget == 0, "cache hits wrongly consumed budget"
+
+
+def test_a_filter_nobody_initialised_still_works():
+    """Defaulting the budget to 0 would make a forgotten begin_cycle() call a
+    silent no-op — the filter quietly stops catching scanners."""
+    dns, r = _r(ptr={"184.105.139.69": "scan-03.shadowserver.io"},
+                fwd={"scan-03.shadowserver.io": ["184.105.139.69"]})
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="shadowserver", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("shadowserver.io",))], resolver=r)
+    assert f.match(_event("184.105.139.69", asn=None, org=None)) == "shadowserver"
