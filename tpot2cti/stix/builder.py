@@ -872,14 +872,12 @@ class STIXBuilder:
             "is_family": True,
             "labels": sorted({f"source:{source}", "malware-family"}),
         }
-        if description:
-            # Callers that did NOT capture a sample must say so. The default
-            # wording below asserts first-party capture, and attaching it to a
-            # list-derived attribution would be a false provenance claim on the
-            # highest-confidence object this codebase emits.
-            obj["description"] = description
-            return self._dedup(self._stamp(obj))
-        bits = [f"Malware family {fam!r} attributed from honeypot-captured sample(s)."]
+        # Callers that did NOT capture a sample must say so: the default
+        # wording asserts first-party capture, and attaching it to a
+        # list-derived attribution would be a false provenance claim on the
+        # highest-confidence object this codebase emits.
+        bits = [description or
+                f"Malware family {fam!r} attributed from honeypot-captured sample(s)."]
         if sample_sha256:
             bits.append(f"First attributed via sha256:{sample_sha256[:16]}….")
         if detection_ratio:

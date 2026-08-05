@@ -88,6 +88,8 @@ they share one fetch path and one matcher. Adding a source is one entry in the
 | `ENRICH_BLOCKLIST_MAX_AGE_HOURS` | `72` | refuse to match a list older than this |
 | `ENRICH_BLOCKLIST_ACTIVE_WITHIN_HOURS` | `168` | how recently an IP must have been active |
 | `ENRICH_BLOCKLIST_MAX_PER_CYCLE` | `2000` | sweep page size |
+| `ENRICH_BLOCKLIST_STUCK_PAGE_ALERT` | `3` | failed publishes at one cursor before the wedge is named |
+| `ENRICH_BLOCKLIST_FETCH_TIMEOUT` | `60` | per-source download timeout, seconds |
 | `ENRICH_BLOCKLIST_STATE_DB` | `<data>/blocklists.db` | own state |
 
 ## Operational notes
@@ -104,6 +106,11 @@ they share one fetch path and one matcher. Adding a source is one entry in the
   contains rows whose `src_ip` is not an address — 16 in the live window, all
   obfuscated Log4Shell JNDI payloads stored by H0neytr4p. They are skipped and
   reported as `malformed`, so they never masquerade as "matched no list".
+- **A failing source cannot starve the others.** The next fetch covers the
+  failures *plus* anything due on its own age. Retrying only the failures
+  would collapse the working set to a permanently-broken source and never
+  expand back — measured at defaults with FireHOL failing permanently, every
+  source was stale and every cycle failed by day 10, from one dead URL.
 - **A failed source keeps its previous copy**, and keeps its old fetch
   timestamp, so it ages toward the staleness cliff and is eventually refused
   rather than answering forever from stale data. Only the failed sources are

@@ -433,3 +433,50 @@ def test_the_edge_target_matches_the_builders_own_malware_id(builder):
     rel = next(o for o in objs if o["type"] == "relationship")
     assert rel["target_ref"] == mal["id"]
     assert mal["id"] == generate_malware_id(normalize_malware_family("QakBot"))
+
+
+# ── the retry working set ────────────────────────────────────────────────
+
+def _age(state_db, key, hours):
+    from datetime import datetime, timedelta, timezone
+    state_db.set(f"bl_fetched_at:{key}",
+                 (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat())
+
+
+def test_a_permanently_failing_source_does_not_starve_the_others(state_db):
+    """Retrying ONLY the failures collapses the working set to the broken
+    source and never expands back — so the other feeds never refresh again and
+    age past the 72h staleness cliff. Simulated at defaults with FireHOL
+    failing permanently, every source was stale and every cycle failed by day
+    10: one dead URL taking out the whole lane. This is the regression that no
+    test caught when the retry-only-failed change was introduced."""
+    srcs = list(src.SOURCES)
+    refresh_every = 24 * 3600.0
+    for s in srcs:
+        _age(state_db, s.key, 0.1)          # all just refreshed
+
+    # firehol keeps failing; the others are still fresh, so only it retries
+    due = bl.sources_due(srcs, state_db, ["firehol"], refresh_every)
+    assert [s.key for s in due] == ["firehol"]
+
+    # a day later the others are due on their own age and MUST come back
+    for s in srcs:
+        if s.key != "firehol":
+            _age(state_db, s.key, 25)
+    due = bl.sources_due(srcs, state_db, ["firehol"], refresh_every)
+    assert {s.key for s in due} == {s.key for s in srcs}, \
+        "healthy sources were starved by a permanently failing one"
+
+
+def test_sources_with_no_timestamp_are_always_due(state_db):
+    due = bl.sources_due(list(src.SOURCES), state_db, [], 24 * 3600.0)
+    assert len(due) == len(src.SOURCES)
+
+
+def test_a_description_override_still_keeps_sample_provenance(builder):
+    """The override branch used to return early, silently dropping sha256 and
+    detection ratio for any future caller passing both."""
+    mal = builder.build_malware("QakBot", description="From a downloaded list.",
+                                sample_sha256="a" * 64, detection_ratio="40/70")
+    assert "From a downloaded list." in mal["description"]
+    assert "aaaaaaaa" in mal["description"] and "40/70" in mal["description"]

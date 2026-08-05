@@ -144,7 +144,10 @@ class Source:
     url: str
     label: str
     parse: Callable[[str], tuple[CidrSet, dict]]
-    #: What a hit actually means, written into the object's description.
+    #: What a hit asserts, in one line. Not written to the graph — observables
+    #: carry labels only — but logged at startup so an operator can see what
+    #: each enabled source is claiming on their behalf, and reused verbatim in
+    #: docs/enrich/blocklists.md.
     meaning: str
     #: Sanity floor. A feed that suddenly parses to fewer entries than this has
     #: almost certainly changed shape or started serving an error page, and

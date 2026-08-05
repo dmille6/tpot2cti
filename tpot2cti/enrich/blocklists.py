@@ -210,6 +210,24 @@ def _is_ip(raw_ip) -> bool:
         return False
 
 
+def sources_due(sources: list[Source], state: CycleState, failed: list[str],
+                refresh_every: float) -> list[Source]:
+    """Which sources the next fetch attempt should cover.
+
+    Failures plus anything now due on its own age. Retrying *only* the failures
+    would collapse the working set to a permanently-broken source and never
+    expand back, so the other feeds would never refresh again and would age
+    past the staleness cliff — one dead URL silently taking out the whole lane
+    72h later. Measured before this was fixed: with FireHOL failing
+    permanently, all four sources were stale and every cycle failed by day 10.
+    """
+    failed_set = set(failed or [])
+    due = [s for s in sources
+           if s.key in failed_set
+           or (age_hours(state, s.key) or 1e9) * 3600.0 >= refresh_every]
+    return due or list(sources)
+
+
 def match_ip(raw_ip: str, lists: dict) -> list[tuple[str, dict]]:
     """Return `[(source_key, extra), …]` for every list containing this IP."""
     try:
@@ -452,6 +470,9 @@ def main() -> int:
         ",".join(s.key for s in sources), WINDOW_HOURS, int(interval),
         int(refresh_every), MAX_LIST_AGE_HOURS, core_db, own_db,
     )
+    for s in sources:
+        logger.info("blocklists: %-9s → %-26s asserts: %s",
+                    s.key, s.label, s.meaning)
     state = CycleState(own_db)
 
     # Bind /health BEFORE connecting: _connect_opencti waits patiently for a
@@ -493,8 +514,7 @@ def main() -> int:
                 # every 5 minutes after one flaky feed is 24x/day of needless
                 # traffic against volunteer-run infrastructure.
                 lists, failed = refresh_lists(pending, state, previous=lists)
-                pending = ([s for s in sources if s.key in failed] if failed
-                           else list(sources))
+                pending = sources_due(sources, state, failed, refresh_every)
                 next_refresh = time.monotonic() + (retry_after if failed
                                                    else refresh_every)
                 if failed:
