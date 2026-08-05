@@ -321,7 +321,7 @@ object (a real predecessor failure).
 | prefix | owner | meaning |
 |---|---|---|
 | `noise:*` | `enrich/noisefloor.py` | broad fan-out / mass-scan behaviour |
-| `targeted:*` | `enrich/noisefloor.py` | focused + substantive activity |
+| `targeted:*` | `enrich/noisefloor.py` | substantive activity — successful auth, executed commands, or a malware drop. **Independent of fan-out:** an address can carry both `noise:*` and `targeted:*`, and 29.7% of suppressed addresses do. |
 | `blocklist:*` | `enrich/blocklists.py` | membership of a named list |
 | `tor:*` | `enrich/blocklists.py` | anonymiser context |
 | `kev:*` | `enrich/blocklists.py` | CVE known-exploited |
