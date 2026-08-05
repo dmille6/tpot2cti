@@ -74,6 +74,25 @@ the skip-cache would have made the omission permanent.
 | `ENRICH_NOISEFLOOR_INTERVAL` | `PT1H` | cycle interval |
 | `ENRICH_NOISEFLOOR_STATE_DB` | `<data>/noisefloor.db` | own state |
 
+## Why publishing one label at a time is safe
+
+The skip-cache keys on `(ip, label)`, so a later cycle publishes **only** the
+newly-earned label. That is sound only if OpenCTI *unions* `x_opencti_labels`
+on upsert rather than replacing them — otherwise every second write would
+destroy the first. This was verified against the live platform through the
+real publisher path (not reasoned about), on `192.0.2.77` (TEST-NET-1,
+RFC 5737, never a real attacker) so no production observable was at risk:
+
+| step | published | labels afterwards |
+|---|---|---|
+| 1 | `tpot:honeypot-attacker`, `tpot:cowrie` | both |
+| 2 | `noise:fleet-scan` **only** | all three |
+| 3 | `targeted:substantive` **only** | all four |
+
+CORE's labels survived, and so did noisefloor's own earlier label. The test
+observable was deleted afterwards. Re-run this proof if the publisher's upsert
+path or the platform version changes — the caching design depends on it.
+
 ## Operational notes
 
 - **Own state DB.** Never CORE's: this module writes heartbeats and `cycle_log`
@@ -98,5 +117,17 @@ the skip-cache would have made the omission permanent.
   effectively windowed (only in-window rows are counted) while substantive
   evidence is lifetime, so drift over time runs toward *eroding* suppression
   rather than deepening it.
+- **A bad page stalls the sweep, loudly.** The cursor advances only after a
+  confirmed publish, so a page that fails deterministically is retried
+  forever rather than skipped. That is the deliberate trade: advancing past
+  data that never published is the worse failure, and this project has already
+  shipped it once. After `STUCK_PAGE_ALERT` (3) consecutive failures at the
+  same cursor the log names the wedge and the stalled cursor, and `/health`
+  already reads unhealthy. To step past a page on purpose, clear
+  `nf_sweep_cursor` in the module's own state DB.
+- **Non-addresses are counted, not silently dropped.** CORE's telemetry
+  contains rows whose `src_ip` is not an address at all — measured: 30, all
+  from H0neytr4p, which stores raw exploit payloads (obfuscated Log4Shell JNDI
+  strings) in that column. They are skipped, and reported as `malformed`.
 - **Recorded only after a confirmed publish** — a cache that records work which
   never landed is the failure this project keeps re-learning.

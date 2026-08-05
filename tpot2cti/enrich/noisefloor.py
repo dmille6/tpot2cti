@@ -78,6 +78,15 @@ STATE_DB_ENV = "ENRICH_NOISEFLOOR_STATE_DB"
 #: Resume point for the src_ip sweep. Reset to "" when a short page proves the
 #: end of the window was reached, so the next cycle starts a fresh pass.
 SWEEP_CURSOR_KEY = "nf_sweep_cursor"
+#: Consecutive failed publishes at the SAME cursor before the wedge is called
+#: out by name. The sweep deliberately does NOT skip the page — advancing past
+#: data that never published is the exact defect this project already shipped
+#: once — so a page that fails deterministically blocks the sweep until an
+#: operator intervenes. That trade is accepted, but it must not be silent:
+#: health already reads unhealthy, and this makes the CAUSE greppable.
+STUCK_PAGE_ALERT = int(os.environ.get("ENRICH_NOISEFLOOR_STUCK_PAGE_ALERT", "3"))
+STUCK_COUNT_KEY = "nf_stuck_count"
+STUCK_AT_KEY = "nf_stuck_at"
 
 #: This module owns these label prefixes and writes no others
 #: (docs/ENRICHMENT.md §8).
@@ -256,7 +265,7 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         builder.build_tlp_marking(),
     ]
     n_foundation = len(objects)
-    counts = {LABEL_NOISE: 0, LABEL_SUBSTANTIVE: 0, "unlabelled": 0}
+    counts = {LABEL_NOISE: 0, LABEL_SUBSTANTIVE: 0, "unlabelled": 0, "malformed": 0}
     pending_marks: list[tuple[str, str]] = []
 
     already = 0
@@ -275,6 +284,14 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
             already += 1
             continue
         objs = build_objects(builder, row, fresh)
+        if not objs:
+            # build_objects rejects anything that is not a parseable address.
+            # CORE's telemetry does contain such rows (measured: 30, all from
+            # H0neytr4p, which stores raw exploit payloads in src_ip), and
+            # dropping them without a count is the silent-loss pattern this
+            # project keeps re-learning. Count them where they can be seen.
+            counts["malformed"] += 1
+            continue
         if objs:
             for l in fresh:
                 counts[l] = counts.get(l, 0) + 1
@@ -297,7 +314,24 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         logger.info("noisefloor cycle %s: nothing to label", cycle_id)
 
     swept = False
+    if not publish_ok:
+        # Count consecutive failures at this exact cursor so a deterministically
+        # bad page is named rather than presenting as a sweep that never ends.
+        stuck_at = state.get(STUCK_AT_KEY)
+        n = (int(state.get(STUCK_COUNT_KEY) or 0) + 1) if stuck_at == cursor else 1
+        state.set(STUCK_AT_KEY, cursor)
+        state.set(STUCK_COUNT_KEY, str(n))
+        if n >= STUCK_PAGE_ALERT:
+            logger.error(
+                "noisefloor: SWEEP WEDGED — %d consecutive publish failures at "
+                "cursor %r. The page is NOT skipped (advancing past unpublished "
+                "data is worse), so coverage is stalled until this is resolved. "
+                "Inspect the addresses after that cursor in CORE's "
+                "attacker_activity, or clear %s to step past them deliberately.",
+                n, cursor or "<start>", SWEEP_CURSOR_KEY,
+            )
     if publish_ok:
+        state.set(STUCK_COUNT_KEY, "0")
         # Mark only on confirmed publish — a cache that records work which
         # never landed is the failure this project keeps re-learning.
         for k, v in pending_marks:
@@ -314,9 +348,10 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     duration = time.monotonic() - started
     logger.info(
         "noisefloor cycle %s complete in %.1fs — ips=%d fleet-scan=%d "
-        "substantive=%d unlabelled=%d already=%d publish_ok=%s",
+        "substantive=%d unlabelled=%d malformed=%d already=%d publish_ok=%s",
         cycle_id, duration, len(rows), counts[LABEL_NOISE],
-        counts[LABEL_SUBSTANTIVE], counts["unlabelled"], already, publish_ok,
+        counts[LABEL_SUBSTANTIVE], counts["unlabelled"], counts["malformed"],
+        already, publish_ok,
     )
     state.record_cycle(
         cycle_id, success=publish_ok, events_read=len(rows),
@@ -327,7 +362,8 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     return {
         "cycle_id": cycle_id, "ips": len(rows),
         "fleet_scan": counts[LABEL_NOISE], "substantive": counts[LABEL_SUBSTANTIVE],
-        "unlabelled": counts["unlabelled"], "already": already,
+        "unlabelled": counts["unlabelled"], "malformed": counts["malformed"],
+        "already": already,
         "publish_ok": publish_ok, "sweep_complete": swept,
         "duration_seconds": round(duration, 3),
     }
