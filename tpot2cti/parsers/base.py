@@ -158,6 +158,15 @@ class AttackSession:
     # planted the same key links to the same SCO — one click in OpenCTI
     # to see the entire campaign.
     planted_ssh_keys: list[dict] = field(default_factory=list)
+    #: SSH public keys the attacker AUTHENTICATED WITH (cowrie.login.success
+    #: for a public-key login). DELIBERATELY separate from
+    #: `planted_ssh_keys`, which the attacker WROTE to authorized_keys for
+    #: persistence — "they hold the private half of this key" and "they
+    #: installed this key on the victim" are different claims, and the
+    #: descriptions built from each say so. Same dict shape
+    #: (`fingerprint` = OpenSSH SHA256 form, `key`, `type`), so a key seen
+    #: on both paths dedups onto one Cryptographic-Key SCO.
+    auth_pubkeys: list[dict] = field(default_factory=list)
 
     # Per-parser extras (e.g., DICOM command type, SIP method)
     meta: dict = field(default_factory=dict)

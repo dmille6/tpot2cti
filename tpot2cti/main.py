@@ -65,7 +65,7 @@ from tpot2cti.benign_filter import (
 )
 from tpot2cti.env import truthy_env
 from tpot2cti.rdns import ForwardConfirmedRDNS
-from tpot2cti.parsers import dispatch, get_parser
+from tpot2cti.parsers import TYPE_RECOVERIES, dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
 from tpot2cti.stix.builder import STIXBuilder
@@ -470,6 +470,9 @@ def run_cycle(
     # normal noise. Keyed on `type` (~21 values) and, for Suricata only, its
     # `event_type` sub-family; never on signature, which is unbounded.
     unparsed_by_source: Counter = Counter()
+    # Per-cycle, so the summary reports THIS cycle's recoveries rather than a
+    # process-lifetime total that only ever grows.
+    TYPE_RECOVERIES.clear()
     events_dropped_dispatch = 0    # parser raised an exception on the doc
     events_dropped_bad_src_ip = 0  # src_ip is not a parseable IP address
     events_self_filtered = 0  # src_ip is our own honeypot / RFC1918 / reserved
@@ -962,6 +965,12 @@ def run_cycle(
         "drop_reasons": drop_reasons,
         "query_excluded": query_excluded,
         "unparsed_by_source": dict(unparsed_by_source),
+        # Docs whose `type` did not name any parser and had to be recovered
+        # from the source log path. A non-zero value is not an error — it is
+        # a honeypot reporting a field of its record instead of its name —
+        # but a SUDDEN change means a honeypot's log format moved, and a
+        # recovery nobody reports is the silent-drop defect in a new costume.
+        "type_recoveries": {f"{a}->{b}": n for (a, b), n in TYPE_RECOVERIES.items()},
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),

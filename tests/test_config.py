@@ -61,11 +61,22 @@ def test_bad_tlp_rejected():
         load_config(env_dict=env)
 
 
-def test_default_ignore_types_includes_p0f_and_ssh_rsa():
-    """Default ignore list has the two known-noise types from audit #8."""
+def test_default_ignore_types_is_p0f_only():
+    """P0f is genuine noise: 3.6M docs over two days yielding zero
+    credentials, commands, hashes or URLs — an OS guess per connection.
+
+    ssh-rsa / ssh-ed25519 were in this list and are NOT noise. They are
+    Cowrie's `cowrie.login.success` for public-key logins, where T-Pot puts
+    the key algorithm in `type`. Measured over 35 days: 4,192 docs, every
+    one a successful ROOT login carrying the attacker's public key. This
+    assertion used to require them and so locked in the defect."""
     cfg = load_config(env_dict=dict(_REQUIRED_ENV))
-    assert "P0f" in cfg.cycle.ignore_types
-    assert "ssh-rsa" in cfg.cycle.ignore_types
+    assert cfg.cycle.ignore_types == ["P0f"]
+    for recovered in ("ssh-rsa", "ssh-ed25519", "ssh-dss"):
+        assert recovered not in cfg.cycle.ignore_types, (
+            f"{recovered} is being ignored — that discards successful "
+            f"public-key logins, the highest-value event Cowrie emits"
+        )
 
 
 def test_honeypot_ips_parsed_as_frozenset():
