@@ -1431,13 +1431,21 @@ class STIXBuilder:
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         return self._dedup(self._stamp(obj))
 
-    def build_planted_ssh_key(
+    def build_attacker_ssh_key(
         self,
         key_info: dict,
         *,
         session: Optional[AttackSession] = None,
+        context: str = "planted",
     ) -> Optional[dict]:
-        """Cryptographic-Key SCO for an attacker-planted SSH public key.
+        """Cryptographic-Key SCO for an attacker SSH public key.
+
+        `context` is "planted" (written to authorized_keys for persistence)
+        or "authenticated" (the key they logged in WITH). Both mint the SAME
+        id for the same key material — that shared id is the pivot, joining
+        "who holds this private key" to "where they installed the public
+        half" — but they are different claims, so the description and labels
+        differ. Nothing here may assert the union of both.
 
         Distinct from :meth:`build_cryptographic_key` (which models a
         HASSH SSH-client hash) — this one represents the public key
@@ -1480,7 +1488,17 @@ class STIXBuilder:
         }
         comment_disp = comment or "∅ (no comment)"
         desc_lines = [
-            f"Attacker-planted SSH public key (campaign IoC).",
+            # Deliberately does NOT say "planted". The same SCO id is minted
+            # for a key the attacker AUTHENTICATED with and one they wrote to
+            # authorized_keys — that shared id is the point, it joins the two
+            # halves of the same actor. But the SCO cannot assert which
+            # happened, because it may be both. The per-edge relationship
+            # descriptions carry the specific claim; this line must stay true
+            # of every path that reaches it.
+            (f"Attacker-planted SSH public key (campaign IoC)."
+             if context == "planted"
+             else f"Attacker SSH public key used to AUTHENTICATE (campaign "
+                  f"IoC) — they hold the private half."),
             f"",
             f"Key type:      {key_type}",
             f"SHA256 fp:     {fingerprint}",
@@ -1489,9 +1507,10 @@ class STIXBuilder:
             f"authorized_keys line (verbatim):",
             f"    {full_line}",
             f"",
-            f"Every attacker IP that planted this key links to this "
-            f"SCO via `related-to`. Click 'Related entities' to see "
-            f"the campaign footprint.",
+            f"Every attacker IP that AUTHENTICATED WITH or PLANTED this "
+            f"key links to this SCO via `related-to` — the per-edge "
+            f"description says which. Click 'Related entities' to see the "
+            f"campaign footprint.",
         ]
         if session is not None:
             desc_lines.insert(
@@ -1502,7 +1521,9 @@ class STIXBuilder:
             )
         obj["x_opencti_description"] = "\n".join(desc_lines)
 
-        labels = ["ssh-key", "planted-key", "campaign-ioc", key_type]
+        # A label is an assertion too — only the planted path may claim it.
+        labels = ["ssh-key", "campaign-ioc", key_type]
+        labels.append("planted-key" if context == "planted" else "auth-key")
         if comment:
             # Comment is often a botnet tag ("mdrfckr" for Outlaw,
             # "JenX" for that family, etc.) — make it a label for
@@ -2093,11 +2114,35 @@ class STIXBuilder:
         # canonical example (470+ src_ips, one key) but this catches any
         # actor doing `echo "ssh-rsa AAA..." >> authorized_keys` style
         # persistence.
+        # Keys the attacker AUTHENTICATED with. Same SCO id space as planted
+        # keys (identical fingerprint convention), so one key seen on both
+        # paths is one observable with edges from both — which is exactly
+        # the pivot: "who holds this private key" joined to "where they
+        # installed the public half". The edge description keeps the two
+        # claims apart; only the planted path may say "installed".
+        for key_info in (session.auth_pubkeys or []):
+            if not key_info.get("fingerprint"):
+                continue
+            ck = self.build_attacker_ssh_key(
+                key_info, session=session, context="authenticated")
+            if not ck:
+                continue
+            out.append(ck)
+            if rel := self.build_relationship(
+                ipv4_id, "related-to", ck["id"],
+                description=(
+                    f"Authenticated to {session.event_type} by public key "
+                    f"(type={key_info.get('type')}) — attacker "
+                    f"{session.src_ip} holds the private half"
+                ),
+            ):
+                out.append(rel)
+
         for key_info in (session.planted_ssh_keys or []):
             fp = key_info.get("fingerprint")
             if not fp:
                 continue
-            ck = self.build_planted_ssh_key(key_info, session=session)
+            ck = self.build_attacker_ssh_key(key_info, session=session)
             if not ck:
                 continue
             out.append(ck)

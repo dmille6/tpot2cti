@@ -114,3 +114,74 @@ def test_the_counter_reaches_the_cycle_summary():
     src = inspect.getsource(main.run_cycle)
     assert "TYPE_RECOVERIES.clear()" in src, "counter is never reset per cycle"
     assert "type_recoveries" in src, "recoveries are absent from the cycle summary"
+
+
+# ── the recovered login must yield the KEY, not just the event ───────────
+
+_REAL_KEY = (
+    "ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAIEAvIhC5skTzxyHif/7iy3yhxuK6/OB13hj"
+    "PqrskogkYFrcW8OK4VJT+5+Fx7wd4sQCnVn8rNqahw== attacker@host"
+)
+
+
+def _pubkey_login_doc():
+    d = _cowrie_pubkey_doc("ssh-rsa")
+    d["key"] = _REAL_KEY
+    d["fingerprint"] = "71:3a:b0:18:e2:6c:41:18:4e:56:1e:fd:d2:49:97:66"
+    return d
+
+
+def test_the_attacker_public_key_survives_to_the_session():
+    """Recovering the login is only half the value. The claimed payoff is
+    the attacker's public key as a durable cross-victim identifier — review
+    showed the login parsed but the key was dropped."""
+    from tpot2cti.parsers.cowrie import CowrieParser
+    p = CowrieParser()
+    ev = p.parse(_pubkey_login_doc())
+    assert ev is not None and ev.meta.get("login_success") is True
+    s = p.correlate([ev])[0]
+    assert s.auth_pubkeys, "the attacker's public key was dropped"
+    assert s.auth_pubkeys[0]["type"] == "ssh-rsa"
+    assert s.auth_pubkeys[0]["key"].startswith("AAAAB3NzaC1yc2E")
+    assert not s.planted_ssh_keys, "an auth key was mislabelled as planted"
+
+
+def test_the_key_becomes_a_cryptographic_key_observable(builder):
+    """End-to-end: it must reach OpenCTI as an observable, not just sit on
+    the session."""
+    from tpot2cti.parsers.cowrie import CowrieParser
+    p = CowrieParser()
+    s = p.correlate([p.parse(_pubkey_login_doc())])[0]
+    objs = builder.build_cowrie_session(s)
+    keys = [o for o in objs if o["type"] == "cryptographic-key"]
+    assert keys, "the attacker's public key never became an observable"
+    k = keys[0]
+    assert "auth-key" in k["x_opencti_labels"]
+    assert "planted-key" not in k["x_opencti_labels"], (
+        "an authenticated key is labelled as planted"
+    )
+    assert "AUTHENTICATE" in k["x_opencti_description"]
+    assert not k["x_opencti_description"].startswith("Attacker-planted"), (
+        "an authenticated key is described as planted"
+    )
+
+
+def test_auth_and_planted_forms_of_one_key_share_an_id():
+    """The pivot this is for: the same key seen on both paths must be ONE
+    observable, so its Related Entities tab joins 'who holds the private
+    half' to 'where they installed the public half'."""
+    from tpot2cti.parsers.cowrie import _pubkey_info, CowrieParser
+    auth = _pubkey_info(_REAL_KEY)
+    planted = CowrieParser._extract_planted_keys(
+        f'echo "{_REAL_KEY}" >> ~/.ssh/authorized_keys'
+    )
+    assert planted, "the planted-key regex stopped matching — fixture stale"
+    assert auth["fingerprint"] == planted[0]["fingerprint"], (
+        "auth and planted forms of the same key mint different SCOs"
+    )
+
+
+def test_a_malformed_key_field_is_ignored_not_crashed():
+    from tpot2cti.parsers.cowrie import _pubkey_info
+    for bad in ("", "   ", "ssh-rsa", "notakey", None):
+        assert _pubkey_info(bad if bad is not None else "") is None

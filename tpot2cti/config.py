@@ -310,9 +310,18 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         #               fired in production (operators using modern
         #               Ed25519 keys produce these instead of the older
         #               RSA-typed sub-events).
+        # ssh-rsa / ssh-ed25519 REMOVED from this default 2026-08-05. The
+        # reasoning recorded above was that they are "sub-events" worth
+        # ignoring. They are not sub-events — they are Cowrie's
+        # `cowrie.login.success` for PUBLIC-KEY logins, where T-Pot puts the
+        # key algorithm in `type`. Measured over 35 days: 4,192 docs, every
+        # one a successful ROOT login carrying the attacker's public key and
+        # fingerprint. Ignoring them discarded every successful pubkey login
+        # the fleet ever saw. `dispatch()` now recovers them via the source
+        # log path; leaving them here would keep them from ever being read.
         ignore_types=_env_list(
             env, "TPOT2CTI_IGNORE_TYPES",
-            default=["P0f", "ssh-rsa", "ssh-ed25519"],
+            default=["P0f"],
         ),
         batch_size=_env_int(env, "TPOT2CTI_BATCH_SIZE", default=1000),
         cycle_anchor_hour_utc=(

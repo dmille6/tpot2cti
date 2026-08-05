@@ -22,6 +22,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Cowrie eventid → semantic category we care about
+def _pubkey_info(key_line: str, reported_type: Optional[str] = None) -> Optional[dict]:
+    """Parse Cowrie's `key` field ("ssh-rsa AAAAB3Nza...") into key-info.
+
+    Returns the SAME dict shape as `_extract_planted_keys`, with the SAME
+    fingerprint convention — `sha256(f"{type} {blob}").hexdigest()` — so a
+    key the attacker AUTHENTICATED with and the same key PLANTED elsewhere
+    collapse onto one Cryptographic-Key SCO. That collapse is the whole
+    point: it links "who holds this private key" to "where they installed
+    the public half".
+
+    Cowrie's own `fingerprint` field is deliberately NOT used — it is an
+    MD5 colon-hex digest, and reusing it here would both mislabel the
+    digest and mint a second SCO for the same key material.
+    """
+    parts = str(key_line).strip().split()
+    if len(parts) < 2:
+        return None
+    key_type = (parts[0] or reported_type or "").lower()
+    key_blob = parts[1]
+    if not key_type or not key_blob:
+        return None
+    import hashlib
+    fp_src = f"{key_type} {key_blob}".encode("ascii", errors="ignore")
+    return {
+        "type": key_type,
+        "key": key_blob,
+        "comment": " ".join(parts[2:]),
+        "fingerprint": hashlib.sha256(fp_src).hexdigest(),
+    }
+
+
 _LOGIN_SUCCESS_EVENTID = "cowrie.login.success"
 _LOGIN_FAIL_EVENTID = "cowrie.login.failed"
 _COMMAND_EVENTID = "cowrie.command.input"
@@ -115,6 +146,14 @@ class CowrieParser(BaseParser):
             event.meta["login_success"] = True
             event.meta["username"] = doc.get("username")
             event.meta["password"] = doc.get("password")
+            # A PUBLIC-KEY login carries no password — it carries the key the
+            # attacker holds the private half of, which is a far more durable
+            # cross-victim identifier than any password. T-Pot reports the key
+            # algorithm in `type` for these ("ssh-rsa"/"ssh-ed25519"/
+            # "ssh-dss"), which is why they were being ignored entirely; see
+            # parsers/__init__._type_from_path.
+            if (blob := doc.get("key")) and isinstance(blob, str):
+                event.meta["auth_pubkey"] = _pubkey_info(blob, doc.get("type"))
         elif eventid == _LOGIN_FAIL_EVENTID:
             event.meta["login_success"] = False
             event.meta["username"] = doc.get("username")
@@ -228,6 +267,14 @@ class CowrieParser(BaseParser):
                 if not any(k.get("fingerprint") == fp
                             for k in session.planted_ssh_keys):
                     session.planted_ssh_keys.append(key_info)
+
+            # The key the attacker AUTHENTICATED with — same dedup, kept
+            # apart from planted keys because the claim is different.
+            if auth_key := meta.get("auth_pubkey"):
+                fp = auth_key.get("fingerprint")
+                if fp and not any(k.get("fingerprint") == fp
+                                  for k in session.auth_pubkeys):
+                    session.auth_pubkeys.append(auth_key)
 
         # Derive domains from URLs
         for url in session.urls:
