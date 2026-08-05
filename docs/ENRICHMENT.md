@@ -138,11 +138,11 @@ open-source user** must do.
 | source | lane | what it adds | evidence |
 |---|---|---|---|
 | **noisefloor** (own data) | C | scanner-vs-focused classification | fleet data; see §5 |
-| **FireHOL** | A | IP on curated blocklists | 4,584 CIDRs; **matched 24.5%** of real attacker IPs |
-| **Spamhaus DROP/EDROP** | A | known-bad netblocks | list download |
-| **Tor exit list** | A | anonymiser context | list download |
-| **Feodo Tracker** | A | botnet C2 IPs | no-auth JSON |
-| **CISA KEV** | A | CVE is *known-exploited* | no-auth JSON; severity multiplier |
+| **FireHOL** | A | IP on curated blocklists | 4,584 CIDRs; **matched 5.8%** of 14,715 real attacker IPs (re-measured 2026-08-05; an earlier **24.5%** in this table was wrong) |
+| **Spamhaus DROP** | A | known-bad netblocks — **adds no coverage**: measured a strict subset of FireHOL level1 (365/365 attacker hits already matched). Kept for its distinct attribution, not for reach. | 1,665 CIDRs; 2.5% |
+| **Tor exit list** | A | anonymiser context | 1,401 entries; 0.4% |
+| **Feodo Tracker** | A | botnet C2 IPs — **effectively wound down**: 5 entries total, 4 of them `status: offline` (2026-08-05). Cheap to keep and high value on a hit, but not a meaningful source. Offline entries must never be published as active C2. | no-auth JSON |
+| **CISA KEV** | A | CVE is *known-exploited* — **deferred, no join key**: KEV keys on CVE and CORE's roll-up has no structured CVE field (46 incidental matches inside command/credential text). Needs CVE extraction from Suricata signatures or payloads first; that is a feature, not a list download. | 1,660 CVEs |
 | **Shodan InternetDB** | B | ports, hostnames, `scanner` tag, CPEs, vulns | no key; real attacker returned `tags:['scanner']`, `cpes:[ubuntu, openssh 8.9p1]` |
 | **CIRCL hashlookup** | B | NSRL known-good suppression | no auth |
 

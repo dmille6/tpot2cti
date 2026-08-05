@@ -117,7 +117,7 @@ def test_read_activity_aggregates_surfaces_per_ip(tmp_path):
         ("45.9.1.2", "ConPot",   "s1", 1, 1, 0, 0, 0, 0, now, now, None),
         ("45.9.9.9", "Cowrie",   "s1", 1, 1, 0, 0, 0, 0, now, now, None),
     ])
-    rows = {r["src_ip"]: r for r in nf.read_activity(db, window_hours=24)}
+    rows = {r["src_ip"]: r for r in nf.read_activity(db, window_hours=24, limit=nf.MAX_PER_CYCLE)}
     assert rows["45.9.1.2"]["surfaces"] == 3          # three distinct parsers
     assert rows["45.9.1.2"]["auth_success"] == 1
     assert rows["45.9.9.9"]["surfaces"] == 1
@@ -130,7 +130,7 @@ def test_a_missing_db_RAISES_rather_than_looking_like_a_quiet_fleet(tmp_path):
     to label: publish nothing, record success, go green. That is this project's
     signature failure mode, and the test was enforcing it."""
     with pytest.raises(nf.ActivityReadError):
-        nf.read_activity(str(tmp_path / "nope.db"))
+        nf.read_activity(str(tmp_path / "nope.db"), window_hours=24, limit=10)
 
 
 def test_schema_drift_RAISES(tmp_path):
@@ -139,7 +139,7 @@ def test_schema_drift_RAISES(tmp_path):
     conn.execute("CREATE TABLE unrelated (x INT)")
     conn.commit(); conn.close()
     with pytest.raises(nf.ActivityReadError):
-        nf.read_activity(db)
+        nf.read_activity(db, window_hours=24, limit=10)
 
 
 def test_a_read_failure_makes_the_cycle_fail_and_health_go_unhealthy(cfg, state_db, tmp_path):
@@ -160,7 +160,7 @@ def test_read_activity_never_writes_to_core_db(tmp_path):
     db = str(tmp_path / "core.db")
     _seed_core_db(db, [("45.9.1.2", "Cowrie", "s1", 1, 1, 0, 0, 0, 0, now, now, None)])
     before = open(db, "rb").read()
-    nf.read_activity(db, window_hours=24)
+    nf.read_activity(db, window_hours=24, limit=nf.MAX_PER_CYCLE)
     assert open(db, "rb").read() == before, "enrichment mutated CORE's state DB"
 
 
