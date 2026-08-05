@@ -182,6 +182,7 @@ class TpotESClient:
         start: datetime,
         end: datetime,
         ignore_types: list[str] | None,
+        suricata_alert_only: bool = False,
     ) -> dict[str, Any]:
         """
         Build the bool query body shared by `stream_events` and
@@ -216,6 +217,34 @@ class TpotESClient:
             # this commit) for the broader pattern.
             must_not.append({"terms": {"type.keyword": list(ignore_types)}})
 
+        if suricata_alert_only:
+            # Suricata is ~60% of everything read and ~89% of ITS docs carry no
+            # `alert` object (flow / http / tls / dns / ssh records). The
+            # Suricata parser's first statement is
+            #     alert = doc.get("alert")
+            #     if not isinstance(alert, dict): return None
+            # so those docs are provably never parsed into anything today —
+            # fetching them costs ~1.8M documents/day for nothing.
+            #
+            # This is a V1 SCOPE decision, not a claim that non-alert Suricata
+            # is worthless. Its `tls` records carry JA3 fingerprints measured to
+            # have ZERO overlap with FATT's, and `fileinfo`/`http`/`dns` are
+            # candidate enrichment sources. Widening the parser therefore means
+            # widening THIS filter in the same change — see the guard test in
+            # tests/test_suricata_alert_only_query.py, which fails if the
+            # parser starts accepting docs the query would have excluded.
+            #
+            # NOTE the asymmetry: ES can only cheaply test EXISTENCE, while the
+            # parser requires `alert` to be a dict. A doc with a malformed
+            # (non-dict) `alert` still arrives and is still counted as parser
+            # `unparsed`, which is correct — that case must stay visible.
+            must_not.append({
+                "bool": {
+                    "must": [{"term": {"type.keyword": "Suricata"}}],
+                    "must_not": [{"exists": {"field": "alert"}}],
+                }
+            })
+
         bool_block: dict[str, Any] = {"must": must}
         if must_not:
             bool_block["must_not"] = must_not
@@ -231,6 +260,7 @@ class TpotESClient:
         end: datetime,
         index_pattern: str = "logstash-*",
         ignore_types: list[str] | None = None,
+        suricata_alert_only: bool = False,
     ) -> int:
         """
         Return the number of matching events in [start, end) without
@@ -238,7 +268,7 @@ class TpotESClient:
         rejecting cycles whose volume crosses a sanity threshold
         before doing the expensive paginated read.
         """
-        query = self._build_query(start, end, ignore_types)
+        query = self._build_query(start, end, ignore_types, suricata_alert_only)
         logger.debug(
             "ES count: index=%s start=%s end=%s ignore_types=%s",
             index_pattern,
@@ -278,6 +308,7 @@ class TpotESClient:
         index_pattern: str = "logstash-*",
         batch_size: int = 1000,
         ignore_types: list[str] | None = None,
+        suricata_alert_only: bool = False,
     ) -> Iterator[dict]:
         """
         Yield T-Pot ES documents in the @timestamp range [start, end).
@@ -307,7 +338,7 @@ class TpotESClient:
             elasticsearch.ConnectionTimeout: query timed out twice in a
                 row — caller skips the cycle per §7.
         """
-        query = self._build_query(start, end, ignore_types)
+        query = self._build_query(start, end, ignore_types, suricata_alert_only)
         # `_doc` is the canonical tiebreaker for search_after pagination in
         # ES 8+. We previously used `_id` here, but ES 8 disables fielddata
         # on _id by default ("all shards failed" / IllegalArgumentException at
