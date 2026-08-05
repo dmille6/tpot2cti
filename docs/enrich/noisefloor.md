@@ -70,7 +70,8 @@ the skip-cache would have made the omission permanent.
 |---|---|---|
 | `ENRICH_NOISEFLOOR_FANOUT_SUPPRESS` | `3` | surfaces for broad fan-out |
 | `ENRICH_NOISEFLOOR_ACTIVE_WITHIN_HOURS` | `168` | how recently an IP must have been active to be considered — **not** a metric window (see below) |
-| `ENRICH_NOISEFLOOR_MAX_PER_CYCLE` | `2000` | sweep page size / bundle-size guard |
+| `ENRICH_NOISEFLOOR_MAX_PER_CYCLE` | `2000` | sweep page size / bundle-size guard — floored at 1 (see below) |
+| `ENRICH_NOISEFLOOR_STUCK_PAGE_ALERT` | `3` | failed publishes at one cursor before the wedge is named |
 | `ENRICH_NOISEFLOOR_INTERVAL` | `PT1H` | cycle interval |
 | `ENRICH_NOISEFLOOR_STATE_DB` | `<data>/noisefloor.db` | own state |
 
@@ -117,6 +118,11 @@ path or the platform version changes — the caching design depends on it.
   effectively windowed (only in-window rows are counted) while substantive
   evidence is lifetime, so drift over time runs toward *eroding* suppression
   rather than deepening it.
+- **Thresholds are floored at 1.** A `.env` typo setting the page size to `0`
+  or `-1` would resurrect silent zero-work: at `0` every cycle reads nothing
+  and records success; at `-1` SQLite treats `LIMIT` as *unlimited*, so the
+  cursor parks at the highest `src_ip` and the short-page reset never fires.
+  Both go green forever, and the second is worse for appearing to work once.
 - **A bad page stalls the sweep, loudly.** The cursor advances only after a
   confirmed publish, so a page that fails deterministically is retried
   forever rather than skipped. That is the deliberate trade: advancing past

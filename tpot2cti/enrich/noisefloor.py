@@ -63,16 +63,22 @@ class ActivityReadError(RuntimeError):
 #: Distinct honeypot services an IP must touch to count as broad fan-out.
 #: Three is deliberately conservative: two can happen by accident (a scanner
 #: hitting SSH and Telnet), three suggests indiscriminate sweeping.
-FANOUT_SUPPRESS = int(os.environ.get("ENRICH_NOISEFLOOR_FANOUT_SUPPRESS", "3"))
+FANOUT_SUPPRESS = max(1, int(os.environ.get("ENRICH_NOISEFLOOR_FANOUT_SUPPRESS", "3")))
 
 #: How far back to look when classifying.
 #: How recently an IP must have been active to be considered this cycle.
 #: NOT a metric window — the counters CORE stores are lifetime totals.
 #: See read_activity() for why that is deliberate.
-WINDOW_HOURS = int(os.environ.get("ENRICH_NOISEFLOOR_ACTIVE_WITHIN_HOURS", "168"))
+WINDOW_HOURS = max(1, int(os.environ.get("ENRICH_NOISEFLOOR_ACTIVE_WITHIN_HOURS", "168")))
 
 #: Max IPs classified per cycle (bundle-size guard).
-MAX_PER_CYCLE = int(os.environ.get("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", "2000"))
+#: Page size for the sweep. Floored at 1: a non-positive value resurrects
+#: silent zero-work in two different ways. At 0 every cycle reads no rows and
+#: records success — green forever. At -1 SQLite reads LIMIT as *unlimited*,
+#: so cycle 1 parks the cursor at the highest src_ip and `len(rows) < -1` is
+#: never true, so the reset never fires and the cursor sticks — green forever,
+#: and worse, because it appears to work once. Both are one .env typo away.
+MAX_PER_CYCLE = max(1, int(os.environ.get("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", "2000")))
 
 STATE_DB_ENV = "ENRICH_NOISEFLOOR_STATE_DB"
 #: Resume point for the src_ip sweep. Reset to "" when a short page proves the
@@ -84,7 +90,7 @@ SWEEP_CURSOR_KEY = "nf_sweep_cursor"
 #: once — so a page that fails deterministically blocks the sweep until an
 #: operator intervenes. That trade is accepted, but it must not be silent:
 #: health already reads unhealthy, and this makes the CAUSE greppable.
-STUCK_PAGE_ALERT = int(os.environ.get("ENRICH_NOISEFLOOR_STUCK_PAGE_ALERT", "3"))
+STUCK_PAGE_ALERT = max(1, int(os.environ.get("ENRICH_NOISEFLOOR_STUCK_PAGE_ALERT", "3")))
 STUCK_COUNT_KEY = "nf_stuck_count"
 STUCK_AT_KEY = "nf_stuck_at"
 
@@ -246,7 +252,8 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         # limit passed explicitly: the default arg binds at import time, so
         # reading the module global here is what makes the page size actually
         # configurable (and testable) rather than frozen at first import.
-        rows = read_activity(core_db, after_ip=cursor, limit=MAX_PER_CYCLE)
+        rows = read_activity(core_db, after_ip=cursor,
+                             limit=MAX_PER_CYCLE, window_hours=WINDOW_HOURS)
     except ActivityReadError as exc:
         # Fail the cycle loudly: /health goes unhealthy rather than reporting a
         # successful zero-work run.
@@ -270,7 +277,7 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
 
     already = 0
     for row in rows:
-        labels = classify(row)
+        labels = classify(row, fanout=FANOUT_SUPPRESS)
         if not labels:
             counts["unlabelled"] += 1
             continue
@@ -348,10 +355,11 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     duration = time.monotonic() - started
     logger.info(
         "noisefloor cycle %s complete in %.1fs — ips=%d fleet-scan=%d "
-        "substantive=%d unlabelled=%d malformed=%d already=%d publish_ok=%s",
+        "substantive=%d unlabelled=%d malformed=%d already=%d publish_ok=%s "
+        "cursor=%s sweep_complete=%s",
         cycle_id, duration, len(rows), counts[LABEL_NOISE],
         counts[LABEL_SUBSTANTIVE], counts["unlabelled"], counts["malformed"],
-        already, publish_ok,
+        already, publish_ok, (state.get(SWEEP_CURSOR_KEY) or "<start>"), swept,
     )
     state.record_cycle(
         cycle_id, success=publish_ok, events_read=len(rows),
@@ -419,7 +427,18 @@ def main() -> int:  # pragma: no cover - process entrypoint
 
     while not stopping:
         try:
-            run_cycle(cfg, state, core_db, lambda: STIXBuilder(cfg), publisher)
+            summary = run_cycle(cfg, state, core_db,
+                                lambda: STIXBuilder(cfg), publisher)
+            # Surface sweep progress at the top level. Coverage is the one
+            # property this module guarantees, and a stuck cursor otherwise
+            # reads exactly like a fleet with nothing left to label.
+            if summary.get("sweep_complete"):
+                logger.info("noisefloor: sweep complete — next cycle restarts "
+                            "the pass from the beginning of the window")
+            elif not summary.get("publish_ok"):
+                logger.warning("noisefloor: sweep NOT advancing — cursor held "
+                               "at %r pending a successful publish",
+                               state.get(SWEEP_CURSOR_KEY) or "<start>")
         except Exception as exc:
             logger.exception("noisefloor: cycle failed: %s", exc)
         for _ in range(int(interval)):

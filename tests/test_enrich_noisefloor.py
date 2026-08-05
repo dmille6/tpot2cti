@@ -432,3 +432,66 @@ def test_the_stuck_counter_resets_once_publishing_recovers(cfg, state_db, tmp_pa
     assert int(state_db.get(nf.STUCK_COUNT_KEY)) == 1
     nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(ok=True))
     assert int(state_db.get(nf.STUCK_COUNT_KEY)) == 0
+
+
+def test_a_non_positive_page_size_cannot_produce_silent_zero_work(cfg, state_db, tmp_path, monkeypatch):
+    """A `.env` typo of 0 or -1 must not resurrect the failure this whole module
+    is written against. At 0 every cycle would read nothing and record success;
+    at -1 SQLite reads LIMIT as UNLIMITED, so the cursor parks at the highest
+    src_ip and `len(rows) < -1` never fires — green forever, and worse for
+    having appeared to work once."""
+    import importlib
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(6, now))
+    for typo in ("0", "-1"):
+        monkeypatch.setenv("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", typo)
+        mod = importlib.reload(nf)
+        try:
+            assert mod.MAX_PER_CYCLE >= 1, f"page size {typo} survived as {mod.MAX_PER_CYCLE}"
+            s = mod.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub())
+            assert s["ips"] > 0, f"page size {typo} read zero rows and called it success"
+        finally:
+            monkeypatch.delenv("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", raising=False)
+            importlib.reload(mod)
+
+
+def test_thresholds_are_read_at_call_time_not_frozen_at_import(cfg, state_db, tmp_path):
+    """Module-level defaults on function parameters bind once, at import. A test
+    that rebinds the global then calls through run_cycle would otherwise keep
+    the imported value and pass for the wrong reason — which one of these tests
+    already did."""
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    # exactly 2 surfaces: below the default fan-out of 3, at or above a 2
+    _seed_core_db(db, [("45.9.1.2", p, "s1", 1, 1, 0, 0, 0, 0, now, now, None)
+                       for p in ("Cowrie", "Dionaea")])
+    orig = nf.FANOUT_SUPPRESS
+    try:
+        assert nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg),
+                            _Pub())["fleet_scan"] == 0
+        nf.FANOUT_SUPPRESS = 2
+        assert nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg),
+                            _Pub())["fleet_scan"] == 1, \
+            "run_cycle ignored the rebound threshold — frozen at import"
+    finally:
+        nf.FANOUT_SUPPRESS = orig
+
+
+def test_the_cycle_log_line_reports_cursor_and_sweep_state(cfg, state_db, tmp_path, caplog):
+    """Coverage is the property this module guarantees, and it was invisible:
+    a stuck cursor and a fully-swept fleet produced identical log output."""
+    import logging
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    _seed_core_db(db, _scanners(3, now))
+    with caplog.at_level(logging.INFO):
+        nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub())
+    line = " ".join(r.getMessage() for r in caplog.records)
+    assert "cursor=" in line and "sweep_complete=" in line

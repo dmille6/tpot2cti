@@ -195,6 +195,17 @@ Rules:
   forbidden is shipping mutually exclusive labels with no way to retract one.
   `enrich/noisefloor` takes the orthogonal route; see its module docstring.
 
+  **The orthogonal route carries a proof obligation** — otherwise any module
+  can exempt itself by asserting non-conflict. A module claiming it must:
+  (a) declare the co-occurrence in the §8 registry, so the claim is visible to
+  every other module rather than buried in one file; and (b) ship a test that
+  emits the co-occurring labels *together* on one object and asserts all of
+  them survive. Orthogonality is a property of the emitted data, not of the
+  author's intent, so it has to be demonstrated on the data. Where the labels
+  land on an object another module also writes, that test must run against the
+  real platform at least once — see the union proof in
+  `docs/enrich/noisefloor.md`.
+
 ---
 
 ## 6. The enrichment ledger (cache + budget + backlog + health)
@@ -318,18 +329,24 @@ One module owns each prefix. No module writes another's. This is an
 inter-module contract; violating it produces contradictory labels on the same
 object (a real predecessor failure).
 
-| prefix | owner | meaning |
-|---|---|---|
-| `noise:*` | `enrich/noisefloor.py` | broad fan-out / mass-scan behaviour |
-| `targeted:*` | `enrich/noisefloor.py` | substantive activity — successful auth, executed commands, or a malware drop. **Independent of fan-out:** an address can carry both `noise:*` and `targeted:*`, and 29.7% of suppressed addresses do. |
-| `blocklist:*` | `enrich/blocklists.py` | membership of a named list |
-| `tor:*` | `enrich/blocklists.py` | anonymiser context |
-| `kev:*` | `enrich/blocklists.py` | CVE known-exploited |
-| `shodan:*` | `enrich/lookup.py` (internetdb) | ports/tags/CPE context |
-| `hashlookup:*` | `enrich/lookup.py` (circl) | known-good suppression |
-| `abusech:*` | `enrich/lookup.py` (abusech) | family / distribution evidence |
-| `abuseipdb:*` | `enrich/lookup.py` (abuseipdb) | reputation confidence |
-| `vt:*` | `enrich/lookup.py` (vt) | VirusTotal verdict (optional tier) |
+The **co-occurs** column is the registry's half of the §5 proof obligation: it
+records which prefixes may appear together on one object. Ownership alone does
+not prevent contradiction — two prefixes owned by the same module can still
+conflict — so a module claiming orthogonality declares it here, where every
+other module and the future export gate can see it.
+
+| prefix | owner | co-occurs with | meaning |
+|---|---|---|---|
+| `noise:*` | `enrich/noisefloor.py` | `targeted:*` (by design) | broad fan-out / mass-scan behaviour |
+| `targeted:*` | `enrich/noisefloor.py` | `noise:*` (by design) | substantive activity — successful auth, executed commands, or a malware drop. **Independent of fan-out:** an address can carry both `noise:*` and `targeted:*`, and 29.7% of suppressed addresses do. |
+| `blocklist:*` | `enrich/blocklists.py` | any | membership of a named list |
+| `tor:*` | `enrich/blocklists.py` | any | anonymiser context |
+| `kev:*` | `enrich/blocklists.py` | any | CVE known-exploited |
+| `shodan:*` | `enrich/lookup.py` (internetdb) | any | ports/tags/CPE context |
+| `hashlookup:*` | `enrich/lookup.py` (circl) | any | known-good suppression |
+| `abusech:*` | `enrich/lookup.py` (abusech) | any | family / distribution evidence |
+| `abuseipdb:*` | `enrich/lookup.py` (abuseipdb) | any | reputation confidence |
+| `vt:*` | `enrich/lookup.py` (vt) | any | VirusTotal verdict (optional tier) |
 
 ---
 
