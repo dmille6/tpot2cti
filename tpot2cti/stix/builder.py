@@ -850,6 +850,7 @@ class STIXBuilder:
         sample_sha256: Optional[str] = None,
         detection_ratio: Optional[str] = None,
         source: str = "virustotal",
+        description: Optional[str] = None,
     ) -> Optional[dict]:
         """Malware SDO for a *confirmed, named* family.
 
@@ -871,7 +872,12 @@ class STIXBuilder:
             "is_family": True,
             "labels": sorted({f"source:{source}", "malware-family"}),
         }
-        bits = [f"Malware family {fam!r} attributed from honeypot-captured sample(s)."]
+        # Callers that did NOT capture a sample must say so: the default
+        # wording asserts first-party capture, and attaching it to a
+        # list-derived attribution would be a false provenance claim on the
+        # highest-confidence object this codebase emits.
+        bits = [description or
+                f"Malware family {fam!r} attributed from honeypot-captured sample(s)."]
         if sample_sha256:
             bits.append(f"First attributed via sha256:{sample_sha256[:16]}….")
         if detection_ratio:

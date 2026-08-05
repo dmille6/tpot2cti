@@ -43,6 +43,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from tpot2cti.config import ConfigError, load_config
+from tpot2cti.enrich.sweep import (  # shared: one copy of the sweep, by design
+    ActivityReadError,
+    SweepCursor,
+    read_activity,
+)
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.publisher import Publisher
@@ -52,13 +57,6 @@ from tpot2cti.stix_ids import attacker_ip_observable_id
 
 logger = logging.getLogger(__name__)
 
-
-class ActivityReadError(RuntimeError):
-    """CORE's telemetry could not be read (missing DB, schema drift, bad query).
-
-    Raised rather than returning an empty list so a broken module can never be
-    mistaken for a genuinely quiet fleet.
-    """
 
 #: Distinct honeypot services an IP must touch to count as broad fan-out.
 #: Three is deliberately conservative: two can happen by accident (a scanner
@@ -107,69 +105,6 @@ LABEL_SUBSTANTIVE = "targeted:substantive"  # auth success, commands, or malware
 # ---------------------------------------------------------------------------
 # Read CORE's telemetry (read-only)
 # ---------------------------------------------------------------------------
-
-def read_activity(
-    core_db: str,
-    *,
-    window_hours: int = WINDOW_HOURS,
-    limit: int = MAX_PER_CYCLE,
-    after_ip: str = "",
-) -> list[dict]:
-    """Aggregate CORE's `attacker_activity` telemetry per source IP.
-
-    **What `window_hours` actually means.** It selects rows *last active*
-    within N hours; it does NOT window the counters. CORE stores one row per
-    `(src_ip, parser, sensor)` with **lifetime** cumulative counts, so the
-    SUMs below are that pair's totals since first contact, not totals for the
-    last N hours. This is deliberate and matches the module's stated rule that
-    observations are never revoked: an IP that authenticated and ran commands
-    six months ago *did that*, and the evidence that lifts export suppression
-    should not silently expire because the attacker went quiet. Read the knob
-    as "how recently must this IP have been active for us to look at it",
-    never as "activity in the last N hours".
-
-    **Coverage is a sweep, not a top-N.** Rows are ordered by `src_ip` and
-    resumed from `after_ip`, so successive cycles walk the whole in-window set
-    and every address is reached within one sweep. Ordering by recency instead
-    would hand back the same most-recent `limit` addresses every cycle; the
-    skip-cache filters *after* the SQL `LIMIT`, so the older majority of the
-    window — measured at ~12,700 of ~14,800 addresses — would never be read at
-    all. That is the starvation this cursor exists to prevent.
-
-    Raises `ActivityReadError` on any DB or schema problem — see that class.
-    """
-    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
-    sql = """
-        SELECT src_ip,
-               COUNT(DISTINCT parser)          AS surfaces,
-               COUNT(DISTINCT sensor)          AS sensors,
-               SUM(sessions_count)             AS sessions,
-               SUM(auth_success_count)         AS auth_success,
-               SUM(commands_count)             AS commands,
-               SUM(malware_drop_count)         AS malware_drops,
-               GROUP_CONCAT(sample_dst_ports_json) AS ports_json
-          FROM attacker_activity
-         WHERE last_seen >= ? AND src_ip > ?
-         GROUP BY src_ip
-         ORDER BY src_ip ASC
-         LIMIT ?
-    """
-    uri = f"file:{core_db}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=10.0)
-    except sqlite3.Error as exc:
-        # A missing/unreadable CORE DB is a BROKEN module, not a quiet fleet.
-        # Returning [] here would publish nothing, record a successful cycle
-        # and go green — this project's signature failure, in a new shape.
-        raise ActivityReadError(f"cannot open CORE state DB {core_db}: {exc}") from exc
-    try:
-        conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute(sql, (since, after_ip, limit))]
-    except sqlite3.Error as exc:
-        raise ActivityReadError(f"activity query failed: {exc}") from exc
-    finally:
-        conn.close()
-
 
 def _distinct_ports(ports_json: Optional[str]) -> int:
     """Count distinct destination ports in concatenated JSON port lists.
@@ -247,7 +182,8 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     started = time.monotonic()
     state.heartbeat()
 
-    cursor = state.get(SWEEP_CURSOR_KEY) or ""
+    sweep = SweepCursor(state, "nf", stuck_alert=STUCK_PAGE_ALERT)
+    cursor = sweep.position()
     try:
         # limit passed explicitly: the default arg binds at import time, so
         # reading the module global here is what makes the page size actually
@@ -322,35 +258,15 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
 
     swept = False
     if not publish_ok:
-        # Count consecutive failures at this exact cursor so a deterministically
-        # bad page is named rather than presenting as a sweep that never ends.
-        stuck_at = state.get(STUCK_AT_KEY)
-        n = (int(state.get(STUCK_COUNT_KEY) or 0) + 1) if stuck_at == cursor else 1
-        state.set(STUCK_AT_KEY, cursor)
-        state.set(STUCK_COUNT_KEY, str(n))
-        if n >= STUCK_PAGE_ALERT:
-            logger.error(
-                "noisefloor: SWEEP WEDGED — %d consecutive publish failures at "
-                "cursor %r. The page is NOT skipped (advancing past unpublished "
-                "data is worse), so coverage is stalled until this is resolved. "
-                "Inspect the addresses after that cursor in CORE's "
-                "attacker_activity, or clear %s to step past them deliberately.",
-                n, cursor or "<start>", SWEEP_CURSOR_KEY,
-            )
-    if publish_ok:
-        state.set(STUCK_COUNT_KEY, "0")
+        sweep.hold(cursor)
+    else:
         # Mark only on confirmed publish — a cache that records work which
         # never landed is the failure this project keeps re-learning.
         for k, v in pending_marks:
             state.set(k, v)
-        # Advance the sweep only after the page landed, so a failed publish
-        # retries the same addresses instead of skipping past them. A short
-        # page means the window is exhausted: restart the pass.
-        if len(rows) < MAX_PER_CYCLE:
-            state.set(SWEEP_CURSOR_KEY, "")
-            swept = True
-        elif rows:
-            state.set(SWEEP_CURSOR_KEY, str(rows[-1]["src_ip"]))
+        # Advance only after the page landed, so a failed publish retries the
+        # same addresses instead of skipping past them.
+        swept = sweep.advance(rows, MAX_PER_CYCLE)
 
     duration = time.monotonic() - started
     logger.info(
