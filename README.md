@@ -290,12 +290,12 @@ entitlement. The full design is specified in
 
 | Ring / lane | Sources | Signup | Status |
 |---|---|---|---|
-| `noisefloor` (own telemetry) | scanner-vs-focused classification | **none** | Specified |
-| `blocklists` (bulk lists) | FireHOL, Spamhaus, Tor, Feodo, CISA KEV | **none** | Specified |
+| `noisefloor` (own telemetry) | scanner-vs-substantive classification | **none** | **Deployed** |
+| `blocklists` (bulk lists) | FireHOL, Spamhaus, Tor, Feodo (**KEV deferred** — no CVE join key) | **none** | **Implemented** |
 | `lookup` (per-object API) | Shodan InternetDB, CIRCL hashlookup | **none** | Specified |
 | `lookup` (per-object API) | abuse.ch (MalwareBazaar/URLhaus/ThreatFox), AbuseIPDB | free key | Specified |
 | `lookup` (per-object API) | VirusTotal / GTI | paid | Specified |
-| `ingest/malware` | hive malware samples → Malware SDOs | **none** | Specified |
+| `ingest/malware` | hive malware samples → Malware SDOs | **none** | **Deployed** |
 | MISP bridge · Discord digest | — | — | Possible |
 
 Enrichment modules ship in the **same image** as the core and run as

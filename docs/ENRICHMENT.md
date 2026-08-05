@@ -118,11 +118,15 @@ tpot2cti/
 │   └── malware.py             # hive malware-* → File + Malware SDO + attacker rels
 └── enrich/
     ├── ledger.py              # cache + budget + backlog + health (one component)
+    ├── sweep.py               # shared cursor sweep over CORE telemetry
+    ├── sources.py             # Lane A source registry + CIDR matcher
     ├── noisefloor.py          # Lane C
     ├── blocklists.py          # Lane A
     ├── lookup.py              # Lane B
     └── sources/
-        ├── firehol.py  spamhaus.py  tor_exit.py  feodo.py  kev.py
+        └── (none — see sources.py: the per-source split below was dropped
+                because each source differs only in a URL, a parse mode and a
+                label, so it would have produced five near-identical files)
         └── internetdb.py  circl.py  abusech.py  abuseipdb.py  vt.py
 ```
 
@@ -341,7 +345,7 @@ other module and the future export gate can see it.
 | `targeted:*` | `enrich/noisefloor.py` | `noise:*` (by design) | substantive activity — successful auth, executed commands, or a malware drop. **Independent of fan-out:** an address can carry both `noise:*` and `targeted:*`, and 29.7% of suppressed addresses do. |
 | `blocklist:*` | `enrich/blocklists.py` | any | membership of a named list |
 | `tor:*` | `enrich/blocklists.py` | any | anonymiser context |
-| `kev:*` | `enrich/blocklists.py` | any | CVE known-exploited |
+| `kev:*` | *(unassigned — KEV is deferred)* | any | CVE known-exploited. Reserved, not yet emitted by any module: KEV keys on CVE and CORE's roll-up has no structured CVE field. See the KEV row in §Sources. |
 | `shodan:*` | `enrich/lookup.py` (internetdb) | any | ports/tags/CPE context |
 | `hashlookup:*` | `enrich/lookup.py` (circl) | any | known-good suppression |
 | `abusech:*` | `enrich/lookup.py` (abusech) | any | family / distribution evidence |
@@ -365,7 +369,10 @@ ENRICH_NOISEFLOOR_INTERVAL=PT1H
 ENRICH_NOISEFLOOR_FANOUT_SUPPRESS=3      # distinct surfaces ⇒ mass-scan
 
 # ── ENRICHMENT — blocklists (no signup) ──
-ENRICH_BLOCKLIST_SOURCES=firehol,spamhaus,tor,feodo,kev
+# 'kev' is NOT a valid source — see the KEV row in §Sources. An unknown name
+# is a hard startup error (deliberately: a typo must not silently disable a
+# feed), so shipping it here would crash-loop the container.
+ENRICH_BLOCKLIST_SOURCES=firehol,spamhaus,tor,feodo
 ENRICH_BLOCKLIST_REFRESH=PT24H
 
 # ── ENRICHMENT — per-object lookups ──

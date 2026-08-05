@@ -100,6 +100,14 @@ they share one fetch path and one matcher. Adding a source is one entry in the
   times and each fix landed in one copy while the other twenty kept the bug.
 - **Per-`(ip, source)` marks**, so an address already matched on one list can
   still earn another later.
+- **Non-addresses are counted, not silently dropped.** CORE's telemetry
+  contains rows whose `src_ip` is not an address — 16 in the live window, all
+  obfuscated Log4Shell JNDI payloads stored by H0neytr4p. They are skipped and
+  reported as `malformed`, so they never masquerade as "matched no list".
+- **A failed source keeps its previous copy**, and keeps its old fetch
+  timestamp, so it ages toward the staleness cliff and is eventually refused
+  rather than answering forever from stale data. Only the failed sources are
+  retried, after `min(refresh, max(interval, 300s))` rather than a full day.
 - **A short parse is refused.** These feeds are plain text over HTTP, so a
   captive portal or rate-limit page parses to zero networks perfectly happily.
   Each source declares a floor; parsing below it raises rather than quietly

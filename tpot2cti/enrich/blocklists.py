@@ -57,7 +57,8 @@ from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.publisher import Publisher
 from tpot2cti.state import CycleState
 from tpot2cti.stix.builder import STIXBuilder
-from tpot2cti.stix_ids import attacker_ip_observable_id
+from tpot2cti.stix.builder import normalize_malware_family
+from tpot2cti.stix_ids import attacker_ip_observable_id, generate_malware_id
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,17 @@ def fetch_source(src: Source, *, timeout: int = FETCH_TIMEOUT) -> tuple:
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise SourceParseError(f"{src.key}: fetch failed: {exc}") from exc
 
-    cidrs, extra = src.parse(body)
+    try:
+        cidrs, extra = src.parse(body)
+    except SourceParseError:
+        raise
+    except Exception as exc:
+        # A parser raising anything else (a renamed field yielding a TypeError,
+        # say) would escape past refresh_lists' handler and take down the other
+        # three feeds — this function promises per-source isolation, so it has
+        # to actually hold for unexpected exceptions too.
+        raise SourceParseError(
+            f"{src.key}: parser raised {type(exc).__name__}: {exc}") from exc
     if len(cidrs) < src.min_entries:
         raise SourceParseError(
             f"{src.key}: parsed only {len(cidrs)} entries, below the floor of "
@@ -174,12 +185,30 @@ def age_hours(state: CycleState, key: str) -> Optional[float]:
         return None
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+    age = (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+    if age < -1.0:
+        # A timestamp meaningfully in the future means clock skew or a corrupt
+        # value. Reading it as "negative hours old" would make the list pass
+        # the staleness cliff forever — an unknown silently becoming the most
+        # confident possible answer.
+        logger.error("blocklists: %s has a fetch timestamp %.1fh in the future "
+                     "— treating as unusable rather than infinitely fresh",
+                     key, -age)
+        return None
+    return max(0.0, age)
 
 
 # ---------------------------------------------------------------------------
 # Matching + build
 # ---------------------------------------------------------------------------
+
+def _is_ip(raw_ip) -> bool:
+    try:
+        ipaddress.ip_address(str(raw_ip))
+        return True
+    except ValueError:
+        return False
+
 
 def match_ip(raw_ip: str, lists: dict) -> list[tuple[str, dict]]:
     """Return `[(source_key, extra), …]` for every list containing this IP."""
@@ -213,8 +242,9 @@ def build_objects(builder: STIXBuilder, raw_ip: str,
     obj["x_opencti_labels"] = sorted(
         set(list(obj.get("x_opencti_labels") or []) + labels)
     )
-    meanings = "; ".join(sources_by_key[k].meaning for k, _ in hits)
-    obj["x_opencti_description"] = f"Blocklist context: {meanings}."
+    # Deliberately NO description. noisefloor's convention is labels-only, the
+    # publisher sends update=False, and a second list hit later would rewrite
+    # the text to name only the newer source — losing the first either way.
     out = [obj]
 
     # Feodo online C2 → Malware SDO + edge. Only promotes when the feed names
@@ -225,12 +255,24 @@ def build_objects(builder: STIXBuilder, raw_ip: str,
         family = (extra.get("families") or {}).get(str(raw_ip))
         if not family:
             continue
-        mal = builder.build_malware(family, source="feodo")
-        if not mal:
+        fam = normalize_malware_family(family)
+        if not fam:
             continue
-        out.append(mal)
+        mal = builder.build_malware(
+            family, source="feodo",
+            description=(f"Malware family {fam!r} attributed from abuse.ch Feodo "
+                         f"Tracker's online C2 list. NOT from a captured sample: "
+                         f"this address was matched against a downloaded "
+                         f"blocklist."),
+        )
+        # `mal` is None when the builder already emitted this family THIS cycle.
+        # The edge must still be built — a second address sharing a family would
+        # otherwise silently lose its relationship, the same shape as the
+        # first-matching-label bug, and invisible in the counters.
+        if mal:
+            out.append(mal)
         rel = builder.build_relationship(
-            obs_id, "related-to", mal["id"],
+            obs_id, "related-to", generate_malware_id(fam),
             description=(f"Address listed as an online {family} C2 by abuse.ch "
                          f"Feodo Tracker at match time."),
         )
@@ -301,8 +343,16 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     matched = already = 0
     per_source: dict[str, int] = {}
 
+    malformed = 0
     for row in rows:
         ip = row.get("src_ip")
+        if not _is_ip(ip):
+            # CORE's telemetry really does contain non-addresses: H0neytr4p
+            # stores raw obfuscated Log4Shell JNDI payloads in src_ip (16 in
+            # the live window). Skipping is right; skipping invisibly makes
+            # them indistinguishable from "matched no list".
+            malformed += 1
+            continue
         hits = match_ip(ip, usable)
         if not hits:
             continue
@@ -345,8 +395,9 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     duration = time.monotonic() - started
     logger.info(
         "blocklists cycle %s complete in %.1fs — ips=%d matched=%d already=%d "
-        "objects=%d per_source=%s publish_ok=%s cursor=%s sweep_complete=%s",
-        cycle_id, duration, len(rows), matched, already,
+        "malformed=%d objects=%d per_source=%s publish_ok=%s cursor=%s "
+        "sweep_complete=%s",
+        cycle_id, duration, len(rows), matched, already, malformed,
         len(objects) - n_foundation, json.dumps(per_source, sort_keys=True),
         publish_ok, (state.get(sweep.cursor_key) or "<start>"), swept,
     )
@@ -356,7 +407,8 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         errors_count=0 if publish_ok else 1, duration_seconds=duration,
     )
     return {"cycle_id": cycle_id, "ips": len(rows), "matched": matched,
-            "already": already, "objects": len(objects) - n_foundation,
+            "already": already, "malformed": malformed,
+            "objects": len(objects) - n_foundation,
             "per_source": per_source, "publish_ok": publish_ok,
             "sweep_complete": swept, "stale": False,
             "duration_seconds": round(duration, 3)}
@@ -433,10 +485,16 @@ def main() -> int:
     retry_after = min(refresh_every, max(interval, 300.0))
     lists: dict = {}
     next_refresh = 0.0
+    pending = list(sources)   # what the next fetch attempt covers
     while not stopping:
         try:
             if time.monotonic() >= next_refresh:
-                lists, failed = refresh_lists(sources, state, previous=lists)
+                # Retry only the sources that failed. Re-downloading all four
+                # every 5 minutes after one flaky feed is 24x/day of needless
+                # traffic against volunteer-run infrastructure.
+                lists, failed = refresh_lists(pending, state, previous=lists)
+                pending = ([s for s in sources if s.key in failed] if failed
+                           else list(sources))
                 next_refresh = time.monotonic() + (retry_after if failed
                                                    else refresh_every)
                 if failed:

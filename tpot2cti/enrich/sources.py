@@ -100,6 +100,14 @@ def _parse_feodo(text: str) -> tuple[CidrSet, dict]:
         raise SourceParseError("feodo: response was not valid JSON")
     if not isinstance(entries, list):
         raise SourceParseError(f"feodo: expected a JSON list, got {type(entries).__name__}")
+    # A renamed `status` or `ip_address` field yields zero online C2s and would
+    # pass silently, because this feed legitimately can be near-empty and so
+    # carries no min_entries floor. Check the SHAPE instead of the count.
+    if entries and not any(isinstance(e, dict) and "ip_address" in e for e in entries):
+        raise SourceParseError(
+            "feodo: no entry has an 'ip_address' field — the feed schema has "
+            "changed. Refusing to report zero C2s as a clean result."
+        )
     nets, families = [], {}
     for e in entries:
         if not isinstance(e, dict) or str(e.get("status", "")).lower() != "online":

