@@ -6,7 +6,9 @@ import urllib.error
 
 import pytest
 
-from tpot2cti.httpfetch import USER_AGENT, FetchResult, Outcome, fetch
+from tpot2cti.httpfetch import (
+    USER_AGENT, FetchResult, MalformedBody, Outcome, fetch,
+)
 
 
 class _Resp:
@@ -115,10 +117,122 @@ def test_json_parses_only_on_ok():
     assert absent.json() is None
 
 
-def test_an_unparseable_body_is_not_silently_absence():
-    """A 200 carrying garbage is a source problem, not 'no record'. json()
-    returning None is a convenience — is_answer still says we got a reply, and
-    the caller must not translate that into absence."""
+def test_an_unparseable_body_raises_rather_than_looking_like_absence():
+    """A 200 carrying garbage is a source problem, not 'no record'.
+
+    json() used to return None here, which made None ambiguous across FOUR
+    meanings — genuine absence, empty body, unparseable body, literal null.
+    The docstring told callers not to read that as absence, but the obvious
+    idiom (`if r.json() is None: mark_not_found()`) did precisely that. A
+    prose warning is not a type; this raises instead."""
     r = fetch("http://x", opener=_opener(_Resp(200, b"<html>rate limited</html>")))
-    assert r.outcome is Outcome.OK and r.json() is None
+    assert r.outcome is Outcome.OK and r.outcome is not Outcome.ABSENT
+    with pytest.raises(MalformedBody):
+        r.json()
+
+
+def test_the_four_meanings_of_none_are_now_distinguishable():
+    """Only genuine absence may return None from json()."""
+    absent = fetch("http://x", opener=_opener(_Resp(404)))
+    assert absent.outcome is Outcome.ABSENT
+    assert absent.json() is None            # the ONLY None
+
+    for body in (b"", b"<html>nope</html>"):
+        r = fetch("http://x", opener=_opener(_Resp(200, body)))
+        with pytest.raises(MalformedBody):
+            r.json()
+
+    # A literal JSON null is a real answer of "null", not an absence.
+    r = fetch("http://x", opener=_opener(_Resp(200, b"null")))
+    assert r.json() is None and r.outcome is Outcome.OK
+    # ...distinguishable from absence by the outcome, which is the point.
     assert r.outcome is not Outcome.ABSENT
+
+
+def test_json_on_a_refusal_raises_rather_than_returning_none():
+    r = fetch("http://x", opener=_opener(_Resp(403)))
+    assert r.outcome is Outcome.REFUSED
+    with pytest.raises(MalformedBody):
+        r.json()
+
+
+# ── the mapping must be TOTAL ────────────────────────────────────────────
+
+def test_a_truncated_body_is_transport_not_an_escaped_exception():
+    """http.client.HTTPException is neither OSError nor ValueError. A server
+    promising Content-Length: 1000 and closing after 5 bytes raises
+    IncompleteRead out of resp.read(); it used to escape fetch() entirely,
+    sail past refresh_lists' per-source isolation, and kill the whole cycle.
+    A truncated feed download is not an exotic input."""
+    import http.client
+    exc = http.client.IncompleteRead(b"12345", 995)
+    r = fetch("http://x", opener=_opener(exc))
+    assert r.outcome is Outcome.TRANSPORT
+    assert not r.is_answer
+
+
+@pytest.mark.parametrize("exc", [
+    __import__("http.client", fromlist=["x"]).BadStatusLine("oops"),
+    __import__("http.client", fromlist=["x"]).LineTooLong("header line"),
+    __import__("http.client", fromlist=["x"]).RemoteDisconnected("closed"),
+])
+def test_no_http_client_exception_escapes(exc):
+    r = fetch("http://x", opener=_opener(exc))
+    assert r.outcome is Outcome.TRANSPORT and not r.is_answer
+
+
+def test_an_unforeseen_exception_is_transport_never_absence():
+    """The backstop. A new urllib exception class must not silently become
+    'the source has no record'."""
+    class Weird(Exception):
+        pass
+    r = fetch("http://x", opener=_opener(Weird("something new")))
+    assert r.outcome is Outcome.TRANSPORT
+    assert r.outcome is not Outcome.ABSENT and not r.is_answer
+
+
+def test_a_malformed_url_does_not_escape():
+    """Request() raises ValueError('unknown url type') and used to be
+    constructed outside the try."""
+    r = fetch("not-a-url")
+    assert r.outcome is Outcome.TRANSPORT and not r.is_answer
+
+
+def test_absent_is_reachable_from_exactly_one_place():
+    """The load-bearing invariant, asserted directly over the whole surface."""
+    import http.client
+    statuses = [200, 201, 204, 206, 301, 304, 400, 401, 403, 410, 418, 429,
+                451, 500, 503, 999, None]
+    for s in statuses:
+        r = fetch("http://x", opener=_opener(_Resp(s, b"{}")))
+        if s == 404:
+            continue
+        assert r.outcome is not Outcome.ABSENT, f"status {s} became ABSENT"
+    for exc in (urllib.error.URLError("dns"), OSError("reset"),
+                http.client.IncompleteRead(b"", 1), ValueError("bad"),
+                urllib.error.HTTPError("http://x", 500, "e", {}, None)):
+        r = fetch("http://x", opener=_opener(exc))
+        assert r.outcome is not Outcome.ABSENT, f"{type(exc).__name__} became ABSENT"
+    # positive control: 404 really does still reach it
+    assert fetch("http://x", opener=_opener(_Resp(404))).outcome is Outcome.ABSENT
+
+
+def test_a_refusal_logs_loudly_on_the_non_raising_path_too(caplog):
+    """The loud log lived only in the `except HTTPError` branch, so an opener
+    returning 403 instead of raising was classified REFUSED in silence."""
+    import logging
+    with caplog.at_level(logging.ERROR):
+        r = fetch("http://x", opener=_opener(_Resp(403)))
+    assert r.outcome is Outcome.REFUSED
+    assert any("REFUSED" in rec.message for rec in caplog.records)
+
+
+def test_the_timeout_actually_reaches_the_opener():
+    """Nothing asserted this, so deleting `timeout=timeout` left all tests
+    green — while a missing timeout hangs the entire pipeline."""
+    seen = {}
+    def _open(req, timeout=None):
+        seen["timeout"] = timeout
+        return _Resp(200, b"{}")
+    fetch("http://x", timeout=7.5, opener=_open)
+    assert seen["timeout"] == 7.5

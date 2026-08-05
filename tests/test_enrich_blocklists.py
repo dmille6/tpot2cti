@@ -488,3 +488,57 @@ def test_a_description_override_still_keeps_sample_provenance(builder):
                                 sample_sha256="a" * 64, detection_ratio="40/70")
     assert "From a downloaded list." in mal["description"]
     assert "aaaaaaaa" in mal["description"] and "40/70" in mal["description"]
+
+
+# ── a refused source must not hide behind a usable previous copy ─────────
+
+def test_a_refused_source_is_visible_before_the_staleness_cliff(cfg, state_db, tmp_path):
+    """The blind window. A source can 403 for up to MAX_LIST_AGE_HOURS while
+    its previous copy is still inside the bound — during which the matching
+    is legitimate, so the cycle correctly records success. But `failed` was
+    logged and dropped: never passed to run_cycle, never in the summary,
+    never in record_cycle, never reaching /health. FireHOL carries 5.8 of
+    the 6.2 coverage points, so that window sat on the highest-value
+    source."""
+    from tpot2cti.stix.builder import STIXBuilder
+    lists = _lists(state_db)                       # fresh previous copy
+    db = _core(tmp_path, ["45.9.1.2"])
+    s = bl.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(),
+                     lists, src.SOURCES_BY_KEY, failed=["firehol"])
+
+    assert s["failed_sources"] == ["firehol"], \
+        "a refused source is absent from the cycle summary"
+    assert state_db.get("bl_failed_sources") == "firehol", \
+        "a refused source is absent from state, so /health cannot see it"
+    row = state_db.recent_cycles(1)[0]
+    assert row["errors_count"] >= 1, \
+        "a refused source recorded zero errors — the cycle reads perfectly clean"
+
+
+def test_a_clean_cycle_still_reports_no_failures(cfg, state_db, tmp_path):
+    """Positive control: the assertions above must not pass by the summary
+    key simply always being non-empty."""
+    from tpot2cti.stix.builder import STIXBuilder
+    lists = _lists(state_db)
+    db = _core(tmp_path, ["45.9.1.2"])
+    s = bl.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(),
+                     lists, src.SOURCES_BY_KEY)
+    assert s["failed_sources"] == []
+    assert state_db.recent_cycles(1)[0]["errors_count"] == 0
+
+
+def test_a_truncated_download_does_not_take_down_the_whole_cycle(monkeypatch, state_db):
+    """refresh_lists documents per-source isolation. IncompleteRead escaped
+    fetch() as an unclassified exception, blew past `except SourceParseError`
+    and killed every remaining source in the round."""
+    import http.client
+    from tpot2cti.httpfetch import fetch as real_fetch
+
+    def _boom(url, timeout=None):
+        return real_fetch(url, timeout=timeout,
+                          opener=lambda req, timeout=None: (_ for _ in ()).throw(
+                              http.client.IncompleteRead(b"12345", 995)))
+    monkeypatch.setattr(bl, "http_fetch", _boom)
+
+    out, failed = bl.refresh_lists(list(src.SOURCES[:2]), state_db)
+    assert len(failed) == 2, "isolation broke — the exception escaped the loop"

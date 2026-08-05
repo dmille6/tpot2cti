@@ -301,7 +301,16 @@ def build_objects(builder: STIXBuilder, raw_ip: str,
 # ---------------------------------------------------------------------------
 
 def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
-              publisher, lists: dict, sources_by_key: dict) -> dict:
+              publisher, lists: dict, sources_by_key: dict,
+              failed: Optional[list[str]] = None) -> dict:
+    """`failed` is the keys that could not be refreshed this round.
+
+    It is threaded in rather than logged and dropped because a source can
+    keep 403ing for up to MAX_LIST_AGE_HOURS while its previous copy is
+    still usable — during which every cycle recorded success=True and
+    /health stayed green. FireHOL carries 5.8 of the 6.2 coverage points,
+    so that blind window sat on the highest-value source.
+    """
     cycle_id = state.start_cycle()
     started = time.monotonic()
     state.heartbeat()
@@ -416,15 +425,31 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         len(objects) - n_foundation, json.dumps(per_source, sort_keys=True),
         publish_ok, (state.get(sweep.cursor_key) or "<start>"), swept,
     )
+    failed = list(failed or [])
+    if failed:
+        # Not a cycle failure — the previous copies are still inside the
+        # staleness bound, so the matching we just did was legitimate. But it
+        # must be VISIBLE: "0 matched because the lists say so" and "0 matched
+        # because we are being refused" are different facts, and only one of
+        # them is an operator's problem.
+        logger.error(
+            "blocklists cycle %s: %d source(s) served from a previous copy "
+            "because refresh failed: %s. Matching is still valid until the "
+            "%dh staleness bound, but this is being refused, not answered.",
+            cycle_id, len(failed), ",".join(sorted(failed)), MAX_LIST_AGE_HOURS,
+        )
+    state.set("bl_failed_sources", ",".join(sorted(failed)))
     state.record_cycle(
         cycle_id, success=publish_ok, events_read=len(rows), events_parsed=matched,
         events_dropped=len(rows) - matched, sdos_emitted=len(objects),
-        errors_count=0 if publish_ok else 1, duration_seconds=duration,
+        errors_count=(0 if publish_ok else 1) + len(failed),
+        duration_seconds=duration,
     )
     return {"cycle_id": cycle_id, "ips": len(rows), "matched": matched,
             "already": already, "malformed": malformed,
             "objects": len(objects) - n_foundation,
             "per_source": per_source, "publish_ok": publish_ok,
+            "failed_sources": sorted(failed),
             "sweep_complete": swept, "stale": False,
             "duration_seconds": round(duration, 3)}
 
@@ -502,6 +527,11 @@ def main() -> int:
     # after a transient blip spends that budget for nothing.
     retry_after = min(refresh_every, max(interval, 300.0))
     lists: dict = {}
+    # Hoisted out of the refresh branch deliberately: most cycles do not
+    # refresh, and a source that failed at the LAST refresh is still being
+    # served from a previous copy on every one of them. Scoped to the branch,
+    # the failure would be reported once and then vanish from the record.
+    failed: list[str] = []
     next_refresh = 0.0
     pending = list(sources)   # what the next fetch attempt covers
     while not stopping:
@@ -521,7 +551,7 @@ def main() -> int:
                                    len(failed), ",".join(failed),
                                    int(retry_after), int(refresh_every))
             summary = run_cycle(cfg, state, core_db, lambda: STIXBuilder(cfg),
-                                publisher, lists, sources_by_key)
+                                publisher, lists, sources_by_key, failed=failed)
             if summary.get("sweep_complete"):
                 logger.info("blocklists: sweep complete — next cycle restarts "
                             "the pass from the beginning of the window")
