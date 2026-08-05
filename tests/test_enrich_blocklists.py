@@ -10,7 +10,13 @@ import pytest
 
 from tpot2cti.enrich import blocklists as bl
 from tpot2cti.enrich import sources as src
+from tpot2cti.httpfetch import FetchResult, Outcome
 from tpot2cti.stix_ids import attacker_ip_observable_id
+
+
+def _fr(status, body):
+    return FetchResult(Outcome.OK if status == 200 else Outcome.UNAVAILABLE,
+                       status, body)
 
 
 # ── CIDR matching ────────────────────────────────────────────────────────
@@ -95,13 +101,20 @@ def test_a_short_parse_is_refused_rather_than_un_labelling_the_world(monkeypatch
     """These feeds are plain text over HTTP: a captive portal or rate-limit
     page parses to zero networks perfectly happily. Accepting that would make
     a broken fetch look like a clean internet."""
-    class _Resp:
-        status = 200
-        def read(self): return b"<html>429 Too Many Requests</html>"
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    monkeypatch.setattr(bl.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(bl, "http_fetch",
+                        lambda url, timeout=None: _fr(200, b"<html>429 Too Many Requests</html>"))
     with pytest.raises(src.SourceParseError, match="below the floor"):
+        bl.fetch_source(src.SOURCES_BY_KEY["firehol"])
+
+
+def test_a_refusal_is_not_reported_as_an_empty_list(monkeypatch):
+    """The distinction the shared fetch helper exists for: a 403 must surface
+    as a refusal, never as "the source returned nothing". Shodan's InternetDB
+    really does 403 Python's default User-Agent."""
+    from tpot2cti.httpfetch import FetchResult, Outcome
+    monkeypatch.setattr(bl, "http_fetch",
+                        lambda url, timeout=None: FetchResult(Outcome.REFUSED, 403))
+    with pytest.raises(src.SourceParseError, match="refused"):
         bl.fetch_source(src.SOURCES_BY_KEY["firehol"])
 
 
@@ -380,12 +393,7 @@ def test_a_parser_raising_something_unexpected_stays_isolated(monkeypatch, state
     boom = src.Source(key="feodo", url="http://x", label="l",
                       parse=lambda body: (_ for _ in ()).throw(TypeError("renamed field")),
                       meaning="m", min_entries=0)
-    class _Resp:
-        status = 200
-        def read(self): return b"[]"
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    monkeypatch.setattr(bl.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(bl, "http_fetch", lambda url, timeout=None: _fr(200, b"[]"))
     with pytest.raises(src.SourceParseError, match="TypeError"):
         bl.fetch_source(boom)
 
@@ -480,3 +488,57 @@ def test_a_description_override_still_keeps_sample_provenance(builder):
                                 sample_sha256="a" * 64, detection_ratio="40/70")
     assert "From a downloaded list." in mal["description"]
     assert "aaaaaaaa" in mal["description"] and "40/70" in mal["description"]
+
+
+# ── a refused source must not hide behind a usable previous copy ─────────
+
+def test_a_refused_source_is_visible_before_the_staleness_cliff(cfg, state_db, tmp_path):
+    """The blind window. A source can 403 for up to MAX_LIST_AGE_HOURS while
+    its previous copy is still inside the bound — during which the matching
+    is legitimate, so the cycle correctly records success. But `failed` was
+    logged and dropped: never passed to run_cycle, never in the summary,
+    never in record_cycle, never reaching /health. FireHOL carries 5.8 of
+    the 6.2 coverage points, so that window sat on the highest-value
+    source."""
+    from tpot2cti.stix.builder import STIXBuilder
+    lists = _lists(state_db)                       # fresh previous copy
+    db = _core(tmp_path, ["45.9.1.2"])
+    s = bl.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(),
+                     lists, src.SOURCES_BY_KEY, failed=["firehol"])
+
+    assert s["failed_sources"] == ["firehol"], \
+        "a refused source is absent from the cycle summary"
+    assert state_db.get("bl_failed_sources") == "firehol", \
+        "a refused source is absent from state, so /health cannot see it"
+    row = state_db.recent_cycles(1)[0]
+    assert row["errors_count"] >= 1, \
+        "a refused source recorded zero errors — the cycle reads perfectly clean"
+
+
+def test_a_clean_cycle_still_reports_no_failures(cfg, state_db, tmp_path):
+    """Positive control: the assertions above must not pass by the summary
+    key simply always being non-empty."""
+    from tpot2cti.stix.builder import STIXBuilder
+    lists = _lists(state_db)
+    db = _core(tmp_path, ["45.9.1.2"])
+    s = bl.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub(),
+                     lists, src.SOURCES_BY_KEY)
+    assert s["failed_sources"] == []
+    assert state_db.recent_cycles(1)[0]["errors_count"] == 0
+
+
+def test_a_truncated_download_does_not_take_down_the_whole_cycle(monkeypatch, state_db):
+    """refresh_lists documents per-source isolation. IncompleteRead escaped
+    fetch() as an unclassified exception, blew past `except SourceParseError`
+    and killed every remaining source in the round."""
+    import http.client
+    from tpot2cti.httpfetch import fetch as real_fetch
+
+    def _boom(url, timeout=None):
+        return real_fetch(url, timeout=timeout,
+                          opener=lambda req, timeout=None: (_ for _ in ()).throw(
+                              http.client.IncompleteRead(b"12345", 995)))
+    monkeypatch.setattr(bl, "http_fetch", _boom)
+
+    out, failed = bl.refresh_lists(list(src.SOURCES[:2]), state_db)
+    assert len(failed) == 2, "isolation broke — the exception escaped the loop"

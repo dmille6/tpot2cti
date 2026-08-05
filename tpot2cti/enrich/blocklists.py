@@ -40,8 +40,6 @@ import os
 import signal
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -53,6 +51,8 @@ from tpot2cti.enrich.sources import (
 )
 from tpot2cti.enrich.sweep import ActivityReadError, SweepCursor, read_activity
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
+from tpot2cti.httpfetch import Outcome
+from tpot2cti.httpfetch import fetch as http_fetch
 from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.publisher import Publisher
 from tpot2cti.state import CycleState
@@ -85,8 +85,6 @@ MAX_LIST_AGE_HOURS = max(1, int(os.environ.get("ENRICH_BLOCKLIST_MAX_AGE_HOURS",
 
 FETCH_TIMEOUT = max(5, int(os.environ.get("ENRICH_BLOCKLIST_FETCH_TIMEOUT", "60")))
 
-_USER_AGENT = "tpot2cti/2.0 (+https://github.com/dmille6/tpot2cti)"
-
 
 class ListTooStaleError(RuntimeError):
     """Every configured source is older than `MAX_LIST_AGE_HOURS`.
@@ -110,16 +108,15 @@ def fetch_source(src: Source, *, timeout: int = FETCH_TIMEOUT) -> tuple:
     page or an error body parses to *zero* networks perfectly happily, and the
     module would then quietly un-label the internet.
     """
-    req = urllib.request.Request(src.url, headers={"User-Agent": _USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise SourceParseError(f"{src.key}: HTTP {resp.status}")
-            body = resp.read().decode("utf-8", errors="replace")
-    except SourceParseError:
-        raise
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise SourceParseError(f"{src.key}: fetch failed: {exc}") from exc
+    # One fetch path for the whole project, so "we were refused" can never be
+    # mistaken for "the source said nothing" — see tpot2cti/httpfetch.py.
+    result = http_fetch(src.url, timeout=timeout)
+    if result.outcome is not Outcome.OK:
+        raise SourceParseError(
+            f"{src.key}: {result.outcome.value}"
+            f"{f' (HTTP {result.status})' if result.status else ''}"
+            f"{f': {result.detail}' if result.detail else ''}")
+    body = (result.body or b"").decode("utf-8", errors="replace")
 
     try:
         cidrs, extra = src.parse(body)
@@ -304,7 +301,16 @@ def build_objects(builder: STIXBuilder, raw_ip: str,
 # ---------------------------------------------------------------------------
 
 def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
-              publisher, lists: dict, sources_by_key: dict) -> dict:
+              publisher, lists: dict, sources_by_key: dict,
+              failed: Optional[list[str]] = None) -> dict:
+    """`failed` is the keys that could not be refreshed this round.
+
+    It is threaded in rather than logged and dropped because a source can
+    keep 403ing for up to MAX_LIST_AGE_HOURS while its previous copy is
+    still usable — during which every cycle recorded success=True and
+    /health stayed green. FireHOL carries 5.8 of the 6.2 coverage points,
+    so that blind window sat on the highest-value source.
+    """
     cycle_id = state.start_cycle()
     started = time.monotonic()
     state.heartbeat()
@@ -419,15 +425,31 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         len(objects) - n_foundation, json.dumps(per_source, sort_keys=True),
         publish_ok, (state.get(sweep.cursor_key) or "<start>"), swept,
     )
+    failed = list(failed or [])
+    if failed:
+        # Not a cycle failure — the previous copies are still inside the
+        # staleness bound, so the matching we just did was legitimate. But it
+        # must be VISIBLE: "0 matched because the lists say so" and "0 matched
+        # because we are being refused" are different facts, and only one of
+        # them is an operator's problem.
+        logger.error(
+            "blocklists cycle %s: %d source(s) served from a previous copy "
+            "because refresh failed: %s. Matching is still valid until the "
+            "%dh staleness bound, but this is being refused, not answered.",
+            cycle_id, len(failed), ",".join(sorted(failed)), MAX_LIST_AGE_HOURS,
+        )
+    state.set("bl_failed_sources", ",".join(sorted(failed)))
     state.record_cycle(
         cycle_id, success=publish_ok, events_read=len(rows), events_parsed=matched,
         events_dropped=len(rows) - matched, sdos_emitted=len(objects),
-        errors_count=0 if publish_ok else 1, duration_seconds=duration,
+        errors_count=(0 if publish_ok else 1) + len(failed),
+        duration_seconds=duration,
     )
     return {"cycle_id": cycle_id, "ips": len(rows), "matched": matched,
             "already": already, "malformed": malformed,
             "objects": len(objects) - n_foundation,
             "per_source": per_source, "publish_ok": publish_ok,
+            "failed_sources": sorted(failed),
             "sweep_complete": swept, "stale": False,
             "duration_seconds": round(duration, 3)}
 
@@ -505,6 +527,11 @@ def main() -> int:
     # after a transient blip spends that budget for nothing.
     retry_after = min(refresh_every, max(interval, 300.0))
     lists: dict = {}
+    # Hoisted out of the refresh branch deliberately: most cycles do not
+    # refresh, and a source that failed at the LAST refresh is still being
+    # served from a previous copy on every one of them. Scoped to the branch,
+    # the failure would be reported once and then vanish from the record.
+    failed: list[str] = []
     next_refresh = 0.0
     pending = list(sources)   # what the next fetch attempt covers
     while not stopping:
@@ -524,7 +551,7 @@ def main() -> int:
                                    len(failed), ",".join(failed),
                                    int(retry_after), int(refresh_every))
             summary = run_cycle(cfg, state, core_db, lambda: STIXBuilder(cfg),
-                                publisher, lists, sources_by_key)
+                                publisher, lists, sources_by_key, failed=failed)
             if summary.get("sweep_complete"):
                 logger.info("blocklists: sweep complete — next cycle restarts "
                             "the pass from the beginning of the window")
