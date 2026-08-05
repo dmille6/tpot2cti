@@ -58,8 +58,13 @@ from tpot2cti.es_client import TpotESClient
 from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
-from tpot2cti.benign_filter import BenignScannerFilter, FilterStats
+from tpot2cti.benign_filter import (
+    DEFAULT_RDNS_BUDGET,
+    BenignScannerFilter,
+    FilterStats,
+)
 from tpot2cti.env import truthy_env
+from tpot2cti.rdns import ForwardConfirmedRDNS
 from tpot2cti.parsers import dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
@@ -456,6 +461,9 @@ def run_cycle(
     unattributed_capped = False
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
+    if benign_filter is not None:
+        # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
+        benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
 
     try:
         for doc in es.stream_events(
@@ -642,17 +650,24 @@ def run_cycle(
         # documenting durability that does not exist is the failure this
         # project keeps repeating.
         state.set("last_cycle_query_excluded", json.dumps(query_excluded))
+        _bd = benign_stats.to_log_dict()
+        _bd["rdns_samples"] = list(getattr(benign_filter, "rdns_samples", []))
+        state.set("last_cycle_benign_dropped", json.dumps(_bd))
         state.set("last_cycle_unparsed_by_source",
                   json.dumps(dict(unparsed_by_source.most_common(30))))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug(f"cycle {cycle_id}: could not persist drop reasons: {e}")
 
+    _r = getattr(benign_filter, "_resolver", None)
+    _rdns_stats = _r.stats() if hasattr(_r, "stats") else {}
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
         f"events_dropped={events_dropped} drops={drop_reasons} "
         f"query_excluded={query_excluded} "
         f"unparsed_by_source={dict(unparsed_by_source.most_common(8))} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
+        f"rdns_skipped_budget={getattr(benign_filter, 'rdns_skipped_budget', 0)} "
+        f"rdns={_rdns_stats} "
         f"types={sorted(parsed_by_type.keys())}"
     )
     state.heartbeat()  # ES stream done — still alive before build/publish.
@@ -1119,7 +1134,24 @@ def main() -> int:
     # Benign-scanner allowlist — static yaml, loaded once at startup.
     # Filters events from Google / Censys / Shodan / Shadowserver /
     # Internet-Archive at parse time. See benign_filter.py.
-    benign_filter = BenignScannerFilter.from_yaml()
+    # Forward-confirmed reverse DNS. Research scanners rent infrastructure, so
+    # ASN/org rules cannot see them — Shadowserver appears as Hurricane
+    # Electric, BinaryEdge as DigitalOcean, Stretchoid as Microsoft. Without
+    # this, 17 measured addresses reach `targeted:substantive`, the label that
+    # means "share this as real intelligence".
+    rdns_enabled = os.environ.get(
+        "TPOT2CTI_BENIGN_RDNS", "1").strip().lower() not in ("0", "false", "no")
+    rdns_resolver = None
+    if rdns_enabled:
+        rdns_resolver = ForwardConfirmedRDNS(
+            timeout=float(os.environ.get("TPOT2CTI_BENIGN_RDNS_TIMEOUT", "1.0")),
+        )
+    benign_filter = BenignScannerFilter.from_yaml(resolver=rdns_resolver)
+    logger.info(
+        "benign-scanner filter: rdns=%s (%d vendor rule(s) carry rdns suffixes)",
+        "on" if rdns_enabled else "off",
+        sum(1 for r in benign_filter._rules if r.rdns_suffixes),
+    )
 
     # Builder is per-cycle (bundle-scoped dedup); pass a factory.
     def builder_factory() -> STIXBuilder:

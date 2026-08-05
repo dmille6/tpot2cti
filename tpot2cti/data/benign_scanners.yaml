@@ -9,6 +9,30 @@
 #   1. event.src_asn in `asns` (integer match) → drop
 #   2. any keyword from `org_keywords` is a case-insensitive substring of
 #      event.src_as_org → drop
+#   3. the address's FORWARD-CONFIRMED reverse-DNS name ends in one of
+#      `rdns_suffixes` → drop
+#
+# Suffix hygiene: list the NARROWEST name a vendor actually scans from, and
+# only names observed on live traffic. A broad apex like "censys.io" or
+# "onyphe.net" covers every subdomain a vendor will ever publish — including
+# ones they abandon, which is subdomain-takeover surface pointed straight at an
+# allowlist that DELETES data. Four such apexes were removed after measuring
+# zero live matches for any of them.
+#
+# Why (3) exists: research scanners rent infrastructure. Shadowserver's
+# scanners are on Hurricane Electric (AS6939), BinaryEdge's on DigitalOcean
+# (AS14061), Stretchoid's on Microsoft (AS8075) — so rules (1) and (2) can
+# NEVER match them, even though all three vendors are listed below. Measured
+# on the live fleet: 2,731 addresses / 92,127 events over 168h, of which 17
+# were labelled `targeted:substantive` — the label meaning "this one got in,
+# share it as real intelligence". One of them is a nonprofit.
+#
+# rDNS matching is FORWARD-CONFIRMED (see tpot2cti/rdns.py): the PTR name is
+# resolved back and must return the original address. A bare PTR match would
+# be an allowlist anyone could opt into, since the address holder controls
+# their own PTR record — publishing "scan-99.shadowserver.io" would be enough
+# to disappear from the intelligence. Suffixes match on label boundaries, so
+# `evil-shadowserver.io` does not match a `shadowserver.io` rule.
 #
 # Adding a vendor:
 #   - Verify the ASN(s) at https://bgp.he.net/ or https://radar.cloudflare.com/asn
@@ -46,6 +70,9 @@ scanners:
     asns: [398324]
     org_keywords:
       - "Censys"
+    # Some probes run from rented space.
+    rdns_suffixes:
+      - "censys-scanner.com"
 
   shodan:
     # AS208046 = Census of Internet, LLC (Shodan's main scanner ASN)
@@ -63,6 +90,9 @@ scanners:
     asns: [33038]
     org_keywords:
       - "Shadowserver"
+    # Scans run from Hurricane Electric space (AS6939), not AS33038 — only rDNS identifies them.
+    rdns_suffixes:
+      - "shadowserver.io"
 
   internet-archive:
     # AS7941 = INTERNET-ARCHIVE (archive.org's crawlers)
@@ -85,6 +115,9 @@ scanners:
     org_keywords:
       - "Stretchoid"
       - "stretchoid.com"
+    # Runs on Microsoft Azure (AS8075).
+    rdns_suffixes:
+      - "stretchoid.com"
 
   rapid7-sonar:
     # Project Sonar — Rapid7's internet-wide scan effort (data feeds
@@ -103,6 +136,9 @@ scanners:
     org_keywords:
       - "BinaryEdge"
       - "BINARYEDGE"
+    # Runs on DigitalOcean (AS14061).
+    rdns_suffixes:
+      - "binaryedge.ninja"
 
   onyphe:
     # ONYPHE — French internet scan / cyber defense data provider.
@@ -111,6 +147,10 @@ scanners:
     org_keywords:
       - "Onyphe"
       - "ONYPHE"
+    # Rented space (observed: dunlop.probe.onyphe.net on OVH).
+    # Narrow to the probe subdomain, not the apex.
+    rdns_suffixes:
+      - "probe.onyphe.net"
 
   net-systems-research:
     # Net Systems Research / "Internet Census of all the things"
