@@ -87,6 +87,22 @@ _HOSTNAME = re.compile(
     r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
 )
 
+#: Multi-label registry suffixes that must never be emitted as a
+#: Domain-Name on their own.  Not a full public-suffix list — a real PSL
+#: is a dependency and a monthly-changing data file, and the
+#: ``stripped and len(labels) < 3`` rule in :func:`_host_of` already
+#: covers the general case.  This set exists so the *common* two-label
+#: registry suffixes are rejected outright even when they arrive
+#: untemplated.
+_PUBLIC_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "me.uk", "gov.uk", "ac.uk", "net.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "com.br", "com.cn", "com.mx", "com.tr", "com.tw", "com.sg",
+    "co.in", "co.za", "co.nz", "co.kr", "co.il", "co.th", "co.id",
+    "com.ar", "com.co", "com.pl", "com.ua", "com.vn", "com.hk",
+})
+
 
 class JndiPayload:
     """One recovered JNDI endpoint.
@@ -248,15 +264,36 @@ def _host_of(url: str) -> Optional[str]:
     authority = authority.rsplit("@", 1)[-1]
     if not authority:
         return None
-    labels = authority.split(".")
+    labels = authority.rstrip(".").split(".")
+    # A port only ever rides on the final label.
+    labels[-1] = labels[-1].split(":", 1)[0]
     # Drop every label up to and including the last templated one.
     last_templated = -1
     for i, label in enumerate(labels):
         if "$" in label or "{" in label or "}" in label:
             last_templated = i
+    stripped = last_templated >= 0
     labels = labels[last_templated + 1:]
-    # A port only ever rides on the final label.
-    if labels:
-        labels[-1] = labels[-1].split(":", 1)[0]
-    host = ".".join(l for l in labels if l).strip(".").lower()
-    return host if host and _HOSTNAME.match(host) else None
+    # An empty label means the authority was malformed (``a..b.example``).
+    # Silently closing the gap would report a name that was never sent.
+    if not labels or any(not l for l in labels):
+        return None
+
+    host = ".".join(labels).lower()
+    if not _HOSTNAME.match(host):
+        return None
+    # A registry suffix is not an IoC. `${sys:java.version}.co.uk` must not
+    # become a Domain-Name for `co.uk`, which would attach honeypot
+    # evidence to a public registry and, in OpenCTI, to every unrelated
+    # observable under it.
+    if host in _PUBLIC_SUFFIXES:
+        return None
+    if stripped and len(labels) < 3:
+        # We only reached this name by GUESSING which labels were
+        # attacker-controlled. Two labels after stripping is usually a
+        # registrable suffix we cannot distinguish from a real C2 domain
+        # without a full public-suffix list. Decline rather than assert a
+        # domain we are not sure of — the URL observable is emitted
+        # either way, so the IoC is not lost.
+        return None
+    return host
