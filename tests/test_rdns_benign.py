@@ -425,3 +425,35 @@ def test_googles_own_network_is_still_allowlisted():
     """Removing the cloud ASN must not have removed Googlebot."""
     f = BenignScannerFilter.from_yaml()
     assert f._asn_to_vendor.get(15169) == "google"
+
+
+def test_a_cloud_tenant_is_not_dropped_by_the_landlords_ORG_NAME():
+    """Removing a cloud ASN is useless while the landlord's org string stays.
+
+    T-Pot's GeoIP reports `as_org: "Google LLC"` for AS396982 (Google Cloud)
+    identically to AS15169 (Google's own network) — verified on live documents
+    — and org matching is a case-insensitive SUBSTRING test. So after AS396982
+    was removed from `asns`, every Google Cloud tenant was still dropped
+    through the org path: 720 Cowrie documents in 24h, and zero AS396982
+    addresses had ever reached attacker_activity.
+
+    The previous guard only checked ASNs, so it passed while the bug was live.
+    An ASN identifies the landlord — and so does the org name."""
+    f = BenignScannerFilter.from_yaml()
+    for asn, org in (
+        (396982, "Google LLC"),          # GCP tenant, as GeoIP actually labels it
+        (14061, "DigitalOcean, LLC"),
+        (8075, "Microsoft Corporation"),
+        (16509, "Amazon.com, Inc."),
+    ):
+        verdict = f.match(_event("45.9.1.2", asn=asn, org=org))
+        assert verdict is None, (
+            f"an attacker renting from {org} (AS{asn}) was dropped as "
+            f"'{verdict}'. Removing the ASN is not enough while the "
+            f"landlord's org string still matches."
+        )
+
+
+def test_googles_own_network_is_still_recognised_by_exact_asn():
+    f = BenignScannerFilter.from_yaml()
+    assert f.match(_event("8.8.8.8", asn=15169, org="Google LLC")) == "google"

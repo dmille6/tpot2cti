@@ -83,9 +83,7 @@ scanners:
     # whereas a rented VM running credential attacks is exactly what this
     # project exists to capture.
     asns: [15169]
-    org_keywords:
-      - "Google LLC"
-      - "GOOGLE"
+    org_keywords: []
     # Google's real crawlers publish forward-confirmable names.
     rdns_suffixes:
       - "googlebot.com"
