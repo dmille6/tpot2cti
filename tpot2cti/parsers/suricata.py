@@ -43,7 +43,15 @@ class SuricataParser(BaseParser):
         # Skip non-alert Suricata docs (flow, stats, dns metadata, etc.).
         # Per V1_SPEC §5.2 we only process alert documents in v1.0.
         alert = doc.get("alert")
-        if not isinstance(alert, dict):
+        # `not alert` rejects an EMPTY alert object as well as a missing one.
+        # That closes a real asymmetry with the read-side filter: Elasticsearch
+        # `exists` treats `alert: {}` as MISSING (an empty object indexes no
+        # value), so the query excludes it — while `isinstance({}, dict)` is
+        # True, so the parser would have accepted it and produced an event with
+        # an empty signature. An alert with no fields is not a detection, and
+        # the two sides must agree or the exclusion silently loses documents
+        # the pipeline would have used. See tests/test_suricata_alert_only_query.
+        if not isinstance(alert, dict) or not alert:
             return None
 
         src_ip = doc.get("src_ip")

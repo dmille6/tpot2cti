@@ -164,16 +164,27 @@ def test_attack_patterns_are_technique_bounded_not_per_event(cfg, state_db):
     )
 
 
-def test_unparsed_is_attributed_to_a_source_not_left_as_an_opaque_pile(
-        monkeypatch, tmp_path):
-    """`unparsed` runs ~172k/cycle and was a single bucket mixing Suricata
-    flow records with genuinely unknown types. A parser that silently breaks
-    because a honeypot changed its log format would be invisible inside it."""
-    from tpot2cti import main
-    import inspect
-    src = inspect.getsource(main.run_cycle)
-    assert "unparsed_by_source" in src
-    # keyed on type, and Suricata split by event_type — never on signature,
-    # which is unbounded cardinality
-    assert 'doc.get("type")' in src and "event_type" in src
-    assert "signature" not in src.split("unparsed_by_source")[1][:400]
+def test_query_exclusion_and_unparsed_breakdown_reach_state(cfg, state_db):
+    """Both reviewers flagged the previous version of this test: it asserted on
+    `inspect.getsource` text, verified nothing behavioural, and passed while the
+    persistence it claimed to check did not exist anywhere in the codebase. A
+    counter that documents a data EXCLUSION is the only evidence the exclusion
+    happened, so this reads the rows back."""
+    import json as _json
+    docs = [json.loads(l) for l in
+            (_FIXTURES / "cowrie.jsonl").read_text().splitlines() if l.strip()]
+    # one doc the parser cannot use, to populate the breakdown
+    docs.append({"type": "Suricata", "src_ip": "198.51.100.21",
+                 "event_type": "flow", "@timestamp": docs[0]["@timestamp"],
+                 "t-pot_hostname": "sensor01"})
+    summary, _ = _run(cfg, state_db, docs)
+
+    assert "unparsed_by_source" in summary
+    assert summary["unparsed_by_source"].get("Suricata:flow") == 1, \
+        "Suricata must be split by event_type, not lumped under one key"
+
+    persisted = state_db.get("last_cycle_unparsed_by_source")
+    assert persisted is not None, "breakdown documented as durable but never written"
+    assert _json.loads(persisted).get("Suricata:flow") == 1
+    assert state_db.get("last_cycle_query_excluded") is not None, \
+        "query_excluded documented as durable but never written"

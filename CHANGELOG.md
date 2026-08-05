@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Suricata read scope + drop attribution
+
+- CORE no longer fetches Suricata documents with no `alert` object. The parser
+  discards them unconditionally, so they were fetched, decoded and thrown away:
+  measured 1,816,522 of 3,399,134 documents/day, **53.4% of all read volume**.
+  Verified to cost nothing — 217,748 alert-bearing Suricata documents before
+  and after. Controlled by `TPOT2CTI_SURICATA_ALERT_ONLY` (default on); not
+  retroactive once the watermark advances.
+- The exclusion is **counted**, not assumed: two independent ES counts per
+  cycle attribute it causally, reported as `query_excluded` and persisted.
+- `unparsed` is attributed by sensor `type`, with Suricata split by
+  `event_type`. It was a single ~172k/cycle pile in which a silently broken
+  parser would have been invisible.
+- The Suricata parser now also rejects an EMPTY `alert` object, closing an
+  asymmetry with the read filter: ES `exists` treats `alert: {}` as missing
+  while `isinstance({}, dict)` is true, so the query would have excluded a
+  document the parser accepted. No live exposure; found by the guard test.
+
+
 ### Fixed
 
 - **H0neytr4p parser was reading the wrong ES field names, silently

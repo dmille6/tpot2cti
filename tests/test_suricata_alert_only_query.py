@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import pytest
 
 from tpot2cti.es_client import TpotESClient
+from tpot2cti.parsers import dispatch
 from tpot2cti.parsers.suricata import SuricataParser
 
 S = datetime(2026, 8, 5, tzinfo=timezone.utc)
@@ -67,6 +68,8 @@ def _doc(**kw):
     _doc(event_type="tls", tls={"ja3": {"hash": "abc"}}),
     _doc(event_type="fileinfo", fileinfo={"sha256": "a" * 64}),
     _doc(event_type="http", http={"url": "/x"}),
+    _doc(alert={}),                           # present but empty dict
+    _doc(alert=[]),                           # present but empty list
 ])
 def test_every_doc_the_query_would_exclude_is_one_the_parser_already_drops(doc):
     """THE load-bearing invariant. If the parser ever starts extracting value
@@ -74,10 +77,35 @@ def test_every_doc_the_query_would_exclude_is_one_the_parser_already_drops(doc):
     ZERO overlap with FATT's, so this is a live possibility — then the query
     filter must widen in the same change or that intelligence silently never
     arrives. This test fails the moment those diverge."""
-    assert SuricataParser().parse(doc) is None, (
-        "the parser now extracts something from a doc the ES query excludes — "
-        "widen or remove suricata_alert_only in this same change"
+    # Through dispatch(), NOT SuricataParser().parse(). The pipeline resolves
+    # the parser from the registry, so a second parser registered for
+    # "Suricata" would diverge from a directly-instantiated one while a test
+    # calling the class stayed green — the guard has to watch the path the
+    # data actually takes.
+    assert dispatch(doc) is None, (
+        "the pipeline now extracts something from a doc the ES query excludes "
+        "— widen or remove suricata_alert_only in this same change"
     )
+
+
+def test_the_guard_watches_the_registry_not_just_the_class():
+    """Demonstrates the hole the previous version had: swapping the registered
+    Suricata parser must break the guard. If it does not, the guard is
+    watching a class nobody calls."""
+    import tpot2cti.parsers as P
+
+    class _Greedy(SuricataParser):
+        def parse(self, doc):            # pretends to have learned tls/flow
+            return "something"
+
+    original = P.get_parser("Suricata")
+    P.register(_Greedy())
+    try:
+        assert dispatch(_doc(event_type="tls")) is not None, \
+            "registry swap did not take effect — this test proves nothing"
+    finally:
+        P.register(original)
+    assert dispatch(_doc(event_type="tls")) is None
 
 
 def test_a_malformed_alert_still_reaches_the_parser():
@@ -86,11 +114,11 @@ def test_a_malformed_alert_still_reaches_the_parser():
     must remain visible as parser `unparsed` rather than disappearing."""
     mn = _clauses(suricata_alert_only=True)[0]["bool"]
     assert mn["must_not"] == [{"exists": {"field": "alert"}}]
-    assert SuricataParser().parse(_doc(alert="not-a-dict")) is None
+    assert dispatch(_doc(alert="not-a-dict")) is None
 
 
 def test_a_real_alert_is_untouched_by_both():
     doc = _doc(alert={"signature": "ET SCAN Zmap User-Agent (Inbound)",
                       "signature_id": 1, "category": "x", "severity": 2},
                src_port=4444, dest_port=22, dest_ip="192.0.2.3", proto="TCP")
-    assert SuricataParser().parse(doc) is not None
+    assert dispatch(doc) is not None

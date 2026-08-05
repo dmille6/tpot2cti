@@ -59,6 +59,7 @@ from tpot2cti.net import wait_for_host
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
 from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.benign_filter import BenignScannerFilter, FilterStats
+from tpot2cti.env import truthy_env
 from tpot2cti.parsers import dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
@@ -414,8 +415,7 @@ def run_cycle(
     # V1 scope: Suricata docs with no `alert` object are provably never parsed
     # (see es_client._build_query). Excluding them at query time removes ~1.8M
     # docs/day — over half of everything read. Set to 0 to fetch them again.
-    suricata_alert_only = os.environ.get(
-        "TPOT2CTI_SURICATA_ALERT_ONLY", "1").strip().lower() not in ("0", "false", "no")
+    suricata_alert_only = truthy_env("TPOT2CTI_SURICATA_ALERT_ONLY", default=True)
 
     effective_ignore_types = list(cfg.cycle.ignore_types)
     try:
@@ -574,18 +574,49 @@ def run_cycle(
     # counted too: one extra count query establishes what the cycle WOULD have
     # read, and the difference is reported like any other drop reason.
     #   events_read + query_excluded == raw_count_after_ignore_types
-    query_excluded = 0
+    #   None  -> the filter is off, so there is nothing to account for
+    #   -1    -> the filter is ON but we could not measure it (the bad case)
+    query_excluded: Optional[int] = None
     if suricata_alert_only:
         try:
+            # Count BOTH shapes rather than inferring the difference from
+            # events_read. The index is written to continuously, so raw_total
+            # and events_read are snapshots of different moments and their
+            # difference conflates "excluded by the filter" with "arrived while
+            # we were streaming". Two counts taken back to back attribute the
+            # exclusion causally, and their agreement with events_read is
+            # itself a check on the stream.
             raw_total = es.count_events(
                 window_start, window_end,
                 index_pattern=cfg.es.index_pattern,
                 ignore_types=effective_ignore_types,
             )
-            query_excluded = max(0, raw_total - events_read)
+            filtered_total = es.count_events(
+                window_start, window_end,
+                index_pattern=cfg.es.index_pattern,
+                ignore_types=effective_ignore_types,
+                suricata_alert_only=True,
+            )
+            query_excluded = raw_total - filtered_total
+            if query_excluded < 0:
+                # Not clamped: a negative residual means the two counts
+                # disagree in a way the filter cannot explain, and hiding it
+                # behind max(0, ...) would turn a real anomaly into a plausible
+                # zero. Report it and let it look wrong.
+                logger.warning(
+                    "cycle %s: negative query_excluded (%d): raw=%d filtered=%d "
+                    "— counts disagree in a way the filter does not explain",
+                    cycle_id, query_excluded, raw_total, filtered_total)
+            drift = filtered_total - events_read
+            if abs(drift) > max(50, int(0.01 * max(filtered_total, 1))):
+                logger.warning(
+                    "cycle %s: stream read %d but the same filtered query counts "
+                    "%d (drift %+d) — expected only live-index churn",
+                    cycle_id, events_read, filtered_total, drift)
         except Exception as exc:
-            # Never let the bookkeeping query fail the cycle — but say so,
-            # because an uncounted exclusion is the thing being guarded against.
+            # Never fail the cycle on bookkeeping — but an uncounted exclusion
+            # is precisely what this accounting exists to prevent, so it is
+            # recorded as unknown rather than as zero.
             logger.warning("cycle %s: could not measure query-side exclusions: %s",
                            cycle_id, exc)
             query_excluded = -1
@@ -605,6 +636,14 @@ def run_cycle(
     # without an operator having to grep logs. Best-effort — never fatal.
     try:
         state.set("last_cycle_drops", json.dumps(drop_reasons))
+        # A query-side exclusion deletes documents before any counter sees
+        # them, so its count is the ONLY evidence it happened. Persisting it
+        # next to the drop reasons is what makes it auditable after the fact —
+        # documenting durability that does not exist is the failure this
+        # project keeps repeating.
+        state.set("last_cycle_query_excluded", json.dumps(query_excluded))
+        state.set("last_cycle_unparsed_by_source",
+                  json.dumps(dict(unparsed_by_source.most_common(30))))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug(f"cycle {cycle_id}: could not persist drop reasons: {e}")
 

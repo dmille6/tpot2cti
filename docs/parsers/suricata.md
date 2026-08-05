@@ -86,4 +86,12 @@ split further by `event_type` since it multiplexes many record kinds under one
 type. Never by signature, which is unbounded cardinality.
 
 Reported as `unparsed_by_source` in the cycle summary and persisted to
-`last_cycle_unparsed_by_source`.
+`last_cycle_unparsed_by_source`, alongside `last_cycle_query_excluded`.
+
+### What this immediately made visible
+
+The first thing the breakdown showed was a pre-existing silent loss that had
+been invisible inside the opaque `unparsed` pile: **91.1% of alert-bearing
+Suricata documents carry `src_ip: null`** — roughly 198,000 alerts/day from one
+sensor — and are dropped for want of a source address. That is not caused by
+this change; it is what this change lets you see. It is tracked separately.
