@@ -946,6 +946,12 @@ def run_cycle(
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),
+        # Output validation refusals. Surfaced, not merely counted: a
+        # validator that drops silently is indistinguishable from an
+        # extractor that never found anything, and a rejection rate moving
+        # from 3% to 60% must be visible without reading DEBUG logs.
+        "rejected_urls": builder.rejected_urls,
+        "rejected_domains": builder.rejected_domains,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),
@@ -992,7 +998,9 @@ def run_cycle(
         f"cycle {cycle_id}: complete in {duration_s:.2f}s — "
         f"events_read={events_read} sdos_emitted={len(all_objects)} "
         f"sdos_by_type={dict(sdos_by_type)} publish_ok={publish_ok} "
-        f"dedup={dedup_before}->{dedup_after} ({dedup_pct:.1f}%)"
+        f"dedup={dedup_before}->{dedup_after} ({dedup_pct:.1f}%) "
+        f"rejected_urls={builder.rejected_urls} "
+        f"rejected_domains={builder.rejected_domains}"
     )
     return summary
 
