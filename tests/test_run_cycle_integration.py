@@ -107,9 +107,13 @@ def test_one_cycle_produces_graph_and_advances_cursor(cfg, state_db):
     assert "indicator" in types
 
     # Drop-reason accounting: every read event is exactly one of parsed /
-    # unparsed / dispatch_error / self_or_internal / benign_scanner.
+    # unparsed / dispatch_error / src_ip_rejected / self_or_internal /
+    # benign_scanner.
     dr = summary["drop_reasons"]
-    assert set(dr) == {"unparsed", "dispatch_error", "self_or_internal", "benign_scanner"}
+    assert set(dr) == {
+        "unparsed", "dispatch_error", "src_ip_rejected",
+        "self_or_internal", "benign_scanner",
+    }
     accounted = summary["events_parsed"] + sum(dr.values())
     assert accounted == summary["events_read"], (
         f"events unaccounted for: read={summary['events_read']} "

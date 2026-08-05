@@ -5,6 +5,62 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **H0neytr4p parser was reading the wrong ES field names, silently
+  emitting zero URLs.** A field-presence census over 34k live docs/24h
+  found that the V1_SPEC §5.7 nested `request.*` shape has never existed
+  in this hive's data, and that two flat schemas ship concurrently. The
+  parser read only the legacy names, so on live traffic `method` and
+  `user_agent` were `None` for ~99.6% of events and `host_header` was
+  `None` for **100%** of them — neither schema ships `host_header`. URL
+  reconstruction needs host + URI, so `session.urls` was never
+  populated: **0 URLs and 0 domains across all 12,860 H0neytr4p rows**
+  in the live state DB, against 1,072/1,072 for Tanner. The URL
+  observable that V1_SPEC §5.7 promised had never once been emitted.
+  Reads are now modern-first with legacy and nested fallbacks; verified
+  on 333 real docs (host_header 297/333, 37 URLs reconstructed).
+
+- **h0neytr4p reports the attacker-controlled `X-Forwarded-For` header
+  as `src_ip`**, so Log4Shell scanners deposited obfuscated JNDI
+  payloads in the source-address field: `src_ip` is byte-identical to
+  `header_x-forwarded-for` in 33/33 documents carrying that header, and
+  nothing in the document preserves the real TCP peer. 30 such rows
+  reached `attacker_activity`. These now fail a central source-address
+  gate in `run_cycle`; events whose XFF is a *plausible* address are
+  flagged (`meta.src_ip_from_xff`) rather than dropped, since none has
+  been observed and dropping would discard real attribution.
+
+- **`state.upsert_attacker_activity` now rejects and canonicalizes its
+  key.** A non-address `src_ip` silently poisoned every consumer that
+  reads the table back as an address. `prune_malformed_attacker_activity`
+  (wired into the per-cycle `prune_all`) removes rows written before the
+  gate existed.
+
+### Added
+
+- **`drop_reasons.src_ip_rejected`** — rejected/unparseable source
+  addresses are now counted and surfaced in `/health`'s
+  `last_cycle_drops`, matching what the noisefloor enricher does with its
+  `malformed` counter. Previously `canonical_ip()` returned `None`, the
+  builders skipped the session, and the loss was invisible: the exact
+  silent-zero-work shape this project keeps re-learning.
+
+- **`tpot2cti/log4shell.py` + unattributed payload salvage.** A
+  Log4Shell probe's JNDI endpoint is live attacker infrastructure and is
+  worth more than the spoofable address it arrived in, but it was being
+  discarded entirely (the `${jndi:` hint regex greps for a literal string
+  that obfuscated payloads never match, and nothing scanned headers or
+  `src_ip`). The new module resolves the `${x:y:-c}` per-character
+  obfuscation — all 30 live payloads decode — and
+  `STIXBuilder.build_unattributed_payload_objects` emits a
+  sensor-anchored graph for them: URL, Domain-Name, `CVE-2021-44228`,
+  `T1190`, a Sighting and an explanatory Note. It deliberately emits **no**
+  IPv4-Addr and **no** Indicator — asserting a source we do not have
+  would be fabricated attribution. Grouped by C2 host rather than URL,
+  because the observed scanner encodes the probed header into the
+  callback's leading label and so yields ~12 URLs per zone.
+
 ### Security
 
 - **Removed real infrastructure identifiers from the public repository.**
