@@ -11,8 +11,9 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
@@ -244,6 +245,122 @@ def _session_is_recon_only(commands) -> bool:
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
+
+#: The IANA root zone, shipped in-repo. The regex above ends in `[a-z]{2,63}`,
+#: so ANY alphabetic trailing label passes as a TLD — which is how
+#: `azenv.nethttp` (protocol residue concatenated onto a real domain),
+#: `huangxcdh.html` (a filename) and `718.xuelian.lpost` became Domain-Name
+#: observables in a threat-intelligence graph. Shape is not existence.
+_TLD_FILE = Path(__file__).resolve().parent.parent / "data" / "iana_tlds.txt"
+
+
+def _load_tlds() -> frozenset[str]:
+    """Load the shipped TLD list. Missing file is FATAL, not a silent bypass.
+
+    A validator that quietly stops validating when its data is absent is worse
+    than no validator: it reports the same clean result either way.
+    """
+    try:
+        text = _TLD_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"IANA TLD list missing at {_TLD_FILE}: {exc}. Refusing to run with "
+            f"domain validation silently disabled."
+        ) from exc
+    tlds = frozenset(
+        line.strip().lower() for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    if len(tlds) < 1000:
+        raise RuntimeError(
+            f"IANA TLD list at {_TLD_FILE} parsed to only {len(tlds)} entries; "
+            f"expected >1000. Refusing to run with a truncated allowlist."
+        )
+    return tlds
+
+
+#: RFC 2606 / RFC 6761 reserved names. Valid TLDs by standard, deliberately
+#: absent from IANA's delegated root because they are permanently reserved for
+#: documentation and testing. Accepted so the project's own fixtures and
+#: sanitised corpora — which are required to use them — keep working. They are
+#: non-resolvable by definition, so accepting them costs nothing in production;
+#: rejecting them would break the convention every sanitised fixture relies on.
+_RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost"})
+
+IANA_TLDS = _load_tlds() | _RESERVED_TLDS
+
+#: Schemes a URL observable may carry. Measured against the live corpus:
+#: https 6,879, http 1,720, ftp 1 — and 2,468 values with no scheme at all,
+#: which are bare request paths ("/admin.php") naming no host, which no
+#: consumer can block, hunt or attribute.
+#:
+#: The JNDI providers are here deliberately. A Log4Shell payload's whole value
+#: is the C2 endpoint it points at (`ldap://c2.example/Exploit`), recovered by
+#: tpot2cti/log4shell.py from deliberately obfuscated input — that is among the
+#: highest-quality intelligence this pipeline produces, and an http-only
+#: allowlist would have silently discarded all of it.
+_JNDI_SCHEMES = frozenset({
+    "ldap", "ldaps", "rmi", "dns", "iiop", "nis", "corba", "nds",
+})
+_URL_SCHEMES = frozenset({"http", "https", "ftp"}) | _JNDI_SCHEMES
+
+
+def valid_domain(value: str) -> Optional[str]:
+    """Return the canonical FQDN, or None if it is not a real domain name.
+
+    Shape AND existence: the label after the final dot must be a TLD that
+    actually exists in the IANA root zone.
+    """
+    if not value:
+        return None
+    fqdn = str(value).strip().lower().rstrip(".")
+    if not fqdn or _IPV4_RE.match(fqdn) or not _DOMAIN_RE.match(fqdn):
+        return None
+    if fqdn.rsplit(".", 1)[-1] not in IANA_TLDS:
+        return None
+    return fqdn
+
+
+def valid_url(value: str) -> Optional[str]:
+    """Return the URL unchanged if it is an absolute, host-bearing URL.
+
+    `build_url` previously accepted anything non-empty, which is how 2,468 bare
+    request paths and at least one User-Agent string became URL observables. A
+    URL that names no host is not an indicator — nobody can block it, hunt it,
+    or attribute it.
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw or any(c.isspace() for c in raw) or any(ord(c) < 32 for c in raw):
+        return None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in _URL_SCHEMES or not parts.netloc:
+        return None
+
+    if scheme in _JNDI_SCHEMES:
+        # A JNDI URL is EVIDENCE, not an IoC, and its host is frequently not a
+        # resolvable name on purpose: exfil payloads embed an unresolved Log4j
+        # template inside the hostname
+        # (`ldap://x-${sys:java.version}.<c2-domain>/`) so the victim leaks its
+        # Java version over DNS. Demanding a valid host here would discard the
+        # payload verbatim — the only record of what was actually attempted.
+        # The resolvable C2 zone is extracted separately by log4shell.py and
+        # published as the Domain-Name observable, which IS the IoC.
+        return raw
+
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return None
+    # For ordinary URLs the host must clear the same bar as a standalone
+    # Domain-Name observable, or be an IP literal.
+    if valid_domain(host) is None and canonical_ip(host) is None:
+        return None
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +676,13 @@ class STIXBuilder:
         self.config = config
         self.sensor_dicts = sensor_dicts or []
         self._now_iso = datetime.now(timezone.utc).isoformat()
+
+        #: Values refused by validation this bundle. Counted, not silent: a
+        #: validator that quietly drops things is indistinguishable from an
+        #: extractor that never found any, and this codebase has shipped that
+        #: confusion more than once.
+        self.rejected_urls = 0
+        self.rejected_domains = 0
 
         # Stable IDs for the operator + TLP marking — referenced everywhere
         self.operator_identity_id = generate_identity_id(
@@ -1038,7 +1162,13 @@ class STIXBuilder:
         *,
         session: Optional[AttackSession] = None,
     ) -> Optional[dict]:
-        if not url:
+        url = valid_url(url)
+        if url is None:
+            # Was `if not url: return None` — no validation whatsoever, which
+            # is how 2,468 bare request paths ("/admin.php") and a User-Agent
+            # string became URL observables. A URL naming no host cannot be
+            # blocked, hunted or attributed by any consumer.
+            self.rejected_urls += 1
             return None
         obj = {
             "type": "url",
@@ -1068,12 +1198,15 @@ class STIXBuilder:
     ) -> Optional[dict]:
         if not fqdn:
             return None
-        fqdn_lc = fqdn.strip().lower().rstrip(".")
         # Reject malformed values (IP literals, ports, paths, bare labels)
         # before OpenCTI bounces them as "Observable is not correctly
         # formatted" — which also dangles any resolves-to edge to them.
-        if not fqdn_lc or _IPV4_RE.match(fqdn_lc) or not _DOMAIN_RE.match(fqdn_lc):
+        # valid_domain additionally requires a REAL TLD: shape alone let
+        # `huangxcdh.html` and `azenv.nethttp` through for months.
+        fqdn_lc = valid_domain(fqdn)
+        if fqdn_lc is None:
             logger.debug(f"build_domain: skipping malformed domain {fqdn!r}")
+            self.rejected_domains += 1
             return None
         obj = {
             "type": "domain-name",
