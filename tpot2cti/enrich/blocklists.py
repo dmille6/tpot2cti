@@ -40,8 +40,6 @@ import os
 import signal
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -53,6 +51,8 @@ from tpot2cti.enrich.sources import (
 )
 from tpot2cti.enrich.sweep import ActivityReadError, SweepCursor, read_activity
 from tpot2cti.health import HealthServer, parse_iso_duration_seconds
+from tpot2cti.httpfetch import Outcome
+from tpot2cti.httpfetch import fetch as http_fetch
 from tpot2cti.log import restore_logging, setup_logging
 from tpot2cti.publisher import Publisher
 from tpot2cti.state import CycleState
@@ -85,8 +85,6 @@ MAX_LIST_AGE_HOURS = max(1, int(os.environ.get("ENRICH_BLOCKLIST_MAX_AGE_HOURS",
 
 FETCH_TIMEOUT = max(5, int(os.environ.get("ENRICH_BLOCKLIST_FETCH_TIMEOUT", "60")))
 
-_USER_AGENT = "tpot2cti/2.0 (+https://github.com/dmille6/tpot2cti)"
-
 
 class ListTooStaleError(RuntimeError):
     """Every configured source is older than `MAX_LIST_AGE_HOURS`.
@@ -110,16 +108,15 @@ def fetch_source(src: Source, *, timeout: int = FETCH_TIMEOUT) -> tuple:
     page or an error body parses to *zero* networks perfectly happily, and the
     module would then quietly un-label the internet.
     """
-    req = urllib.request.Request(src.url, headers={"User-Agent": _USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise SourceParseError(f"{src.key}: HTTP {resp.status}")
-            body = resp.read().decode("utf-8", errors="replace")
-    except SourceParseError:
-        raise
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise SourceParseError(f"{src.key}: fetch failed: {exc}") from exc
+    # One fetch path for the whole project, so "we were refused" can never be
+    # mistaken for "the source said nothing" — see tpot2cti/httpfetch.py.
+    result = http_fetch(src.url, timeout=timeout)
+    if result.outcome is not Outcome.OK:
+        raise SourceParseError(
+            f"{src.key}: {result.outcome.value}"
+            f"{f' (HTTP {result.status})' if result.status else ''}"
+            f"{f': {result.detail}' if result.detail else ''}")
+    body = (result.body or b"").decode("utf-8", errors="replace")
 
     try:
         cidrs, extra = src.parse(body)

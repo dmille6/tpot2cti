@@ -10,7 +10,13 @@ import pytest
 
 from tpot2cti.enrich import blocklists as bl
 from tpot2cti.enrich import sources as src
+from tpot2cti.httpfetch import FetchResult, Outcome
 from tpot2cti.stix_ids import attacker_ip_observable_id
+
+
+def _fr(status, body):
+    return FetchResult(Outcome.OK if status == 200 else Outcome.UNAVAILABLE,
+                       status, body)
 
 
 # ── CIDR matching ────────────────────────────────────────────────────────
@@ -95,13 +101,20 @@ def test_a_short_parse_is_refused_rather_than_un_labelling_the_world(monkeypatch
     """These feeds are plain text over HTTP: a captive portal or rate-limit
     page parses to zero networks perfectly happily. Accepting that would make
     a broken fetch look like a clean internet."""
-    class _Resp:
-        status = 200
-        def read(self): return b"<html>429 Too Many Requests</html>"
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    monkeypatch.setattr(bl.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(bl, "http_fetch",
+                        lambda url, timeout=None: _fr(200, b"<html>429 Too Many Requests</html>"))
     with pytest.raises(src.SourceParseError, match="below the floor"):
+        bl.fetch_source(src.SOURCES_BY_KEY["firehol"])
+
+
+def test_a_refusal_is_not_reported_as_an_empty_list(monkeypatch):
+    """The distinction the shared fetch helper exists for: a 403 must surface
+    as a refusal, never as "the source returned nothing". Shodan's InternetDB
+    really does 403 Python's default User-Agent."""
+    from tpot2cti.httpfetch import FetchResult, Outcome
+    monkeypatch.setattr(bl, "http_fetch",
+                        lambda url, timeout=None: FetchResult(Outcome.REFUSED, 403))
+    with pytest.raises(src.SourceParseError, match="refused"):
         bl.fetch_source(src.SOURCES_BY_KEY["firehol"])
 
 
@@ -380,12 +393,7 @@ def test_a_parser_raising_something_unexpected_stays_isolated(monkeypatch, state
     boom = src.Source(key="feodo", url="http://x", label="l",
                       parse=lambda body: (_ for _ in ()).throw(TypeError("renamed field")),
                       meaning="m", min_entries=0)
-    class _Resp:
-        status = 200
-        def read(self): return b"[]"
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    monkeypatch.setattr(bl.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(bl, "http_fetch", lambda url, timeout=None: _fr(200, b"[]"))
     with pytest.raises(src.SourceParseError, match="TypeError"):
         bl.fetch_source(boom)
 
