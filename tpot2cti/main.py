@@ -46,7 +46,7 @@ import threading
 import time
 import ipaddress
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -411,6 +411,12 @@ def run_cycle(
     # wasteful. Skip them unless the cycle index is a multiple of
     # cfg.cycle.fatt_cycle_multiplier. With default multiplier=4 and
     # base interval PT15M, FATT is processed every ~60 min.
+    # V1 scope: Suricata docs with no `alert` object are provably never parsed
+    # (see es_client._build_query). Excluding them at query time removes ~1.8M
+    # docs/day — over half of everything read. Set to 0 to fetch them again.
+    suricata_alert_only = os.environ.get(
+        "TPOT2CTI_SURICATA_ALERT_ONLY", "1").strip().lower() not in ("0", "false", "no")
+
     effective_ignore_types = list(cfg.cycle.ignore_types)
     try:
         cycle_n = int(cycle_id)
@@ -434,6 +440,12 @@ def run_cycle(
     # at a glance (surfaced in the cycle summary + /health). A single opaque
     # "dropped" bucket is how silent-loss regressions hide.
     events_dropped_unparsed = 0    # parser returned None (unknown type / below parse floor)
+    # WHICH sensor those unparsed docs came from. Without this the bucket is a
+    # single opaque pile (~172k/cycle) and a parser that silently breaks —
+    # because a honeypot changed its log format — is indistinguishable from
+    # normal noise. Keyed on `type` (~21 values) and, for Suricata only, its
+    # `event_type` sub-family; never on signature, which is unbounded.
+    unparsed_by_source: Counter = Counter()
     events_dropped_dispatch = 0    # parser raised an exception on the doc
     events_dropped_bad_src_ip = 0  # src_ip is not a parseable IP address
     events_self_filtered = 0  # src_ip is our own honeypot / RFC1918 / reserved
@@ -451,6 +463,7 @@ def run_cycle(
             index_pattern=cfg.es.index_pattern,
             batch_size=cfg.cycle.batch_size,
             ignore_types=effective_ignore_types,
+            suricata_alert_only=suricata_alert_only,
         ):
             events_read += 1
             try:
@@ -461,6 +474,12 @@ def run_cycle(
                 continue
             if event is None:
                 events_dropped_unparsed += 1
+                src = str(doc.get("type") or "<no-type>")
+                if src == "Suricata":
+                    # Suricata multiplexes many record kinds under one type;
+                    # "Suricata" alone would say nothing useful.
+                    src = f"Suricata:{doc.get('event_type') or '<none>'}"
+                unparsed_by_source[src] += 1
                 continue
             # Source-address gate: everything downstream — the observable,
             # the Indicator, the Sighting, attacker_activity, campaign
@@ -550,6 +569,27 @@ def run_cycle(
 
     # Consolidated drop breakdown — every event read is accounted for as
     # exactly one of: parsed, unparsed, dispatch-error, self/internal, benign.
+    # A query-side exclusion removes documents BEFORE anything can count them,
+    # which is the exact shape of this project's defining failure. So it gets
+    # counted too: one extra count query establishes what the cycle WOULD have
+    # read, and the difference is reported like any other drop reason.
+    #   events_read + query_excluded == raw_count_after_ignore_types
+    query_excluded = 0
+    if suricata_alert_only:
+        try:
+            raw_total = es.count_events(
+                window_start, window_end,
+                index_pattern=cfg.es.index_pattern,
+                ignore_types=effective_ignore_types,
+            )
+            query_excluded = max(0, raw_total - events_read)
+        except Exception as exc:
+            # Never let the bookkeeping query fail the cycle — but say so,
+            # because an uncounted exclusion is the thing being guarded against.
+            logger.warning("cycle %s: could not measure query-side exclusions: %s",
+                           cycle_id, exc)
+            query_excluded = -1
+
     drop_reasons = {
         "unparsed": events_dropped_unparsed,
         "dispatch_error": events_dropped_dispatch,
@@ -571,6 +611,8 @@ def run_cycle(
     logger.info(
         f"cycle {cycle_id}: events_read={events_read} events_parsed={events_parsed} "
         f"events_dropped={events_dropped} drops={drop_reasons} "
+        f"query_excluded={query_excluded} "
+        f"unparsed_by_source={dict(unparsed_by_source.most_common(8))} "
         f"benign_by_vendor={dict(benign_stats.by_vendor)} "
         f"types={sorted(parsed_by_type.keys())}"
     )
@@ -839,6 +881,8 @@ def run_cycle(
         "events_parsed": events_parsed,
         "events_dropped": events_dropped,
         "drop_reasons": drop_reasons,
+        "query_excluded": query_excluded,
+        "unparsed_by_source": dict(unparsed_by_source),
         "sessions_by_type": sessions_by_type,
         "sdos_emitted": len(all_objects),
         "sdos_by_type": dict(sdos_by_type),

@@ -162,3 +162,18 @@ def test_attack_patterns_are_technique_bounded_not_per_event(cfg, state_db):
         f"attack-patterns ({aps}) scaling with events/IPs ({ipv4}) — the "
         f"2026-07-19 per-session re-emission bug has regressed"
     )
+
+
+def test_unparsed_is_attributed_to_a_source_not_left_as_an_opaque_pile(
+        monkeypatch, tmp_path):
+    """`unparsed` runs ~172k/cycle and was a single bucket mixing Suricata
+    flow records with genuinely unknown types. A parser that silently breaks
+    because a honeypot changed its log format would be invisible inside it."""
+    from tpot2cti import main
+    import inspect
+    src = inspect.getsource(main.run_cycle)
+    assert "unparsed_by_source" in src
+    # keyed on type, and Suricata split by event_type — never on signature,
+    # which is unbounded cardinality
+    assert 'doc.get("type")' in src and "event_type" in src
+    assert "signature" not in src.split("unparsed_by_source")[1][:400]
