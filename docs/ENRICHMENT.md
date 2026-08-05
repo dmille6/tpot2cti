@@ -303,7 +303,6 @@ produced graph objects.
 
 | source | becomes |
 |---|---|
-| InternetDB `hostnames[]` | Domain-Name SCO + `resolves-to` |
 | InternetDB `vulns[]` | Vulnerability SDO + `has` |
 | Feodo C2 hit | Malware SDO + edge |
 | MalwareBazaar **exact hash** | Malware SDO + `indicator --indicates--> malware` |
@@ -312,6 +311,20 @@ produced graph objects.
 
 - MalwareBazaar **TLSH fuzzy match** — fuzzy attribution is precisely what got
   the predecessor's abuse.ch key banned. Exact hash promotes; fuzzy labels.
+- **InternetDB `hostnames[]`** — moved here from the promote table
+  (2026-08-05). A PTR name is a *third-party assertion about naming*, not a
+  first-party observation, and a `Domain-Name` SCO in this graph implies the
+  name is attacker infrastructure. Three reasons, in
+  [`EVIDENCE.md`](EVIDENCE.md) §6: it fabricates a DNS record we never
+  observed (the `dst_ip or src_ip` shape that scored Canonical); attacker-IP
+  rDNS is mostly mass-hosting boilerplate, so promoting it invites a consumer
+  to block a cloud provider's PTR range; and **PTR records are set by whoever
+  owns the netblock**, so for attacker-owned ranges the attacker chooses which
+  name we would publish as their infrastructure. The same fuzzy-attribution
+  rule that demotes TLSH applies here, and more strongly.
+  **Note: rDNS used for *suppression* is unaffected** — `tpot2cti/rdns.py`
+  forward-confirms PTR names to identify rented scanner infrastructure, where
+  a wrong answer publishes less rather than asserting more.
 - Tor / anonymiser context, broad-list membership.
 
 **Hard rules:**
