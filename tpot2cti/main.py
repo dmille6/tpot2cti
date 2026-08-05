@@ -905,9 +905,15 @@ def run_cycle(
         publish_result = publisher.publish(
             all_objects, cycle_id=str(cycle_id)
         )
-        # PublishResult shape (Phase 5): may have .ok / .errors / etc.
-        publish_ok = bool(getattr(publish_result, "ok", True))
+        # Success is the ABSENCE OF ERRORS. PublishResult has no `ok` field —
+        # it never has — so the previous `getattr(publish_result, "ok", True)`
+        # evaluated to True on every single publish, including total failures.
+        # Every failed publish therefore reported success and advanced
+        # `last_run` past data that never landed: silent loss, the same shape
+        # as the 16.5-day outage. ingest/malware.py fixed this exact pattern;
+        # CORE had not.
         publish_errors = list(getattr(publish_result, "errors", []) or [])
+        publish_ok = not publish_errors
         logger.info(
             f"cycle {cycle_id}: publish result: {publish_result!r}"
         )
