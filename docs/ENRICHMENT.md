@@ -187,6 +187,12 @@ Rules:
   malware). Never from a low fan-out count alone: sensor volumes are heavily
   skewed, so "hit one surface" can just mean "hit the loudest one."
 - Ambiguous middle cases stay **unlabelled**. Silence is a valid answer.
+- **Benign research scanners must be excluded before labelling, not after.**
+  They rent infrastructure, so ASN/org allowlists cannot see them — measured
+  2026-08-05, 17 addresses reached `targeted:substantive` including
+  Shadowserver, BinaryEdge and Stretchoid. Identification is by
+  forward-confirmed reverse DNS (`tpot2cti/rdns.py`); a bare PTR match would be
+  an allowlist any attacker could opt into by editing their own DNS.
 - Read roll-ups from `state.db` (`attacker_activity`), **not** raw ES. The
   predecessor's equivalent burned ~3.65M redundant document reads per hour.
 - Labels must be **revocable**, *or* provably non-contradictory. The

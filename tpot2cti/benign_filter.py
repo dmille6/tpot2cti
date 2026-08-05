@@ -32,6 +32,7 @@ from typing import Iterable, Optional
 import yaml
 
 from tpot2cti.parsers.base import ParsedEvent
+from tpot2cti.rdns import suffix_matches
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ class ScannerRule:
     vendor: str                       # e.g. "google", "censys"
     asns: frozenset[int]              # ASNs that identify this scanner
     org_keywords: tuple[str, ...]     # lowercase keyword substrings
+    #: Forward-confirmed reverse-DNS suffixes. Needed because scanners rent
+    #: infrastructure: Shadowserver appears as Hurricane Electric, BinaryEdge
+    #: as DigitalOcean, Stretchoid as Microsoft — so ASN and org can never
+    #: match them. See tpot2cti/rdns.py for why the confirmation is mandatory.
+    rdns_suffixes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -94,8 +100,13 @@ ENV_YAML_PATH = "TPOT2CTI_BENIGN_SCANNERS_YAML"
 class BenignScannerFilter:
     """Stateless allowlist matcher; safe to call from the cycle loop."""
 
-    def __init__(self, rules: list[ScannerRule]):
+    def __init__(self, rules: list[ScannerRule], resolver=None):
         self._rules = rules
+        # Reverse-DNS path. Optional: with no resolver the filter behaves
+        # exactly as before, matching on ASN/org only.
+        self._resolver = resolver
+        self._rdns_rules = [r for r in rules if r.rdns_suffixes]
+        self.rdns_skipped_budget = 0
         # Precompute an ASN → vendor lookup for the fast path.
         self._asn_to_vendor: dict[int, str] = {}
         for r in rules:
@@ -110,7 +121,8 @@ class BenignScannerFilter:
                 self._asn_to_vendor[asn] = r.vendor
 
     @classmethod
-    def from_yaml(cls, path: Optional[Path | str] = None) -> "BenignScannerFilter":
+    def from_yaml(cls, path: Optional[Path | str] = None,
+                  resolver=None) -> "BenignScannerFilter":
         """Load rules from yaml. Returns an empty filter if file missing."""
         # Resolution order: explicit arg > env var > shipped default.
         if path is None:
@@ -127,7 +139,7 @@ class BenignScannerFilter:
                 f"benign_scanners.yaml not found at {path}; filter disabled "
                 f"(every event treated as potentially-malicious)"
             )
-            return cls([])
+            return cls([], resolver=resolver)
 
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -137,7 +149,7 @@ class BenignScannerFilter:
                 f"failed to parse benign_scanners.yaml at {path}: {e}; "
                 f"filter disabled"
             )
-            return cls([])
+            return cls([], resolver=resolver)
 
         rules: list[ScannerRule] = []
         for vendor, body in (doc.get("scanners") or {}).items():
@@ -145,16 +157,21 @@ class BenignScannerFilter:
             org_keywords = tuple(
                 str(kw).lower() for kw in (body.get("org_keywords") or [])
             )
+            rdns_suffixes = tuple(
+                str(s).lower().rstrip(".").lstrip(".")
+                for s in (body.get("rdns_suffixes") or [])
+            )
             rules.append(ScannerRule(
                 vendor=str(vendor),
                 asns=asns,
                 org_keywords=org_keywords,
+                rdns_suffixes=rdns_suffixes,
             ))
         logger.info(
             f"benign-scanner filter loaded {len(rules)} vendor rule(s) "
             f"from {path}: {sorted(r.vendor for r in rules)}"
         )
-        return cls(rules)
+        return cls(rules, resolver=resolver)
 
     def match(self, event: ParsedEvent) -> Optional[str]:
         """Return the vendor name if the event is from a benign scanner, else None.
@@ -175,6 +192,22 @@ class BenignScannerFilter:
         for rule in self._rules:
             for kw in rule.org_keywords:
                 if kw in org:
+                    return rule.vendor
+
+        # Slowest path: forward-confirmed reverse DNS. Only reached when ASN
+        # and org both failed, which is the case for every scanner running on
+        # rented infrastructure — i.e. the ones the other two paths cannot see.
+        return self._match_rdns(event)
+
+    def _match_rdns(self, event: ParsedEvent) -> Optional[str]:
+        if self._resolver is None or not self._rdns_rules:
+            return None
+        name = self._resolver.name_for(event.src_ip)
+        if not name:
+            return None
+        for rule in self._rdns_rules:
+            for suffix in rule.rdns_suffixes:
+                if suffix_matches(name, suffix):
                     return rule.vendor
         return None
 
