@@ -185,8 +185,15 @@ Rules:
 - Ambiguous middle cases stay **unlabelled**. Silence is a valid answer.
 - Read roll-ups from `state.db` (`attacker_activity`), **not** raw ES. The
   predecessor's equivalent burned ~3.65M redundant document reads per hour.
-- Labels must be **revocable**. The predecessor accreted contradictory
-  `noise:*` and `targeted:*` on the same IP forever.
+- Labels must be **revocable**, *or* provably non-contradictory. The
+  predecessor's failure was not accretion as such — it was accreting `noise:*`
+  and `targeted:*` as **mutually exclusive verdicts** while never removing
+  either, so an IP ended up asserting two incompatible states. A module may
+  instead define its labels as **orthogonal observations** that can all be
+  true at once (an address really did fan out, and really did execute
+  commands). Those need no revocation because they never conflict. What is
+  forbidden is shipping mutually exclusive labels with no way to retract one.
+  `enrich/noisefloor` takes the orthogonal route; see its module docstring.
 
 ---
 

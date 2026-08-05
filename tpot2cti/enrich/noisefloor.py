@@ -75,6 +75,9 @@ WINDOW_HOURS = int(os.environ.get("ENRICH_NOISEFLOOR_ACTIVE_WITHIN_HOURS", "168"
 MAX_PER_CYCLE = int(os.environ.get("ENRICH_NOISEFLOOR_MAX_PER_CYCLE", "2000"))
 
 STATE_DB_ENV = "ENRICH_NOISEFLOOR_STATE_DB"
+#: Resume point for the src_ip sweep. Reset to "" when a short page proves the
+#: end of the window was reached, so the next cycle starts a fresh pass.
+SWEEP_CURSOR_KEY = "nf_sweep_cursor"
 
 #: This module owns these label prefixes and writes no others
 #: (docs/ENRICHMENT.md §8).
@@ -95,6 +98,7 @@ def read_activity(
     *,
     window_hours: int = WINDOW_HOURS,
     limit: int = MAX_PER_CYCLE,
+    after_ip: str = "",
 ) -> list[dict]:
     """Aggregate CORE's `attacker_activity` telemetry per source IP.
 
@@ -109,6 +113,14 @@ def read_activity(
     as "how recently must this IP have been active for us to look at it",
     never as "activity in the last N hours".
 
+    **Coverage is a sweep, not a top-N.** Rows are ordered by `src_ip` and
+    resumed from `after_ip`, so successive cycles walk the whole in-window set
+    and every address is reached within one sweep. Ordering by recency instead
+    would hand back the same most-recent `limit` addresses every cycle; the
+    skip-cache filters *after* the SQL `LIMIT`, so the older majority of the
+    window — measured at ~12,700 of ~14,800 addresses — would never be read at
+    all. That is the starvation this cursor exists to prevent.
+
     Raises `ActivityReadError` on any DB or schema problem — see that class.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
@@ -122,9 +134,9 @@ def read_activity(
                SUM(malware_drop_count)         AS malware_drops,
                GROUP_CONCAT(sample_dst_ports_json) AS ports_json
           FROM attacker_activity
-         WHERE last_seen >= ?
+         WHERE last_seen >= ? AND src_ip > ?
          GROUP BY src_ip
-         ORDER BY MAX(last_seen) DESC
+         ORDER BY src_ip ASC
          LIMIT ?
     """
     uri = f"file:{core_db}?mode=ro"
@@ -137,7 +149,7 @@ def read_activity(
         raise ActivityReadError(f"cannot open CORE state DB {core_db}: {exc}") from exc
     try:
         conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute(sql, (since, limit))]
+        return [dict(r) for r in conn.execute(sql, (since, after_ip, limit))]
     except sqlite3.Error as exc:
         raise ActivityReadError(f"activity query failed: {exc}") from exc
     finally:
@@ -220,8 +232,12 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     started = time.monotonic()
     state.heartbeat()
 
+    cursor = state.get(SWEEP_CURSOR_KEY) or ""
     try:
-        rows = read_activity(core_db)
+        # limit passed explicitly: the default arg binds at import time, so
+        # reading the module global here is what makes the page size actually
+        # configurable (and testable) rather than frozen at first import.
+        rows = read_activity(core_db, after_ip=cursor, limit=MAX_PER_CYCLE)
     except ActivityReadError as exc:
         # Fail the cycle loudly: /health goes unhealthy rather than reporting a
         # successful zero-work run.
@@ -280,11 +296,20 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
     else:
         logger.info("noisefloor cycle %s: nothing to label", cycle_id)
 
+    swept = False
     if publish_ok:
         # Mark only on confirmed publish — a cache that records work which
         # never landed is the failure this project keeps re-learning.
         for k, v in pending_marks:
             state.set(k, v)
+        # Advance the sweep only after the page landed, so a failed publish
+        # retries the same addresses instead of skipping past them. A short
+        # page means the window is exhausted: restart the pass.
+        if len(rows) < MAX_PER_CYCLE:
+            state.set(SWEEP_CURSOR_KEY, "")
+            swept = True
+        elif rows:
+            state.set(SWEEP_CURSOR_KEY, str(rows[-1]["src_ip"]))
 
     duration = time.monotonic() - started
     logger.info(
@@ -303,7 +328,7 @@ def run_cycle(cfg, state: CycleState, core_db: str, builder_factory,
         "cycle_id": cycle_id, "ips": len(rows),
         "fleet_scan": counts[LABEL_NOISE], "substantive": counts[LABEL_SUBSTANTIVE],
         "unlabelled": counts["unlabelled"], "already": already,
-        "publish_ok": publish_ok,
+        "publish_ok": publish_ok, "sweep_complete": swept,
         "duration_seconds": round(duration, 3),
     }
 
@@ -343,7 +368,6 @@ def main() -> int:  # pragma: no cover - process entrypoint
     from tpot2cti.main import _connect_opencti
     opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
     restore_logging()
-    health._opencti = opencti
     publisher = Publisher(opencti, state=state,
                           indexing_delay_seconds=cfg.cycle.indexing_delay_seconds)
 

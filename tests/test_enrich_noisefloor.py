@@ -213,7 +213,36 @@ def test_module_uses_its_own_state_db_and_patient_connect():
     assert "HealthServer" in src
 
 
-def test_already_classified_ips_are_skipped_so_the_tail_is_reached(cfg, state_db, tmp_path):
+def test_the_sweep_reaches_every_ip_not_just_the_most_recent_page(cfg, state_db, tmp_path):
+    """The skip-cache filters AFTER the SQL LIMIT, so a recency-ordered top-N
+    read hands back the same page forever and the older majority of the window
+    is never read at all. Measured on live data: ~12,700 of ~14,800 addresses
+    would have been unreachable. The cursor makes coverage a sweep."""
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    now = datetime.now(timezone.utc).isoformat()
+    db = str(tmp_path / "core.db")
+    # 25 distinct scanners, each fanning out across 3 services
+    _seed_core_db(db, [(f"45.9.{i}.1", p, "s1", 1, 1, 0, 0, 0, 0, now, now, None)
+                       for i in range(25) for p in ("Cowrie", "Dionaea", "ConPot")])
+    monkey = 10
+    seen, cycles = 0, 0
+    orig = nf.MAX_PER_CYCLE
+    nf.MAX_PER_CYCLE = monkey
+    try:
+        while cycles < 10:
+            s = nf.run_cycle(cfg, state_db, db, lambda: STIXBuilder(cfg), _Pub())
+            seen += s["fleet_scan"]
+            cycles += 1
+            if s["sweep_complete"] and seen >= 25:
+                break
+        assert seen == 25, f"only {seen}/25 addresses ever reached"
+        assert cycles >= 3, "expected a multi-page sweep with a 10-row page"
+    finally:
+        nf.MAX_PER_CYCLE = orig
+
+
+def test_already_classified_ips_are_skipped_so_work_is_not_repeated(cfg, state_db, tmp_path):
     """With a per-cycle cap, re-labelling the busiest IPs forever would starve
     the long tail (tens of thousands of addresses). A recorded classification
     is skipped on later cycles."""
