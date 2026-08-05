@@ -12,6 +12,15 @@
 #   3. the address's FORWARD-CONFIRMED reverse-DNS name ends in one of
 #      `rdns_suffixes` → drop
 #
+# NEVER allowlist a cloud or transit provider's ASN. An ASN identifies the
+# LANDLORD, not the tenant, and the same fact cuts both ways:
+#   - Shadowserver rents Hurricane Electric, so ASN rules cannot SEE it
+#     (that is what rdns_suffixes exists for), and
+#   - attackers rent Google Cloud, DigitalOcean, Azure and OVH, so an ASN rule
+#     there DELETES them.
+# The second failure is worse: it is silent data loss of exactly the traffic
+# this project exists to collect. Only allowlist an ASN a vendor actually owns.
+#
 # Suffix hygiene: list the NARROWEST name a vendor actually scans from, and
 # only names observed on live traffic. A broad apex like "censys.io" or
 # "onyphe.net" covers every subdomain a vendor will ever publish — including
@@ -55,14 +64,32 @@
 scanners:
 
   google:
-    # AS15169 = Google LLC (Googlebot, crawlers)
-    # AS396982 = Google Cloud Platform (cloud-hosted scanners, including
-    #            internal Google research scanners that hit our T-Pot)
-    asns: [15169, 396982]
+    # AS15169 = Google LLC — Google's OWN network: Googlebot and crawlers.
+    #
+    # AS396982 (Google Cloud Platform) was here and has been REMOVED. It is a
+    # rented-VM ASN, and allowlisting it deleted real attacks: measured over 7
+    # days, 150,821 events from 2,879 addresses, of which 7,919 events from 439
+    # addresses landed on INTERACTIVE honeypots — 6,918 Cowrie SSH sessions,
+    # 671 Heralding, 174 Galah. Every one was discarded as "benign".
+    #
+    # rDNS cannot rescue this the way it rescues Shadowserver. Google assigns
+    # every Compute Engine VM a PTR like 179.128.93.34.bc.googleusercontent.com
+    # — the LANDLORD's automatic name, identical for Google's own research
+    # scanners and for an attacker's rented VM. `scan-03.shadowserver.io` works
+    # because the TENANT chose it; googleusercontent.com identifies nobody.
+    #
+    # Losing Google's internal research scanning is the correct trade: those
+    # produce a scanner-shaped signature the noise floor already suppresses,
+    # whereas a rented VM running credential attacks is exactly what this
+    # project exists to capture.
+    asns: [15169]
     org_keywords:
       - "Google LLC"
       - "GOOGLE"
-      - "Google Cloud Platform"
+    # Google's real crawlers publish forward-confirmable names.
+    rdns_suffixes:
+      - "googlebot.com"
+      - "google.com"
 
   censys:
     # AS398324 = CENSYS-ARIN-01 — internet-wide research scanner
