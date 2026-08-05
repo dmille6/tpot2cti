@@ -189,8 +189,8 @@ Rules:
 - Ambiguous middle cases stay **unlabelled**. Silence is a valid answer.
 - **Benign research scanners must be excluded before labelling, not after.**
   They rent infrastructure, so ASN/org allowlists cannot see them — measured
-  2026-08-05, 17 addresses reached `targeted:substantive` including
-  Shadowserver, BinaryEdge and Stretchoid. Identification is by
+  2026-08-05: 2,731 addresses / 92,127 events over 168h, of which 17 reached
+  `targeted:substantive`, including Shadowserver, BinaryEdge and Stretchoid. Identification is by
   forward-confirmed reverse DNS (`tpot2cti/rdns.py`); a bare PTR match would be
   an allowlist any attacker could opt into by editing their own DNS.
 - Read roll-ups from `state.db` (`attacker_activity`), **not** raw ES. The

@@ -5,9 +5,10 @@ name. That worked when scanners ran on their own netblocks and does not work
 now, because they rent: Shadowserver's scanners appear as Hurricane Electric
 (AS6939), BinaryEdge's as DigitalOcean (AS14061), Stretchoid's as Microsoft
 (AS8075). All three vendors were already named in `benign_scanners.yaml` and
-were structurally unmatchable — measured on the live fleet, 17 addresses were
-being labelled `targeted:substantive`, the label that means "this one got in,
-share it as real intelligence". Shadowserver is a nonprofit.
+were structurally unmatchable — measured on the live fleet, 2,731 addresses across
+those three renting ASNs are affected, of which 17 were being labelled
+`targeted:substantive` — the label meaning "this one got in, share it as real
+intelligence". Shadowserver is a nonprofit.
 
 Reverse DNS is the only thing that identifies them.
 
@@ -37,16 +38,27 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-#: Seconds to wait on a single DNS operation. Deliberately short: this runs
-#: inside the ingest loop, and a slow resolver must never stall a cycle.
+#: Advisory only. `socket.setdefaulttimeout()` does NOT bound gethostbyaddr /
+#: getaddrinfo — those go through the system resolver, not a Python socket.
+#: Verified: a 1 ms setting still allowed a 58 ms lookup, and on 600 live
+#: attacker addresses 87 exceeded 1.0 s with a maximum of 11.5 s. The real
+#: protection is the per-cycle WALL-CLOCK budget below; this value only keeps
+#: any socket the resolver happens to open from hanging indefinitely.
 DEFAULT_TIMEOUT = 1.0
 
-#: A confirmed name is stable — infrastructure keeps its PTR for a long time.
-DEFAULT_TTL = 7 * 24 * 3600
+#: Confirmed names expire in a day, not a week. Cloud addresses are recycled:
+#: an attacker assigned a released BinaryEdge or Stretchoid address would
+#: otherwise inherit its allowlisting for a week, with no DNS control at all.
+#: That is the strongest real bypass of this mechanism, and TTL is the only
+#: thing that bounds it.
+DEFAULT_TTL = 24 * 3600
 
-#: A miss is cached far more briefly: an address with no PTR today may get one,
-#: and a resolver failure must not be remembered as a fact for a week.
-DEFAULT_NEGATIVE_TTL = 3600
+#: A miss must be cached for LONGER than one cycle or it buys nothing — every
+#: cycle would re-resolve the same PTR-less addresses and exhaust the budget by
+#: construction, which also destroys the budget counter's value as a signal.
+#: Measured: ~932 distinct addresses per 2 h window, so a 1 h negative TTL
+#: meant ~662 lookups per cycle against a budget of 500, forever.
+DEFAULT_NEGATIVE_TTL = 24 * 3600
 
 #: Hard ceiling on cached entries, so a high-churn fleet cannot grow this
 #: without bound. Evicts oldest-expiring first.
@@ -78,6 +90,10 @@ class ForwardConfirmedRDNS:
         self._reverse = resolver or self._default_reverse
         self._forward = forward_resolver or self._default_forward
         self._cache: dict[str, tuple[Optional[str], float]] = {}
+        #: Cumulative wall-clock seconds spent resolving. This is what the
+        #: caller's budget is enforced against, because per-lookup timeouts
+        #: are not honoured by the system resolver.
+        self.elapsed = 0.0
         self.lookups = 0
         self.confirmed = 0
         self.rejected_unconfirmed = 0
@@ -130,6 +146,7 @@ class ForwardConfirmedRDNS:
             return None
 
         self.lookups += 1
+        started = time.monotonic()
         name: Optional[str] = None
         try:
             raw = self._reverse(ip)
@@ -152,6 +169,7 @@ class ForwardConfirmedRDNS:
             # socket.herror / gaierror / timeout — all "we do not know".
             self.errors += 1
 
+        self.elapsed += time.monotonic() - started
         ttl = self._ttl if name else self._negative_ttl
         self._remember(ip, name, now + ttl)
         return name
@@ -185,12 +203,14 @@ class ForwardConfirmedRDNS:
             "confirmed": self.confirmed,
             "rejected_unconfirmed": self.rejected_unconfirmed,
             "errors": self.errors,
+            "elapsed_seconds": round(self.elapsed, 2),
             "cached": len(self._cache),
         }
 
     def reset_stats(self) -> None:
         self.lookups = self.confirmed = 0
         self.rejected_unconfirmed = self.errors = 0
+        self.elapsed = 0.0
 
 
 def suffix_matches(name: str, suffix: str) -> bool:

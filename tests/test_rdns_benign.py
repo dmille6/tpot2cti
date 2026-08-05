@@ -82,12 +82,43 @@ def test_results_are_cached_so_dns_is_not_hit_per_event():
     assert dns.reverse_calls == 1
 
 
-def test_misses_are_cached_too_but_briefly():
+def test_a_negative_cache_entry_outlives_a_cycle():
+    """A negative TTL shorter than the cycle interval buys nothing: every cycle
+    re-resolves the same PTR-less addresses and exhausts the budget by
+    construction — which also destroys the skip counter's value as a signal.
+    Measured: ~932 distinct addresses per 2h window meant ~662 lookups/cycle
+    against a budget of 500, forever."""
     dns, r = _r(ptr={})
     for _ in range(10):
         r.name_for("45.9.1.2")
     assert dns.reverse_calls == 1
-    assert r._negative_ttl < r._ttl, "a miss must expire sooner than a hit"
+    assert r._negative_ttl >= 2 * 3600, \
+        "negative TTL must exceed any plausible cycle interval"
+
+
+def test_an_expired_cache_entry_is_not_served():
+    """The security-relevant half: serving an EXPIRED positive as fresh means
+    unbounded allowlisting. Mutating `cached_name_for` to ignore expiry
+    previously passed the entire suite."""
+    import time as _t
+    dns, r = _r(ptr={"184.105.139.69": "scan-03.shadowserver.io"},
+                fwd={"scan-03.shadowserver.io": ["184.105.139.69"]})
+    assert r.name_for("184.105.139.69") == "scan-03.shadowserver.io"
+    assert r.cached_name_for("184.105.139.69") == ("scan-03.shadowserver.io", True)
+    # force expiry
+    name, _ = r._cache["184.105.139.69"]
+    r._cache["184.105.139.69"] = (name, _t.monotonic() - 1)
+    assert r.cached_name_for("184.105.139.69") == (None, False), \
+        "an expired entry was served as a live cache hit"
+
+
+def test_a_confirmed_name_expires_within_a_day():
+    """Cloud addresses are recycled. A week-long positive TTL let an attacker
+    assigned a released BinaryEdge/Stretchoid address inherit its allowlisting
+    for days, with no DNS control at all — the strongest real bypass, and TTL
+    is the only thing bounding it."""
+    _, r = _r()
+    assert r._ttl <= 24 * 3600
 
 
 def test_the_cache_is_bounded():
@@ -157,6 +188,35 @@ def test_the_shipped_allowlist_actually_carries_the_suffixes():
         assert vendor in by_vendor, f"{vendor} missing from shipped allowlist"
         assert suffix in by_vendor[vendor].rdns_suffixes, \
             f"{vendor} has no rdns_suffixes — ASN/org can never match it"
+
+
+def test_the_wall_clock_budget_is_what_actually_bounds_dns():
+    """`socket.setdefaulttimeout()` does NOT bound gethostbyaddr/getaddrinfo —
+    they use the system resolver. Verified live: a 1 ms setting still allowed a
+    58 ms lookup, and 87 of 600 real addresses exceeded 1 s (max 11.5 s). So a
+    per-lookup timeout bounds nothing and a count budget alone is not a stall
+    bound; cumulative wall-clock is."""
+    import time as _t
+
+    class _Slow:
+        def __init__(self): self.calls = 0
+        def reverse(self, ip):
+            self.calls += 1
+            _t.sleep(0.01)
+            return None
+        def forward(self, name): return []
+
+    slow = _Slow()
+    r = ForwardConfirmedRDNS(resolver=slow.reverse, forward_resolver=slow.forward)
+    f = BenignScannerFilter(
+        [ScannerRule(vendor="x", asns=frozenset(), org_keywords=(),
+                     rdns_suffixes=("example.com",))], resolver=r)
+    f.begin_cycle(10_000, time_budget=0.05)      # huge count, tiny time
+    for i in range(500):
+        f.match(_event(f"45.9.{i // 256}.{i % 256}", asn=None, org=None))
+    assert slow.calls < 500, "wall-clock budget did not stop the lookups"
+    assert r.elapsed >= 0.05
+    assert f.rdns_skipped_budget > 0, "skips must be counted"
 
 
 def test_the_dns_timeout_does_not_leak_into_the_rest_of_the_process():

@@ -60,6 +60,18 @@ class FilterStats:
     total_filtered: int = 0
     by_vendor: Counter[str] = field(default_factory=Counter)
 
+    #: A bounded sample of what was dropped, so a deletion is inspectable
+    #: after the fact. Dropping happens BEFORE OpenCTI and before
+    #: attacker_activity, so without this the only evidence an address was
+    #: removed is a per-vendor count — the same argument this codebase already
+    #: makes for query_excluded.
+    samples: list = field(default_factory=list)
+    MAX_SAMPLES: int = 25
+
+    def record_sample(self, ip: str, name: str, vendor: str) -> None:
+        if len(self.samples) < self.MAX_SAMPLES:
+            self.samples.append({"ip": ip, "name": name, "vendor": vendor})
+
     def record(self, vendor: str) -> None:
         """Increment the total-filtered counter and per-vendor breakdown.
 
@@ -79,6 +91,7 @@ class FilterStats:
         return {
             "total": self.total_filtered,
             "by_vendor": dict(self.by_vendor),
+            "samples": list(self.samples),
         }
 
 
@@ -97,7 +110,15 @@ ENV_YAML_PATH = "TPOT2CTI_BENIGN_SCANNERS_YAML"
 #: ingest stall: 500 x 2 x 1.0s timeout = ~17 min absolute worst case, against
 #: a typical ~1,100 new addresses/day and a measured peak of 3,118. Cache hits
 #: are free and never spend budget, so in steady state almost nothing does.
-DEFAULT_RDNS_BUDGET = int(os.environ.get("TPOT2CTI_BENIGN_RDNS_BUDGET", "500"))
+DEFAULT_RDNS_BUDGET = int(os.environ.get("TPOT2CTI_BENIGN_RDNS_BUDGET", "2000"))
+
+#: The REAL bound: cumulative wall-clock seconds of DNS per cycle. Per-lookup
+#: timeouts are not honoured by the system resolver (a 1 ms setting still
+#: allowed a 58 ms lookup; 87 of 600 live addresses exceeded 1 s, max 11.5 s),
+#: so a count budget alone bounds nothing. 60 s is ~1% of a 2 h cycle, and
+#: overshoot is at most one in-flight lookup.
+DEFAULT_RDNS_TIME_BUDGET = float(
+    os.environ.get("TPOT2CTI_BENIGN_RDNS_TIME_BUDGET", "60"))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,7 @@ class BenignScannerFilter:
         # for it, which is the failure shape this codebase keeps hitting.
         # Exhaustion is never silent either: rdns_skipped_budget is reported.
         self._rdns_budget = DEFAULT_RDNS_BUDGET
+        self._rdns_time_budget = DEFAULT_RDNS_TIME_BUDGET
         self.rdns_skipped_budget = 0
         # Precompute an ASN → vendor lookup for the fast path.
         self._asn_to_vendor: dict[int, str] = {}
@@ -138,10 +160,14 @@ class BenignScannerFilter:
                     )
                 self._asn_to_vendor[asn] = r.vendor
 
-    def begin_cycle(self, budget: int) -> None:
-        """Reset the per-cycle rDNS lookup budget and its skip counter."""
+    def begin_cycle(self, budget: int,
+                    time_budget: float = DEFAULT_RDNS_TIME_BUDGET) -> None:
+        """Reset the per-cycle rDNS budgets and the skip counter."""
         self._rdns_budget = max(0, int(budget))
+        self._rdns_time_budget = max(0.0, float(time_budget))
         self.rdns_skipped_budget = 0
+        if self._resolver is not None and hasattr(self._resolver, "reset_stats"):
+            self._resolver.reset_stats()
 
     @classmethod
     def from_yaml(cls, path: Optional[Path | str] = None,
@@ -235,7 +261,8 @@ class BenignScannerFilter:
             hit, known = cached(event.src_ip)
             if known:
                 return self._vendor_for(hit)
-        if self._rdns_budget <= 0:
+        spent = getattr(self._resolver, "elapsed", 0.0)
+        if self._rdns_budget <= 0 or spent >= self._rdns_time_budget:
             # Fail OPEN: out of budget means "we do not know", so the event is
             # kept. Under-filtering is visible and fixable; dropping a real
             # attacker because a resolver was slow is data loss.

@@ -560,6 +560,10 @@ def run_cycle(
             # tpot2cti/data/benign_scanners.yaml for the source list.
             if benign_filter is not None:
                 benign_vendor = benign_filter.match(event)
+                if benign_vendor and getattr(benign_filter, "_resolver", None):
+                    nm, known = benign_filter._resolver.cached_name_for(event.src_ip)
+                    if known and nm:
+                        benign_stats.record_sample(event.src_ip, nm, benign_vendor)
                 if benign_vendor:
                     benign_stats.record(benign_vendor)
                     continue
@@ -650,6 +654,7 @@ def run_cycle(
         # documenting durability that does not exist is the failure this
         # project keeps repeating.
         state.set("last_cycle_query_excluded", json.dumps(query_excluded))
+        state.set("last_cycle_benign_dropped", json.dumps(benign_stats.to_log_dict()))
         state.set("last_cycle_unparsed_by_source",
                   json.dumps(dict(unparsed_by_source.most_common(30))))
     except Exception as e:  # pragma: no cover - defensive
