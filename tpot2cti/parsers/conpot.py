@@ -159,17 +159,20 @@ class ConPotParser(BaseParser):
     #
     # We DO populate session-level aggregate fields here so the
     # publisher doesn't have to reach into events[0]: the `request`
-    # blob is also pushed onto `session.commands` (which the publisher
-    # already knows how to render into Notes for protocols like
-    # Cowrie), and protocol/request meta is mirrored onto session.meta.
+    # blob goes onto `session.protocol_requests` — NOT `session.commands`,
+    # which means "commands the attacker RAN" and is read as such by the
+    # score, the prose, the ATT&CK mapping and the Process builder — and
+    # protocol/request meta is mirrored onto session.meta.
 
     def correlate(self, events):
         """One-event-per-session, with session-level meta populated.
 
         We keep the default 1:1 mapping but enrich each AttackSession
         with `session.meta["protocol"]`, `session.meta["request"]`, and
-        push the request blob onto `session.commands` so downstream
-        consumers can render a Note without peeking into `events[0]`.
+        push the request blob onto `session.protocol_requests` so
+        downstream consumers can render a Note without peeking into
+        `events[0]` — and without any of them mistaking a request the
+        sensor RECEIVED for a command someone RAN.
         """
         sessions: list[AttackSession] = []
         for ev in events:
@@ -179,12 +182,13 @@ class ConPotParser(BaseParser):
                 s.meta.setdefault("protocol", proto)
             if request := ev.meta.get("request"):
                 s.meta.setdefault("request", request)
-                # The publisher renders session.commands into Notes for
-                # other parsers; reuse the same shape here so the
-                # builder can produce a uniform "request blob" Note
-                # without a ConPot-specific code path.  See
-                # docs/LESSONS_LEARNED_FROM_V0.md §6 on Note shape reuse.
-                s.commands.append(str(request))
+                # NOT `commands`. This is an HTTP request ConPot received, not
+                # a command anyone executed. It was appended to `commands` to
+                # reuse Note rendering, and every consumer then treated it as
+                # execution: +25 score, prose claiming shell activity, a
+                # Process SDO, T1059, and URLs harvested from the request
+                # line. Note reuse was not worth any of that.
+                s.protocol_requests.append(str(request))
             if ev.meta.get("request_truncated"):
                 s.meta["request_truncated"] = True
             sessions.append(s)

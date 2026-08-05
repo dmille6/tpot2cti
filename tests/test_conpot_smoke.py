@@ -82,12 +82,25 @@ def test_conpot_smoke():
         assert s.dst_ports, "session.dst_ports should be populated"
         assert s.protocols, "session.protocols should be populated"
 
-    # The Modbus and IPMI sessions both carry a non-empty request blob;
-    # the S7Comm session carried an empty string so should have no
-    # command pushed onto session.commands.
-    assert len(sessions[0].commands) == 1, "modbus session.commands missing request"
-    assert len(sessions[1].commands) == 0, "s7 session.commands should be empty"
-    assert len(sessions[2].commands) == 1, "ipmi session.commands missing request"
+    # The Modbus and IPMI sessions both carry a non-empty request blob; the
+    # S7Comm session carried an empty string so should have none.
+    #
+    # These land on `protocol_requests`, NOT `commands`. This assertion used to
+    # require the opposite and so locked in the defect: a request ConPot
+    # RECEIVED was recorded as a command someone RAN, which gave every ConPot
+    # probe +25 score (75 vs a true 50), prose reading "ran N shell
+    # command(s)", a Process SDO whose command_line was an HTTP request,
+    # T1059, and URL/Domain observables harvested from the request line.
+    assert len(sessions[0].protocol_requests) == 1, "modbus request blob missing"
+    assert len(sessions[1].protocol_requests) == 0, "s7 blob should be empty"
+    assert len(sessions[2].protocol_requests) == 1, "ipmi request blob missing"
+
+    # And the honest half: none of them claim a command was executed.
+    for s in sessions:
+        assert s.commands == [], (
+            "a received protocol request is being reported as an executed "
+            "command — every downstream consumer believes that field"
+        )
 
     # Malformed docs
     assert parser.parse({}) is None, "empty doc should yield None"
