@@ -32,6 +32,7 @@ import ipaddress
 import logging
 import socket
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -84,13 +85,31 @@ class ForwardConfirmedRDNS:
 
     # -- resolution ------------------------------------------------------
 
-    def _default_reverse(self, ip: str) -> Optional[str]:
+    @contextmanager
+    def _dns_timeout(self):
+        """Scope the socket timeout to the DNS call and put it back.
+
+        `socket.setdefaulttimeout()` is PROCESS-GLOBAL: it applies to every
+        socket created afterwards, so setting it and walking away would silently
+        impose a 1-second timeout on the Elasticsearch and OpenCTI clients too —
+        turning a DNS convenience into cycle-wide failures under load. CORE's
+        ingest loop is single-threaded, so save/restore is sufficient here; it
+        would need rethinking if this were ever called from multiple threads.
+        """
+        previous = socket.getdefaulttimeout()
         socket.setdefaulttimeout(self._timeout)
-        return socket.gethostbyaddr(ip)[0]
+        try:
+            yield
+        finally:
+            socket.setdefaulttimeout(previous)
+
+    def _default_reverse(self, ip: str) -> Optional[str]:
+        with self._dns_timeout():
+            return socket.gethostbyaddr(ip)[0]
 
     def _default_forward(self, name: str) -> list[str]:
-        socket.setdefaulttimeout(self._timeout)
-        infos = socket.getaddrinfo(name, None)
+        with self._dns_timeout():
+            infos = socket.getaddrinfo(name, None)
         return [i[4][0] for i in infos]
 
     def name_for(self, ip: str) -> Optional[str]:

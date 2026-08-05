@@ -152,3 +152,21 @@ def test_the_shipped_allowlist_actually_carries_the_suffixes():
         assert vendor in by_vendor, f"{vendor} missing from shipped allowlist"
         assert suffix in by_vendor[vendor].rdns_suffixes, \
             f"{vendor} has no rdns_suffixes — ASN/org can never match it"
+
+
+def test_the_dns_timeout_does_not_leak_into_the_rest_of_the_process():
+    """`socket.setdefaulttimeout()` is PROCESS-GLOBAL. Setting it for a DNS
+    call and walking away would silently impose a 1-second timeout on every
+    socket created afterwards — including the Elasticsearch and OpenCTI
+    clients, turning a DNS convenience into cycle-wide failures under load."""
+    import socket
+    before = socket.getdefaulttimeout()
+    r = ForwardConfirmedRDNS(timeout=0.5)
+    r.name_for("192.0.2.1")          # will fail to resolve; that is fine
+    assert socket.getdefaulttimeout() == before, \
+        "rDNS leaked its socket timeout into the process"
+    probe = socket.socket()
+    try:
+        assert probe.gettimeout() == before
+    finally:
+        probe.close()
