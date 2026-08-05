@@ -131,15 +131,23 @@ def fetch_source(src: Source, *, timeout: int = FETCH_TIMEOUT) -> tuple:
 
 
 def refresh_lists(sources: list[Source], state: CycleState, *,
-                  timeout: int = FETCH_TIMEOUT) -> dict:
-    """Fetch every source, keeping the previous copy of any that fails.
+                  previous: Optional[dict] = None,
+                  timeout: int = FETCH_TIMEOUT) -> tuple[dict, list[str]]:
+    """Fetch every source. Returns `(lists, failed_keys)`.
 
-    Returns `{key: {"cidrs":…, "extra":…, "fetched_at":…, "fresh":bool}}`.
-    One source failing must not take down the others — but a source that has
-    failed for long enough to go stale is dropped from matching entirely
-    rather than silently answering from an old copy.
+    A source that fails **keeps its previous copy** rather than vanishing, so
+    one flaky feed cannot silently remove a whole dimension of matching. It
+    also keeps its previous `bl_fetched_at`, so it goes on aging toward the
+    staleness cliff and is eventually dropped by `run_cycle` — degrading to
+    "refused because stale" rather than "quietly answering from an old copy".
+
+    Merging into `previous` is the point. An earlier version returned only the
+    successes and the caller did `lists = refresh_lists(...) or lists`, which
+    replaced the dict wholesale: a single transient failure dropped that
+    source's good data entirely, contradicting this docstring.
     """
-    out: dict[str, dict] = {}
+    out: dict[str, dict] = dict(previous or {})
+    failed: list[str] = []
     for src in sources:
         try:
             cidrs, extra = fetch_source(src, timeout=timeout)
@@ -149,8 +157,11 @@ def refresh_lists(sources: list[Source], state: CycleState, *,
                       out[src.key]["fetched_at"].isoformat())
             logger.info("blocklists: %s refreshed — %d entries", src.key, len(cidrs))
         except SourceParseError as exc:
-            logger.error("blocklists: %s refresh FAILED: %s", src.key, exc)
-    return out
+            failed.append(src.key)
+            kept = "keeping previous copy" if src.key in out else "no previous copy"
+            logger.error("blocklists: %s refresh FAILED (%s): %s",
+                         src.key, kept, exc)
+    return out, failed
 
 
 def age_hours(state: CycleState, key: str) -> Optional[float]:
@@ -416,13 +427,24 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    # Retry sooner than the full refresh interval when a fetch fails: a failed
+    # source keeps aging toward the staleness cliff, so waiting a whole day
+    # after a transient blip spends that budget for nothing.
+    retry_after = min(refresh_every, max(interval, 300.0))
     lists: dict = {}
-    last_refresh = 0.0
+    next_refresh = 0.0
     while not stopping:
         try:
-            if not lists or (time.monotonic() - last_refresh) >= refresh_every:
-                lists = refresh_lists(sources, state) or lists
-                last_refresh = time.monotonic()
+            if time.monotonic() >= next_refresh:
+                lists, failed = refresh_lists(sources, state, previous=lists)
+                next_refresh = time.monotonic() + (retry_after if failed
+                                                   else refresh_every)
+                if failed:
+                    logger.warning("blocklists: %d source(s) failed to refresh "
+                                   "(%s) — retrying in %ds rather than waiting "
+                                   "the full %ds refresh interval",
+                                   len(failed), ",".join(failed),
+                                   int(retry_after), int(refresh_every))
             summary = run_cycle(cfg, state, core_db, lambda: STIXBuilder(cfg),
                                 publisher, lists, sources_by_key)
             if summary.get("sweep_complete"):

@@ -112,9 +112,32 @@ def test_one_source_failing_does_not_take_down_the_others(monkeypatch, state_db)
             raise src.SourceParseError("simulated")
         return src._parse_netset(good)
     monkeypatch.setattr(bl, "fetch_source", fake)
-    out = bl.refresh_lists(list(src.SOURCES[:3]), state_db)
+    out, failed = bl.refresh_lists(list(src.SOURCES[:3]), state_db)
+    assert failed == ["firehol"]
     assert "firehol" not in out
     assert "spamhaus" in out and "tor" in out
+
+
+def test_a_failed_source_keeps_its_previous_copy(monkeypatch, state_db):
+    """One flaky feed must not silently remove a whole dimension of matching.
+    An earlier version returned only successes and the caller merged with
+    `or lists`, which replaced the dict wholesale — so a single transient
+    failure dropped that source's good data entirely."""
+    good = "45.9.0.0/16\n" + "\n".join(f"10.{i}.0.0/16" for i in range(1100))
+    calls = {"n": 0}
+    def flaky(source, timeout=None):
+        calls["n"] += 1
+        if source.key == "firehol" and calls["n"] > 1:
+            raise src.SourceParseError("simulated outage")
+        return src._parse_netset(good)
+    monkeypatch.setattr(bl, "fetch_source", flaky)
+    first, _ = bl.refresh_lists([src.SOURCES_BY_KEY["firehol"]], state_db)
+    assert "firehol" in first
+    second, failed = bl.refresh_lists([src.SOURCES_BY_KEY["firehol"]], state_db,
+                                      previous=first)
+    assert failed == ["firehol"]
+    assert "firehol" in second, "a transient failure deleted a good list"
+    assert second["firehol"] is first["firehol"]
 
 
 # ── staleness: this lane's whole health question ─────────────────────────
