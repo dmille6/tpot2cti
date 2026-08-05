@@ -33,6 +33,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from tpot2cti.stix_ids import canonical_ip
+
 logger = logging.getLogger(__name__)
 
 
@@ -399,6 +401,49 @@ class CycleState:
             )
             return cur.rowcount
 
+    def prune_malformed_attacker_activity(self) -> int:
+        """Drop attacker_activity rows whose src_ip is not an address.
+
+        Cleanup for rows written before the source-address gate existed:
+        h0neytr4p reports the attacker-controlled X-Forwarded-For header
+        as the client address, so Log4Shell scanners deposited obfuscated
+        JNDI payloads in this table's key column (30 rows on the live
+        hive). They produce no observables, they are counted as
+        ``malformed`` by the noisefloor enricher every pass, and they can
+        never match a real attacker.
+
+        Self-healing rather than a one-shot migration: it runs each cycle
+        as part of :meth:`prune_all`, costs one indexed scan, and returns
+        0 forever once the table is clean. Filtering is done in Python
+        because SQLite has no address type.
+        """
+        with self._conn() as c:
+            bad = [
+                row[0] for row in c.execute(
+                    "SELECT DISTINCT src_ip FROM attacker_activity"
+                )
+                if canonical_ip(str(row[0])) is None
+            ]
+            if not bad:
+                return 0
+            deleted = 0
+            # Chunked so a large cleanup can't overflow SQLite's
+            # bind-variable limit — the exact failure mode behind the
+            # 2026-07-19 ingestion outage.
+            for i in range(0, len(bad), 500):
+                chunk = bad[i:i + 500]
+                cur = c.execute(
+                    "DELETE FROM attacker_activity WHERE src_ip IN "
+                    f"({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                deleted += cur.rowcount
+            logger.info(
+                f"attacker_activity: removed {deleted} row(s) with a "
+                f"non-address src_ip ({len(bad)} distinct value(s))"
+            )
+            return deleted
+
     def prune_attacker_profile_emit_log(self, cutoff_days: int = 100) -> int:
         """Drop attacker_profile_emit_log rows older than cutoff (default 100d).
 
@@ -498,6 +543,7 @@ class CycleState:
         return {
             "cycles": self.prune_cycles(keep_last=cycles_keep_last),
             "attacker_activity": self.prune_attacker_activity(cutoff_days=activity_cutoff_days),
+            "attacker_activity_malformed": self.prune_malformed_attacker_activity(),
             "profile_emit_log": self.prune_attacker_profile_emit_log(cutoff_days=profile_log_cutoff_days),
             "object_max_state": self.prune_object_max_state(cutoff_days=max_state_cutoff_days),
             "campaign_artifacts": self.prune_campaign_artifacts(cutoff_days=max_state_cutoff_days),
@@ -676,6 +722,24 @@ class CycleState:
         sensor = getattr(session, "sensor_hostname", None) or "unknown"
         if not src_ip:
             return
+        # Defence in depth: this table is keyed on src_ip and is read back
+        # as an address by attacker_profile, campaigns, the noisefloor
+        # enricher and the credential Notes. A non-address key poisons all
+        # of them silently. main.run_cycle rejects these before a session
+        # is ever built (drop reason `src_ip_rejected`); this guard means a
+        # future caller that skips that gate cannot re-introduce the rows.
+        # 30 such rows — obfuscated Log4Shell payloads that h0neytr4p
+        # reported as client addresses — accumulated here before the gate
+        # existed. Canonicalize too, so 1.2.3.4 and ::ffff:1.2.3.4 don't
+        # split one attacker across two rows.
+        canon = canonical_ip(str(src_ip))
+        if canon is None:
+            logger.debug(
+                f"attacker_activity: skipping non-address src_ip "
+                f"{str(src_ip)[:80]!r} from parser={parser_name!r}"
+            )
+            return
+        src_ip = canon[1]
 
         first_seen = session.first_seen.isoformat()
         last_seen = session.last_seen.isoformat()
