@@ -8,6 +8,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -78,6 +79,15 @@ MAX_NOTE_BODY_BYTES = 64 * 1024
 #: Max distinct URL observables emitted per web session (a scanner can
 #: hit hundreds of paths; cap so one session can't balloon the bundle).
 _MAX_WEB_URLS = 25
+
+#: Stand-in for the source of an event whose src_ip could not be trusted
+#: (see build_unattributed_payload_objects). It is a human-readable LABEL
+#: that flows into generated descriptions — never an address, and never
+#: passed to an id generator.
+_UNATTRIBUTED_SRC = "an unattributed source (spoofed X-Forwarded-For)"
+
+#: Cap on raw/decoded payload text embedded in a salvage Note.
+_UNATTRIBUTED_RAW_CAP = 4 * 1024
 
 # Process command_line cap (matches PoC convention)
 MAX_COMMANDS_PER_PROCESS = 50
@@ -2472,6 +2482,225 @@ class STIXBuilder:
             )):
                 out.append(rel)
         return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # Unattributed payload salvage
+    # ──────────────────────────────────────────────────────────────────
+
+    def build_unattributed_payload_objects(
+        self, events: list[ParsedEvent],
+    ) -> list[dict]:
+        """STIX for events with a usable payload but NO usable source IP.
+
+        The motivating case is Log4Shell against h0neytr4p: that honeypot
+        reports the attacker-controlled ``X-Forwarded-For`` header as the
+        client address, so a scanner's obfuscated JNDI payload lands in
+        ``src_ip`` and nothing in the document preserves the real TCP
+        peer. The source is genuinely unrecoverable — but the payload
+        contains the attacker's live C2 / DNS-exfil endpoint, which is
+        the more durable IoC of the two.
+
+        So we emit the payload's own graph and anchor it at the SENSOR:
+
+          URL (C2 endpoint) ──resolves-to──▶ Domain-Name (C2 zone)
+            │                                  │
+            └──related-to──▶ Vulnerability (CVE-2021-44228)
+            └──related-to──▶ AttackPattern (T1190)
+            └──◀ Sighting (where_sighted = sensor Identity)
+            └──◀ Note (raw obfuscated payload + why there is no source IP)
+
+        There is deliberately NO IPv4-Addr, no IP Indicator and no
+        attacker Identity: minting any of those would assert an
+        attribution we do not have. Callers pass only events that already
+        failed the source-address gate in ``main.run_cycle``.
+        """
+        out: list[dict] = []
+        if not events:
+            return out
+
+        # Group by C2 *host*, not by URL. Measured on live traffic: the
+        # scanner encodes which header it probed into the URL's leading
+        # label (``XFl0c-…`` for X-Forwarded-For, ``REl0c-…`` for
+        # Referer, and so on for ~12 headers), so one probe of one host
+        # yields a dozen near-identical URLs. Grouping by URL would mint
+        # a dozen Sightings and a dozen Notes for what is one campaign
+        # against one C2 zone. The zone is also the durable pivot: the
+        # leading labels are per-probe, the zone is the attacker's.
+        #
+        # Payloads whose host is entirely templated have no zone to group
+        # on and fall back to their URL as the key.
+        groups: dict[str, dict] = {}
+        for ev in events:
+            for payload in (ev.meta.get("jndi_payloads") or []):
+                url = payload.get("url")
+                if not url:
+                    continue
+                key = payload.get("host") or url
+                g = groups.setdefault(key, {"events": [], "urls": {}})
+                g["events"].append(ev)
+                g["urls"].setdefault(url, payload)
+
+        for key in sorted(groups):
+            group = sorted(groups[key]["events"], key=lambda e: e.timestamp)
+            urls = groups[key]["urls"]
+            first, last = group[0], group[-1]
+            # The representative payload — its `host`/`decoded`/`raw` are
+            # shared by the whole group by construction.
+            url, payload = sorted(urls.items())[0]
+            extra_urls = sorted(u for u in urls if u != url)
+            # Synthetic session purely as a carrier for the shared
+            # build_* helpers (timestamps, sensor, deterministic ids).
+            # Its src_ip is a LABEL, never an address — nothing on this
+            # path calls build_ip_observable, and the label is what the
+            # helpers' descriptions will read.
+            session = AttackSession.from_event(first)
+            session.src_ip = _UNATTRIBUTED_SRC
+            session.last_seen = last.timestamp
+
+            out.extend(self.build_sensor_context(first.sensor_hostname))
+
+            u = self.build_url(url, session=session)
+            if not u:
+                continue
+            out.append(u)
+            # The per-header URL variants are real observations, so emit
+            # them too — but under this one group's Sighting/Note rather
+            # than a graph each.
+            for variant in extra_urls[:_MAX_WEB_URLS]:
+                if uv := self.build_url(variant, session=session):
+                    out.append(uv)
+            if len(extra_urls) > _MAX_WEB_URLS:
+                logger.info(
+                    f"unattributed salvage: {key} — emitted "
+                    f"{_MAX_WEB_URLS + 1} of {len(extra_urls) + 1} URL "
+                    f"variants (capped)"
+                )
+
+            if host := payload.get("host"):
+                d = self.build_domain(host, session=session)
+                if d:
+                    out.append(d)
+                    if rel := self.build_relationship(
+                        u["id"], "resolves-to", d["id"],
+                        description=f"C2 endpoint {url[:120]} resolves to {host}",
+                    ):
+                        out.append(rel)
+
+            if cve := first.meta.get("matched_cve"):
+                v = self.build_vulnerability(
+                    cve,
+                    description=(
+                        f"Exploitation attempt observed via "
+                        f"{first.event_type} on sensor "
+                        f"{first.sensor_hostname!r}. Source address not "
+                        f"recoverable — the honeypot reports the "
+                        f"attacker-controlled X-Forwarded-For header as "
+                        f"the client address."
+                    ),
+                )
+                if v and (rel := self.build_relationship(
+                    u["id"], "related-to", v["id"],
+                    description=f"C2 endpoint delivered in a {cve} payload",
+                )):
+                    out.append(v)
+                    out.append(rel)
+                elif v:
+                    out.append(v)
+
+            if attack_type := first.meta.get("attack_type"):
+                ap = self.build_attack_pattern(
+                    attack_type, first.meta.get("mitre_technique"),
+                    session=session,
+                )
+                if ap:
+                    out.append(ap)
+                    if rel := self.build_relationship(
+                        u["id"], "related-to", ap["id"],
+                        description=f"C2 endpoint used by {attack_type}",
+                    ):
+                        out.append(rel)
+
+            if sighting := self.build_sighting(
+                u["id"], first.sensor_hostname, session,
+                count=len(group),
+                description=(
+                    f"{len(group)} exploitation attempt(s) carrying this C2 "
+                    f"endpoint, observed by {first.event_type}. No source "
+                    f"address: see the attached Note."
+                ),
+                id_discriminator="unattributed",
+            ):
+                out.append(sighting)
+
+            note = self.build_session_note(
+                session,
+                self._unattributed_note_body(url, extra_urls, payload, group),
+                abstract=f"Unattributed {first.event_type} payload → {key[:80]}",
+                object_refs=[u["id"]],
+            )
+            if note:
+                out.append(note)
+
+        return out
+
+    @staticmethod
+    def _unattributed_note_body(
+        url: str, extra_urls: list[str], payload: dict, group: list[ParsedEvent],
+    ) -> str:
+        """Markdown body for the salvage Note.
+
+        Records the recovered endpoint, the raw obfuscated text it was
+        extracted from, and — importantly — an explicit statement that the
+        source address is unknown, so nobody reading this in OpenCTI
+        mistakes the absence of an IP for an oversight.
+        """
+        sensors = sorted({e.sensor_hostname for e in group})
+        raw = str(payload.get("raw") or "")
+        if len(raw) > _UNATTRIBUTED_RAW_CAP:
+            raw = raw[:_UNATTRIBUTED_RAW_CAP] + " … [truncated]"
+        lines = [
+            "## Unattributed exploitation payload",
+            "",
+            f"- **Recovered C2 endpoint:** `{url}`",
+            f"- **C2 host:** `{payload.get('host') or '(templated — not a fixed name)'}`",
+            f"- **Observed:** {len(group)} request(s) "
+            f"{group[0].timestamp.isoformat()} → {group[-1].timestamp.isoformat()}",
+            f"- **Sensors:** {', '.join(sensors)}",
+        ]
+        if extra_urls:
+            lines += [
+                "",
+                f"### {len(extra_urls)} further URL variant(s) on the same host",
+                "",
+                "The scanner encodes the probed header into the URL's "
+                "leading label, so one probe produces one variant per "
+                "header it tried:",
+                "",
+            ] + [f"- `{u}`" for u in extra_urls[:_MAX_WEB_URLS]]
+        lines += [
+            "",
+            "### Why there is no source IP",
+            "",
+            "This honeypot reports the attacker-controlled "
+            "`X-Forwarded-For` header as the client address, and the "
+            "request carried an obfuscated payload in that header. The "
+            "real TCP peer is not preserved anywhere in the event, so no "
+            "IP observable, Indicator or Sighting has been minted for a "
+            "source — asserting one would be a fabricated attribution.",
+            "",
+            "### Deobfuscated payload",
+            "",
+            "```",
+            str(payload.get("decoded") or "")[:_UNATTRIBUTED_RAW_CAP],
+            "```",
+            "",
+            "### Raw payload as received",
+            "",
+            "```",
+            raw,
+            "```",
+        ]
+        return "\n".join(lines)
 
     # Dedicated per-type entries (registered in main._PARSER_DISPATCH).
     def build_galah_session(self, session: AttackSession) -> list[dict]:
