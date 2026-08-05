@@ -63,6 +63,7 @@ from tpot2cti.parsers import dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
 from tpot2cti.stix.builder import STIXBuilder
+from tpot2cti.stix_ids import canonical_ip
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,13 @@ _EXCLUDED_SRC_NETS = [
 ]
 
 
+#: Per-cycle cap on retained unattributable payload-bearing events.
+#: Each retains its raw + decoded payload text, so this bounds cycle
+#: memory during a mass Log4Shell campaign or a long catch-up window.
+#: Live volume is ~33 over seven weeks, so this is pure headroom.
+_MAX_UNATTRIBUTED_PER_CYCLE = 2000
+
+
 def _is_internal_src(ip: str) -> bool:
     """True if src_ip is internal/own-infra and must not become an indicator:
     RFC1918 / link-local (incl 169.254.169.254 Azure IMDS) / loopback /
@@ -427,8 +435,13 @@ def run_cycle(
     # "dropped" bucket is how silent-loss regressions hide.
     events_dropped_unparsed = 0    # parser returned None (unknown type / below parse floor)
     events_dropped_dispatch = 0    # parser raised an exception on the doc
+    events_dropped_bad_src_ip = 0  # src_ip is not a parseable IP address
     events_self_filtered = 0  # src_ip is our own honeypot / RFC1918 / reserved
     parsed_by_type: dict[str, list[ParsedEvent]] = defaultdict(list)
+    # Events rejected for an unusable src_ip that still carry salvageable
+    # payload intelligence (see the source-address gate below).
+    unattributed_events: list[ParsedEvent] = []
+    unattributed_capped = False
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
 
@@ -448,6 +461,56 @@ def run_cycle(
                 continue
             if event is None:
                 events_dropped_unparsed += 1
+                continue
+            # Source-address gate: everything downstream — the observable,
+            # the Indicator, the Sighting, attacker_activity, campaign
+            # membership — is keyed on src_ip, and all of it silently
+            # produces nothing when src_ip is not an address. Reject here,
+            # once, where it can be counted.
+            #
+            # This is not hypothetical: h0neytr4p reports the
+            # attacker-controlled X-Forwarded-For header as the client
+            # address, so Log4Shell scanners put an obfuscated JNDI
+            # payload in src_ip. 30 such rows reached the live state DB
+            # and produced zero observables with zero recorded drops —
+            # the silent-loss shape this project keeps re-learning.
+            #
+            # An ABSENT src_ip is a different case and is deliberately NOT
+            # gated here: the fallback parser documents that a doc with no
+            # src_ip still parses, and build_fallback_event emits a
+            # sensor-anchored Note for it. That path predates this gate
+            # and stays intact. Only a src_ip that is present but is not
+            # an address is rejected.
+            if event.src_ip and canonical_ip(event.src_ip) is None:
+                events_dropped_bad_src_ip += 1
+                # The event is unattributable, but its PAYLOAD may still
+                # be intelligence (a live Log4Shell C2 endpoint is worth
+                # more than the spoofed address it arrived in). Salvage
+                # it into a sensor-anchored graph rather than dropping it.
+                #
+                # Bounded: each retained event carries its raw + decoded
+                # payload text, and a long catch-up window during a mass
+                # Log4Shell campaign would otherwise grow this list without
+                # limit — the unbounded-per-cycle-accumulation shape behind
+                # the 2026-07-19 outage. The builder groups by C2 host, so
+                # the cap costs repeat observations of an endpoint we have
+                # already captured, never a distinct one in practice.
+                if event.meta.get("jndi_payloads"):
+                    if len(unattributed_events) < _MAX_UNATTRIBUTED_PER_CYCLE:
+                        unattributed_events.append(event)
+                    elif not unattributed_capped:
+                        unattributed_capped = True
+                        logger.warning(
+                            f"cycle {cycle_id}: more than "
+                            f"{_MAX_UNATTRIBUTED_PER_CYCLE} unattributable "
+                            f"payload-bearing events; salvaging the first "
+                            f"{_MAX_UNATTRIBUTED_PER_CYCLE} only"
+                        )
+                logger.debug(
+                    f"cycle {cycle_id}: rejected non-address src_ip from "
+                    f"{event.event_type} on {event.sensor_hostname}: "
+                    f"{str(event.src_ip)[:80]!r}"
+                )
                 continue
             # Self-filter: drop events whose src_ip is one of our own
             # honeypot's public IPs. Suricata observes both directions of
@@ -490,6 +553,7 @@ def run_cycle(
     drop_reasons = {
         "unparsed": events_dropped_unparsed,
         "dispatch_error": events_dropped_dispatch,
+        "src_ip_rejected": events_dropped_bad_src_ip,
         "self_or_internal": events_self_filtered,
         "benign_scanner": benign_stats.total_filtered,
     }
@@ -630,6 +694,25 @@ def run_cycle(
                     f"session_id={session.session_id!r}: {e}"
                 )
                 logger.debug(traceback.format_exc())
+
+    # ── Step 4b: unattributed payload salvage ─────────────────────────
+    # Events whose src_ip was rejected above but which carried a real
+    # IoC. They get no attacker graph — there is no attacker to anchor it
+    # to — but the C2 endpoint itself is emitted and sighted at the
+    # sensor, so the intelligence survives the drop.
+    if unattributed_events:
+        try:
+            salvaged = builder.build_unattributed_payload_objects(
+                unattributed_events,
+            )
+            all_objects.extend(salvaged)
+            logger.info(
+                f"cycle {cycle_id}: salvaged {len(salvaged)} object(s) from "
+                f"{len(unattributed_events)} unattributable event(s)"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"cycle {cycle_id}: payload salvage failed: {e}")
+            logger.debug(traceback.format_exc())
 
     # ── Step 5: credentials → store (bulk) + one Note per attacker IP ──
     # Bruteforce runs are tens of thousands of pairs; we keep them OUT of

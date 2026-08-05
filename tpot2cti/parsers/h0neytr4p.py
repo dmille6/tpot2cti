@@ -5,10 +5,12 @@ See docs/parsers/h0neytr4p.md for protocol/ES-field/STIX/substance notes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from typing import Iterable, Optional
 
+from tpot2cti.log4shell import extract_jndi
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
 
@@ -28,6 +30,22 @@ REQUEST_BODY_CAP = 4 * 1024
 #: Substance threshold on request.body length (bytes).  Bodies above
 #: this cutoff are treated as substantive even if no hint regex hits.
 BODY_LENGTH_THRESHOLD = 8
+
+#: Log4Shell.  A recovered JNDI endpoint is proof of an exploitation
+#: attempt against this CVE, so we attach both the Vulnerability and the
+#: ATT&CK technique for exploiting an internet-facing service.
+LOG4SHELL_CVE = "CVE-2021-44228"
+LOG4SHELL_MITRE_ID = "T1190"
+
+#: Cap on distinct JNDI endpoints recovered from one request.  A single
+#: Log4Shell probe sprays every header it can reach — and the scanner
+#: observed on this hive encodes WHICH header into the callback hostname
+#: (``XFl0c-…`` for X-Forwarded-For, ``REl0c-…`` for Referer, …), so one
+#: request legitimately yields ~12 distinct URLs sharing one C2 zone.
+#: The cap sits above that so normal probes are never truncated; it only
+#: bounds a pathological spray.  Truncation is recorded on the event
+#: (``jndi_truncated``) rather than dropped silently.
+_MAX_JNDI_PER_EVENT = 32
 
 #: Tight list of regexes describing URIs / payload markers that we treat
 #: as substantive on their own — even on a plain GET.  Keep this list
@@ -114,13 +132,17 @@ class H0neytr4pParser(BaseParser):
     def parse(self, doc: dict) -> Optional[ParsedEvent]:
         """Convert an H0neytr4p ES doc into a normalized :class:`ParsedEvent`.
 
-        Pulls the request method / URI / body / user-agent (all nested
-        under ``request``), the ``host_header`` field, and runs the
-        substance hint list now so the result is cached on the event
-        and re-used downstream.
+        Pulls the request method / URI / body / user-agent / host header
+        across both live ES schemas (see the field-order comment below),
+        records source-address provenance, salvages any Log4Shell JNDI
+        payload, and runs the substance hint list now so the result is
+        cached on the event and re-used downstream.
 
         Returns ``None`` for malformed docs (missing src_ip or
-        @timestamp); these are logged at DEBUG and dropped.
+        @timestamp); these are logged at DEBUG and dropped. A ``src_ip``
+        that is present but is not an address is NOT dropped here — it is
+        flagged in ``meta`` and rejected centrally by ``main.run_cycle``
+        so the loss is counted, and so its payload can still be salvaged.
         """
         src_ip = doc.get("src_ip")
         if not src_ip:
@@ -135,38 +157,64 @@ class H0neytr4pParser(BaseParser):
             )
             return None
 
-        # h0neytr4p ES shape per 2026-05-22 field-name audit:
-        # T-Pot actually ships these fields FLAT at the top level
-        # (request_method, request_uri, user-agent, host_header,
-        # header_*), NOT nested under a `request` dict as V1_SPEC §5.7
-        # originally documented. The nested form is kept as a fallback
-        # for older/forked T-Pot versions, but real data hits the flat
-        # path on every event. Note the hyphenated `user-agent` and
-        # `header_user-agent` spellings — Python dict access works
-        # with hyphens, this is not a typo.
+        # h0neytr4p ES shape — TWO schemas ship concurrently.
+        #
+        # Per the 2026-08-04 live-ES field census (34k docs/24h), the
+        # hive runs two h0neytr4p builds and their log schemas differ:
+        #
+        #   "modern" (~99.6% of docs, every sensor but two)
+        #       method, request_uri, http_user_agent, http_host,
+        #       sni, status, request_time, http_referer
+        #   "legacy" (~0.4%, two older sensors)
+        #       request_method, request_uri, user-agent,
+        #       header_<name> (one field per HTTP header), protocol
+        #
+        # The original reads targeted the legacy names only (plus a
+        # nested `request` dict from V1_SPEC §5.7 that no build has ever
+        # emitted), so on live traffic `method` and `user_agent` were
+        # None for 99.6% of events and `host_header` was None for
+        # *100%* of them — no build ships `host_header`/`header_host` at
+        # all. That silently disabled URL reconstruction entirely:
+        # measured 0 URLs and 0 domains across all 12,860 H0neytr4p rows
+        # in the live state DB, against 1,072/1,072 for Tanner. Order
+        # below is modern-first, legacy-fallback, nested-last. Note the
+        # hyphenated `user-agent` / `header_user-agent` spellings — dict
+        # access works with hyphens, this is not a typo.
         request = doc.get("request") or {}
         if not isinstance(request, dict):
             request = {}
 
         method = str(
-            doc.get("request_method") or request.get("method") or ""
+            doc.get("method")
+            or doc.get("request_method")
+            or request.get("method")
+            or ""
         ).upper() or None
         uri = (
             doc.get("request_uri") or request.get("uri") or ""
         )
+        # No h0neytr4p build observed ships a request-body field; the
+        # reads are kept for forks that do. Consequence: the
+        # BODY_LENGTH_THRESHOLD substance rule never fires on live data,
+        # so substance rests on the URI/UA hint lists below.
         body = (
             doc.get("request_body") or request.get("body") or ""
         )
         user_agent = (
-            doc.get("user-agent")
+            doc.get("http_user_agent")
+            or doc.get("user-agent")
             or doc.get("header_user-agent")
             or request.get("user_agent")
             or ""
         )
         host_header = (
-            doc.get("host_header")
+            doc.get("http_host")
+            or doc.get("host_header")
             or doc.get("header_host")
             or request.get("host")
+            # TLS SNI is the modern build's only other host signal and is
+            # a truthful last resort for HTTPS virtual-host naming.
+            or doc.get("sni")
             or ""
         )
 
@@ -220,11 +268,85 @@ class H0neytr4pParser(BaseParser):
             event.meta["user_agent"] = str(user_agent)
         if host_header:
             event.meta["host_header"] = str(host_header)
+        if (status := self._safe_int(doc.get("status"))) is not None:
+            event.meta["status"] = status
+
+        # ── src_ip provenance ─────────────────────────────────────────
+        # h0neytr4p reports the X-Forwarded-For header AS the client
+        # address: measured on live ES, src_ip is byte-identical to
+        # header_x-forwarded-for in 33/33 docs that carry that header.
+        # This is honeypot behaviour, not a field-read error on our side
+        # — and it means an h0neytr4p src_ip is ATTACKER-CONTROLLED
+        # whenever XFF is present, because nothing in the document
+        # preserves the real TCP peer (t-pot_ip_ext / hostname are the
+        # sensor's own addresses).
+        #
+        # Log4Shell scanners spray their payload into every header, XFF
+        # included, so the visible symptom is a src_ip holding an
+        # obfuscated JNDI payload — 30 such rows reached the live state
+        # DB. Those are self-evidently unusable and CORE rejects them.
+        # The quieter risk is an XFF holding a *plausible* IP, which
+        # would be indistinguishable from real attribution; none has been
+        # observed in the retained window, so we flag rather than drop.
+        # main.run_cycle owns the reject-and-count decision (its
+        # `src_ip_rejected` drop reason); the parser only records
+        # provenance so that decision is auditable.
+        raw_src = str(src_ip)
+        xff = doc.get("header_x-forwarded-for") or doc.get("http_x_forwarded_for")
+        if xff is not None and str(xff) == raw_src:
+            event.meta["src_ip_from_xff"] = True
+        # Because src_ip IS the XFF header, it arrives in XFF's syntax,
+        # not as a bare address: `client, proxy1, proxy2` behind any
+        # proxy chain, sometimes quoted or bracketed. Rejecting the whole
+        # value would discard a usable client address over punctuation,
+        # which contradicts the reason we keep a plausible XFF at all.
+        # Normalize to the first hop — the originating client per RFC
+        # 7239 — and record the original whenever we changed anything.
+        normalized = self._normalize_src_ip(raw_src)
+        if normalized is not None and normalized != raw_src:
+            event.meta["src_ip_raw"] = raw_src[:REQUEST_BODY_CAP]
+            event.meta["src_ip_normalized_from_chain"] = True
+            event.src_ip = normalized
+        elif normalized is None:
+            event.meta["src_ip_invalid"] = True
+            event.meta["src_ip_raw"] = raw_src[:REQUEST_BODY_CAP]
+
+        # ── Log4Shell payload salvage ─────────────────────────────────
+        # The JNDI endpoint is the actual intelligence in these events —
+        # live attacker C2 / DNS-exfil infrastructure — and it is worth
+        # strictly more than the spoofable address it rode in on. It
+        # arrives obfuscated and sprayed across many fields at once
+        # (src_ip plus ~10 header_* values in the observed sample), so
+        # scan them all and dedupe by recovered URL.
+        jndi, jndi_truncated = self._extract_jndi(doc)
+        if jndi:
+            event.meta["jndi_payloads"] = [j.to_dict() for j in jndi]
+            if jndi_truncated:
+                # No silent caps: say so where an operator can see it.
+                event.meta["jndi_truncated"] = True
+                logger.info(
+                    f"h0neytr4p: JNDI extraction exceeded the per-event cap "
+                    f"({_MAX_JNDI_PER_EVENT}) on {event.sensor_hostname}; "
+                    f"some endpoint variants not recorded"
+                )
+            # Feed the keys _build_web_session already consumes, so the
+            # Vulnerability + AttackPattern come out of the shared web
+            # graph instead of a parallel code path.
+            event.meta["matched_cve"] = LOG4SHELL_CVE
+            event.meta["attack_type"] = "Log4Shell JNDI injection"
+            event.meta["mitre_technique"] = LOG4SHELL_MITRE_ID
 
         # ── Run the substance hint scan now, cache the matches ─────────
         # We run it once at parse time so downstream substance checks are
-        # just a dict lookup.
-        matched_hints = self._scan_hints(uri, body_truncated, user_agent)
+        # just a dict lookup. Headers are included because on the legacy
+        # schema the exploit rides in the headers, not the URI or body.
+        matched_hints = self._scan_hints(
+            uri, body_truncated, user_agent, self._header_values(doc),
+        )
+        if jndi and r"\$\{jndi:" not in matched_hints:
+            # The hint list greps for a literal `${jndi:`; an obfuscated
+            # payload never matches it, so record substance explicitly.
+            matched_hints.append(r"\$\{jndi:")
         if matched_hints:
             event.meta["matched_hints"] = matched_hints
 
@@ -280,12 +402,29 @@ class H0neytr4pParser(BaseParser):
                     if host_str not in session.domains:
                         session.domains.append(host_str)
 
+            # Recovered Log4Shell C2 endpoints. Promoted to the same
+            # session.urls / session.domains the builder already consumes,
+            # so the C2 lands in OpenCTI through the existing web-session
+            # graph rather than a bespoke path. The URL is emitted even
+            # when the host is None (authority still carries an
+            # unresolved `${sys:...}` exfil template) — the URL is the
+            # IoC; the Domain-Name is only minted for a real FQDN.
+            for payload in meta.get("jndi_payloads") or []:
+                url = payload.get("url")
+                if url and url not in session.urls:
+                    session.urls.append(url)
+                host = payload.get("host")
+                if host and host not in session.domains:
+                    session.domains.append(host)
+
         # Mirror first-event meta onto session.meta for STIX builder use.
         if events:
             first_meta = events[0].meta
             for k in (
                 "method", "uri", "body", "body_length", "body_truncated",
-                "user_agent", "host_header", "matched_hints",
+                "user_agent", "host_header", "matched_hints", "status",
+                "jndi_payloads", "src_ip_invalid", "src_ip_raw",
+                "src_ip_from_xff",
             ):
                 if k in first_meta:
                     session.meta.setdefault(k, first_meta[k])
@@ -294,7 +433,9 @@ class H0neytr4pParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _scan_hints(uri: str, body: str, user_agent: str) -> list[str]:
+    def _scan_hints(
+        uri: str, body: str, user_agent: str, headers: str = "",
+    ) -> list[str]:
         """Return the list of regex-pattern strings that matched.
 
         We return the pattern string (``regex.pattern``) rather than the
@@ -302,7 +443,7 @@ class H0neytr4pParser(BaseParser):
         surface in the Note body.
         """
         hits: list[str] = []
-        haystack = f"{uri}\n{body}"
+        haystack = f"{uri}\n{body}\n{headers}"
         for pat in _WEB_EXPLOIT_HINTS:
             if pat.search(haystack):
                 if pat.pattern not in hits:
@@ -312,6 +453,100 @@ class H0neytr4pParser(BaseParser):
                 if pat.pattern not in hits:
                     hits.append(pat.pattern)
         return hits
+
+    @classmethod
+    def _normalize_src_ip(cls, raw: str) -> Optional[str]:
+        """Reduce an XFF-shaped value to its first-hop address, or None.
+
+        Handles the forms XFF actually arrives in — ``client, proxy1``,
+        quoted values, ``[::1]``, and a trailing ``:port`` — and returns
+        None for anything that still isn't an address (the Log4Shell
+        payload case). Returns the input unchanged when it is already a
+        bare address, so the common path costs one parse.
+        """
+        if cls._is_ip(raw):
+            return raw
+        # First hop only; the rest of the chain is intermediary proxies.
+        candidate = raw.split(",", 1)[0].strip().strip('"\'')
+        if cls._is_ip(candidate):
+            return candidate
+        # `[2001:db8::1]:443` / `[2001:db8::1]`
+        if candidate.startswith("["):
+            inner = candidate[1:].split("]", 1)[0]
+            if cls._is_ip(inner):
+                return inner
+        # `1.2.3.4:5678` — only strip a port when exactly one colon is
+        # present, so a bare IPv6 address is never mangled.
+        if candidate.count(":") == 1:
+            head = candidate.split(":", 1)[0]
+            if cls._is_ip(head):
+                return head
+        return None
+
+    @staticmethod
+    def _is_ip(value: str) -> bool:
+        """True when ``value`` parses as an IPv4/IPv6 address.
+
+        Mirrors ``stix_ids.canonical_ip``'s accept set; kept local so the
+        parser layer stays free of STIX imports.
+        """
+        try:
+            ipaddress.ip_address(value.strip())
+        except (ValueError, AttributeError):
+            return False
+        return True
+
+    @staticmethod
+    def _header_values(doc: dict) -> str:
+        """Newline-joined request-header values, for hint scanning.
+
+        The legacy schema breaks headers out as ``header_<name>``; the
+        modern one folds a fixed few into ``http_*`` fields and drops the
+        rest. Reading both keeps the hint scan working on either.
+        """
+        return "\n".join(
+            str(v) for k, v in doc.items()
+            if (k.startswith("header_") or k.startswith("http_"))
+            and isinstance(v, (str, int, float))
+        )
+
+    @classmethod
+    def _extract_jndi(cls, doc: dict) -> tuple[list, bool]:
+        """Recover distinct JNDI endpoints from the whole document.
+
+        Returns ``(payloads, truncated)``.
+
+        Scans **every top-level string value** rather than an allowlist of
+        field names. A Log4Shell probe sprays whatever fields it can
+        reach, and the two live schemas expose those fields under
+        different names — the legacy one as ``header_*``, the modern one
+        as ``http_referer`` / ``http_host`` / ``sni`` and friends. An
+        allowlist silently missed every modern-schema header, which is
+        ~99.6% of live traffic: a Referer-borne payload was recovered on
+        one sensor and invisible on all the others. Nothing the honeypot
+        itself writes contains ``${jndi:``, so scanning broadly is safe,
+        and the ``"${" not in value`` pre-check keeps it cheap.
+
+        Deduped by recovered URL, so one payload sprayed across a dozen
+        headers yields one endpoint.
+        """
+        seen: set[str] = set()
+        out: list = []
+        for value in doc.values():
+            if not isinstance(value, str) or "${" not in value:
+                continue
+            for payload in extract_jndi(value):
+                if payload.url in seen:
+                    continue
+                seen.add(payload.url)
+                out.append(payload)
+        # Truncate AFTER collecting, so the flag means "we actually
+        # dropped something" rather than "we happened to hit the cap
+        # exactly". Candidate count is bounded by the document's field
+        # count, so collecting first is safe.
+        if len(out) > _MAX_JNDI_PER_EVENT:
+            return out[:_MAX_JNDI_PER_EVENT], True
+        return out, False
 
     @staticmethod
     def _safe_int(value) -> Optional[int]:
