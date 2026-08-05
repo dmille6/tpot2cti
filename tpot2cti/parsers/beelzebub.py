@@ -10,9 +10,14 @@ from typing import Iterable, Optional
 
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
-from tpot2cti.session import correlate_by_session_id
+from tpot2cti.session import correlate_by_session_id, correlate_by_window
 
 logger = logging.getLogger(__name__)
+
+#: Rolling window for grouping one attacker's activity burst against one
+#: sensor. Matches the Mailoney fallback window and the V0 importer's
+#: max_gap_seconds default.
+_SESSION_WINDOW_SECONDS: int = 300
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +114,43 @@ class BeelzebubParser(BaseParser):
         return event
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — group by (session_id, sensor, src_ip)
+    # correlate() — group by (src_ip, sensor) within a time window
     # ──────────────────────────────────────────────────────────────────
 
     def correlate(self, events: Iterable[ParsedEvent]) -> list[AttackSession]:
-        return correlate_by_session_id(events, aggregator=self._aggregate_session)
+        """Group by (src_ip, sensor) within a window — NOT by session id.
+
+        Beelzebub's "SSH Inline" mode mints a fresh session UUID for EVERY
+        command, so its `session` field does not identify a session at all.
+        Measured on the live hive, one day of Beelzebub:
+
+            124,198 docs / 65,523 distinct sessions / 187 source IPs
+            = 1.90 docs per "session", 350 "sessions" per IP
+
+        Cowrie, which emits real session ids, averages 11.2 commands per
+        session. Correlating Beelzebub by session id therefore shattered
+        3,743,838 command events across 35 days into ~4M one-command
+        fragments — every Beelzebub AttackSession reaching the builder held
+        a single command, so multi-command transcripts, command ORDER, and
+        any per-session substance signal were structurally unavailable.
+
+        That matters more than it sounds: Beelzebub carries 55x more
+        attacker command volume than Cowrie (3,743,838 vs 68,362 events),
+        and its actor population is different — GPU/mining capacity
+        surveys, Solana-validator credential attacks, and hands-on VPS
+        resale profiling that never appears in Cowrie. All of it was
+        arriving as unrelated singletons.
+
+        `correlate_by_window` groups on (src_ip, sensor) with a rolling
+        window, which is the honest unit here: one attacker's burst of
+        activity against one sensor. The session id is retained on each
+        event's meta for anyone who wants the raw grouping.
+        """
+        return correlate_by_window(
+            events,
+            window_seconds=_SESSION_WINDOW_SECONDS,
+            aggregator=self._aggregate_session,
+        )
 
     def _aggregate_session(
         self, session: AttackSession, events: list[ParsedEvent]

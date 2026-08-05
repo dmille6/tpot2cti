@@ -116,7 +116,7 @@ def test_beelzebub_smoke():
         spray_docs.append({
             **base,
             "@timestamp": (now + timedelta(seconds=i)).isoformat(),
-            "session": f"spray-{i}",  # different sessions per attempt
+            "session": f"spray-{i}",  # Beelzebub mints a fresh id per attempt
             "message": "New SSH attempt",
             "username": u,
             "password": p,
@@ -125,9 +125,23 @@ def test_beelzebub_smoke():
     spray_events = [parser.parse(d) for d in spray_docs]
     spray_events = [e for e in spray_events if e is not None]
     spray_sessions = parser.correlate(spray_events)
-    # Different session IDs → 4 sessions; each has 1 event + 1 cred,
-    # so each is substantive on the credentials_tried branch.
-    assert len(spray_sessions) == 4
-    print(f"spray:       sessions={len(spray_sessions)} all_substantive=True")
+    # ONE session, not four. This assertion used to require four and so
+    # locked in the fragmentation: Beelzebub's "SSH Inline" mode mints a
+    # fresh session UUID per attempt, so correlating on it split a single
+    # credential spray into four unrelated one-attempt sessions. Measured
+    # live: 124,198 docs / 65,523 "sessions" / 187 source IPs = 1.90 docs
+    # per session, 350 sessions per IP.
+    #
+    # Merging is also what makes the spray legible — four credentials tried
+    # by one attacker in four seconds is the intelligence; four sessions of
+    # one credential each is not.
+    assert len(spray_sessions) == 1, (
+        "a credential spray from one IP is still being split into "
+        "one-attempt fragments"
+    )
+    sprayed = spray_sessions[0].credentials_tried
+    assert len(sprayed) == 4, f"credential pairs were lost: {sprayed}"
+    assert ("oracle", "oracle") in sprayed
+    print(f"spray:       sessions={len(spray_sessions)} creds={len(sprayed)}")
 
     print("OK")
