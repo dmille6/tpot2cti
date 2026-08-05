@@ -88,9 +88,9 @@ def test_conpot_smoke():
     # These land on `protocol_requests`, NOT `commands`. This assertion used to
     # require the opposite and so locked in the defect: a request ConPot
     # RECEIVED was recorded as a command someone RAN, which gave every ConPot
-    # probe +25 score, prose reading "ran N shell command(s)", a Process SDO,
-    # and — worst — an escape from `_is_bare_scan()`, the gate that exists to
-    # keep drive-by probes at observable-only.
+    # probe +25 score (75 vs a true 50), prose reading "ran N shell
+    # command(s)", a Process SDO whose command_line was an HTTP request,
+    # T1059, and URL/Domain observables harvested from the request line.
     assert len(sessions[0].protocol_requests) == 1, "modbus request blob missing"
     assert len(sessions[1].protocol_requests) == 0, "s7 blob should be empty"
     assert len(sessions[2].protocol_requests) == 1, "ipmi request blob missing"

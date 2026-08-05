@@ -113,11 +113,18 @@ class AttackSession:
     #: DELIBERATELY separate from `commands`: a request is something the
     #: attacker SENT, a command is something they RAN. ConPot used to append
     #: request blobs to `commands` purely to reuse Note rendering, and every
-    #: downstream consumer then believed them: +25 score, prose reading "ran N
-    #: shell command(s)", indicator text "N command(s) executed", Process SDOs,
-    #: URL harvesting, and — worst — escaping `_is_bare_scan()`, the gate whose
-    #: entire job is keeping drive-by probes at observable-only. The field name
-    #: was the assertion.
+    #: downstream consumer then believed them: +25 score (75 vs a true 50),
+    #: prose reading "ran N shell command(s)" with the raw blob pasted in as
+    #: the example, indicator text "N command(s) executed", a Process SDO
+    #: whose command_line was an HTTP request, T1059 Command and Scripting
+    #: Interpreter, and URL/Domain observables harvested out of the request
+    #: line. The field name was the assertion.
+    #:
+    #: NOT a bare-scan escape, despite what the original commit claimed:
+    #: `_is_bare_scan()` is only consulted for parsers dispatching to
+    #: build_driveby_session/build_fallback_event/None (main.py), and ConPot
+    #: dispatches to build_conpot_session, so the gate has never run on a
+    #: ConPot session either way.
     protocol_requests: list[str] = field(default_factory=list)
     malware_hashes: list[str] = field(default_factory=list)  # sha256s
     urls: list[str] = field(default_factory=list)
