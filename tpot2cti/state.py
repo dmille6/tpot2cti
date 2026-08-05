@@ -731,7 +731,12 @@ class CycleState:
         # 30 such rows — obfuscated Log4Shell payloads that h0neytr4p
         # reported as client addresses — accumulated here before the gate
         # existed. Canonicalize too, so 1.2.3.4 and ::ffff:1.2.3.4 don't
-        # split one attacker across two rows.
+        # split one attacker across two rows GOING FORWARD. This does not
+        # migrate rows already written in a non-canonical form: they are
+        # valid addresses, so prune_malformed leaves them, and merging
+        # would mean summing counters and unioning sample sets. Measured
+        # on the live DB 2026-08-04: zero such rows, so there is nothing
+        # to migrate. Revisit only if that count stops being zero.
         canon = canonical_ip(str(src_ip))
         if canon is None:
             logger.debug(

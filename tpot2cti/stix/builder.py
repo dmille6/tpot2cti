@@ -2530,18 +2530,23 @@ class STIXBuilder:
         # Payloads whose host is entirely templated have no zone to group
         # on and fall back to their URL as the key.
         groups: dict[str, dict] = {}
-        for ev in events:
+        for i, ev in enumerate(events):
             for payload in (ev.meta.get("jndi_payloads") or []):
                 url = payload.get("url")
                 if not url:
                     continue
                 key = payload.get("host") or url
-                g = groups.setdefault(key, {"events": [], "urls": {}})
-                g["events"].append(ev)
+                g = groups.setdefault(key, {"events": {}, "urls": {}})
+                # Keyed by event index, NOT appended: one request carrying
+                # 12 header variants of the same zone is ONE observation.
+                # A plain append counted that request twelve times and
+                # inflated both the Sighting count and the Note's request
+                # tally — 7x on the live sample (243 vs the true 33).
+                g["events"][i] = ev
                 g["urls"].setdefault(url, payload)
 
         for key in sorted(groups):
-            group = sorted(groups[key]["events"], key=lambda e: e.timestamp)
+            group = sorted(groups[key]["events"].values(), key=lambda e: e.timestamp)
             urls = groups[key]["urls"]
             first, last = group[0], group[-1]
             # The representative payload — its `host`/`decoded`/`raw` are
@@ -2556,6 +2561,15 @@ class STIXBuilder:
             session = AttackSession.from_event(first)
             session.src_ip = _UNATTRIBUTED_SRC
             session.last_seen = last.timestamp
+            # The group key MUST be part of session_id. Sighting and Note
+            # ids are both derived from it, and one request can carry
+            # payloads for several C2 zones — every such group shares the
+            # same `first` event, so without this the ids collide and
+            # _dedup silently drops the second zone's Sighting and Note,
+            # leaving a naked URL+Domain with no sensor anchor. Same
+            # collision hits any payload whose host is fully literal,
+            # where grouping degenerates to one group per URL.
+            session.session_id = f"{session.session_id}:{key}"
 
             out.extend(self.build_sensor_context(first.sensor_hostname))
 
@@ -2583,18 +2597,36 @@ class STIXBuilder:
                     f"variants (capped)"
                 )
 
+            # Every edge below anchors on a DETERMINISTIC id rather than on
+            # the builder's return value. `_dedup` returns None for an
+            # object already emitted in this bundle — which happens from
+            # the second C2 group onward, and from the first if a normal
+            # web session emitted the same CVE/technique earlier in the
+            # cycle (the scanner sprays the whole hive, so that is the
+            # common case, not the corner case). Gating the relationship
+            # on the object would drop the edge for evidence we really
+            # observed; the id is valid whether or not the SDO was
+            # re-emitted.
             if host := payload.get("host"):
+                # build_domain returns None for BOTH "already emitted"
+                # and "malformed". Only the first is safe to reference —
+                # an edge to a malformed domain that was never built (and
+                # never will be) is a dangling ref. _emitted_ids tells the
+                # two cases apart.
                 d = self.build_domain(host, session=session)
+                domain_id = generate_domain_id(host)
                 if d:
                     out.append(d)
-                    if rel := self.build_relationship(
-                        url_id, "resolves-to", d["id"],
+                if (d or domain_id in self._emitted_ids) and (
+                    rel := self.build_relationship(
+                        url_id, "resolves-to", domain_id,
                         description=f"C2 endpoint {url[:120]} resolves to {host}",
-                    ):
-                        out.append(rel)
+                    )
+                ):
+                    out.append(rel)
 
             if cve := first.meta.get("matched_cve"):
-                v = self.build_vulnerability(
+                if v := self.build_vulnerability(
                     cve,
                     description=(
                         f"Exploitation attempt observed via "
@@ -2604,28 +2636,25 @@ class STIXBuilder:
                         f"attacker-controlled X-Forwarded-For header as "
                         f"the client address."
                     ),
-                )
-                if v and (rel := self.build_relationship(
-                    url_id, "related-to", v["id"],
+                ):
+                    out.append(v)
+                if rel := self.build_relationship(
+                    url_id, "related-to", generate_vulnerability_id(cve),
                     description=f"C2 endpoint delivered in a {cve} payload",
-                )):
-                    out.append(v)
+                ):
                     out.append(rel)
-                elif v:
-                    out.append(v)
 
             if attack_type := first.meta.get("attack_type"):
-                ap = self.build_attack_pattern(
+                if ap := self.build_attack_pattern(
                     attack_type, first.meta.get("mitre_technique"),
                     session=session,
-                )
-                if ap:
+                ):
                     out.append(ap)
-                    if rel := self.build_relationship(
-                        url_id, "related-to", ap["id"],
-                        description=f"C2 endpoint used by {attack_type}",
-                    ):
-                        out.append(rel)
+                if rel := self.build_relationship(
+                    url_id, "related-to", generate_attack_pattern_id(attack_type),
+                    description=f"C2 endpoint used by {attack_type}",
+                ):
+                    out.append(rel)
 
             if sighting := self.build_sighting(
                 url_id, first.sensor_hostname, session,

