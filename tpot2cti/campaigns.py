@@ -2,10 +2,26 @@
 
 A single scanning IP is a data point; the *same concrete artifact* turning up
 from many IPs is intelligence. When two or more distinct attacker IPs deliver
-the same malware, plant the same SSH key, or present the same client
-fingerprint (HASSH / JA3), they're almost certainly the same actor or toolkit.
-This module rolls those into a first-class STIX **Campaign** node so OpenCTI
-shows one coordinated operation instead of N disconnected indicators.
+the same malware or plant the same SSH key, that shared object is something
+an actor had to put there. This module rolls those into a first-class STIX
+**Campaign** node so OpenCTI shows one operation instead of N disconnected
+indicators.
+
+**HASSH and JA3 are deliberately NOT campaign artifacts** (removed
+2026-08-05). They identify the SSH/TLS library the client was built against,
+which groups SOFTWARE, not actors. Measured live: 217 of 243 generated
+campaigns clustered on one, and for 136 of the 157 JA3 campaigns the hive
+held more distinct IPs carrying that fingerprint than the campaign claimed —
+median 4.5x, worst 117x. The fingerprints are still emitted as
+Cryptographic-Key observables with `related-to` edges to every IP that
+presented them, which says "these hosts run the same tooling" rather than
+"these hosts are one actor".
+
+KNOWN REMAINING WEAKNESS: MIN_CAMPAIGN_MEMBERS = 2 is still low for the
+artifact types that survive. A shared malware hash can be commodity reuse,
+and the `mdrfckr` planted SSH key is the most copy-pasted persistence
+one-liner on the internet — it was claimed as a single 485-IP campaign. The
+threshold and a popularity guard for planted keys are unresolved.
 
 Why this needs state (cf. attacker_profile.py):
   The second IP sharing an artifact almost always arrives in a LATER cycle than
@@ -78,25 +94,6 @@ _CAMPAIGN_DEFS: dict[str, dict] = {
             "botnet maintaining cross-host persistence."
         ),
     },
-    "hassh": {
-        "name": "Shared SSH client fingerprint — {display}",
-        "objective": "Common SSH client tooling across distributed sources",
-        "labels": ["shared-ioc", "shared-fingerprint", "hassh"],
-        "describe": (
-            "{n} distinct source IPs presented the identical SSH client "
-            "fingerprint (HASSH {value}) — the same automation / tool driving "
-            "the connections."
-        ),
-    },
-    "ja3": {
-        "name": "Shared TLS client fingerprint — {display}",
-        "objective": "Common TLS client tooling across distributed sources",
-        "labels": ["shared-ioc", "shared-fingerprint", "ja3"],
-        "describe": (
-            "{n} distinct source IPs presented the identical TLS client "
-            "fingerprint (JA3 {value}) — the same client toolkit."
-        ),
-    },
 }
 
 
@@ -131,22 +128,26 @@ def extract_artifacts(session: AttackSession) -> list[dict]:
             "display": f"SSH fp {fp[:12]}…",
         })
 
-    # HASSH / JA3 use the raw value verbatim — it must match the seed the
-    # builder feeds generate_cryptographic_key_id() so the edge resolves.
-    if session.hassh:
-        h = session.hassh.strip()
-        if h:
-            out.append({
-                "type": "hassh", "value": h, "key": f"hassh:{h}",
-                "display": f"HASSH {h[:12]}…",
-            })
-    if session.ja3:
-        j = session.ja3.strip()
-        if j:
-            out.append({
-                "type": "ja3", "value": j, "key": f"ja3:{j}",
-                "display": f"JA3 {j[:12]}…",
-            })
+    # HASSH and JA3 are DELIBERATELY NOT campaign artifacts.
+    #
+    # A Campaign asserts coordinated activity by an actor. A HASSH or JA3
+    # fingerprint identifies the SSH/TLS library the client was built
+    # against — it groups software, not actors. Measured on the live corpus
+    # 2026-08-05: 217 of 243 generated campaigns clustered on one of these,
+    # and the grouping was demonstrably arbitrary. One campaign asserted
+    # "4 distinct source IPs presented the identical TLS client fingerprint
+    # — the same client toolkit" for a JA3 that 468 distinct IPs carried.
+    # The three largest HASSH campaigns were stock library defaults:
+    # libssh 0.9.x (999 IPs claimed, 1,406 in the hive), a scanner offering
+    # every algorithm ever defined (899 claimed), and stock OpenSSH 9.x.
+    #
+    # Deleting those campaigns would not have helped — they regenerate from
+    # here. The defect is the SDO choice, not the data.
+    #
+    # The fingerprints themselves remain valuable and are still emitted as
+    # Cryptographic-Key observables with `related-to` edges to every IP that
+    # presented them (stix/builder.py), which is the honest shape: "these
+    # hosts run the same tooling" rather than "these hosts are one actor".
     return out
 
 

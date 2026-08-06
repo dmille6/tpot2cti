@@ -57,10 +57,17 @@ def test_extract_artifacts_all_types(now_utc):
         planted=[{"fingerprint": "fp" * 20}],
     )
     arts = {a["type"]: a for a in campaigns.extract_artifacts(s)}
-    assert set(arts) == {"malware", "hassh", "ja3", "ssh-key"}
+    # HASSH and JA3 are deliberately absent. They identify the SSH/TLS
+    # LIBRARY the client was built against, not an actor — measured on the
+    # live corpus, 217 of 243 generated campaigns clustered on one of them,
+    # including a JA3 asserted to link 4 IPs that 468 IPs actually carried.
+    # This assertion used to require them and so locked in the wrong SDO.
+    assert set(arts) == {"malware", "ssh-key"}
+    assert "hassh" not in arts and "ja3" not in arts, (
+        "a tooling fingerprint is being materialised as a Campaign again"
+    )
     assert arts["malware"]["value"] == _SHA  # lowercased
     assert arts["malware"]["key"] == f"malware:{_SHA}"
-    assert arts["hassh"]["key"] == "hassh:hasshvalue123"
 
 
 def test_extract_skips_garbage_hash_and_no_ip(now_utc):
@@ -121,9 +128,12 @@ def test_two_ips_sharing_malware_materialise_campaign(state_db, cfg, now_utc):
 
 
 def test_third_ip_adds_one_edge_no_duplicate(state_db, cfg, now_utc):
-    key = f"hassh:toolX"
-    a = _session("10.0.0.1", now_utc, hassh="toolX")
-    b = _session("10.0.0.2", now_utc + timedelta(minutes=5), hassh="toolX")
+    # Uses a shared malware hash, not a HASSH — this test is about the
+    # incremental-edge mechanism, and tooling fingerprints are no longer
+    # campaign artifacts (they group a library, not an actor).
+    key = f"malware:{_SHA}"
+    a = _session("10.0.0.1", now_utc, malware=[_SHA])
+    b = _session("10.0.0.2", now_utc + timedelta(minutes=5), malware=[_SHA])
     campaigns.record_session_artifacts(state_db, a)
     campaigns.record_session_artifacts(state_db, b)
     # first materialisation: 2 indicates edges
@@ -135,21 +145,35 @@ def test_third_ip_adds_one_edge_no_duplicate(state_db, cfg, now_utc):
     assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) == []
 
     # cycle 3: a third IP shares it → exactly ONE new indicates edge
-    c = _session("10.0.0.3", now_utc + timedelta(minutes=40), hassh="toolX")
+    c = _session("10.0.0.3", now_utc + timedelta(minutes=40), malware=[_SHA])
     keys3 = campaigns.record_session_artifacts(state_db, c)
     third = campaigns.emit_campaigns(state_db, _fresh_builder(cfg), keys3)
     ind3 = [o for o in third if o.get("relationship_type") == "indicates"]
     assert len(ind3) == 1
     assert ind3[0]["source_ref"] == generate_ip_indicator_id("10.0.0.3")
-    # the related-to target is the crypto-key SCO for the hassh
+    # the related-to target is the File SCO for the shared malware hash
     related = [o for o in third if o.get("relationship_type") == "related-to"]
-    assert related[0]["target_ref"] == generate_cryptographic_key_id("toolX")
+    assert related[0]["target_ref"] == generate_file_id(_SHA)
 
 
 def test_same_ip_twice_is_not_two_members(state_db, cfg, now_utc):
     """The same IP re-presenting an artifact must NOT cross the threshold."""
-    key = f"ja3:fpZ"
-    campaigns.record_session_artifacts(state_db, _session("9.9.9.9", now_utc, ja3="fpZ"))
+    # Uses a malware hash: a JA3 here would make this test VACUOUS, because
+    # ja3 is no longer collected as an artifact, so emit_campaigns would
+    # return [] without ever exercising same-IP de-duping.
+    key = f"malware:{_SHA}"
     campaigns.record_session_artifacts(
-        state_db, _session("9.9.9.9", now_utc + timedelta(minutes=10), ja3="fpZ"))
+        state_db, _session("9.9.9.9", now_utc, malware=[_SHA]))
+    campaigns.record_session_artifacts(
+        state_db, _session("9.9.9.9", now_utc + timedelta(minutes=10),
+                           malware=[_SHA]))
+    # Positive control: the rows ARE being recorded, so [] below means
+    # "one IP is not two members", not "nothing was stored".
     assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) == []
+    campaigns.record_session_artifacts(
+        state_db, _session("9.9.9.8", now_utc + timedelta(minutes=20),
+                           malware=[_SHA]))
+    assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) != [], (
+        "a SECOND distinct IP should cross the threshold — if this is empty "
+        "the test above passed for the wrong reason"
+    )
