@@ -93,7 +93,17 @@ ask_yes_no() {
     local hint
     if [[ "$default" == "y" ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
     local answer
-    read -r -p "$prompt $hint " answer
+    # `read` returns non-zero on EOF (closed/exhausted stdin). That MUST NOT
+    # fall through to the default: a "y"-defaulted prompt inside a `while`
+    # then loops forever. It did — a piped install exhausted its answers and
+    # spun the sensor-enrollment loop 88,404 times, writing a 16MB log,
+    # before it was killed. EOF means "no operator is here", so the safe
+    # answer is no, whatever the default is.
+    if ! read -r -p "$prompt $hint " answer; then
+        echo "" >&2
+        warn "No input available (EOF) — answering 'no' to: $prompt"
+        return 1
+    fi
     answer="${answer:-$default}"
     case "${answer,,}" in
         y|yes) return 0 ;;
@@ -106,11 +116,21 @@ ask_with_default() {
     local prompt="$1"
     local default="$2"
     local var
+    # Same EOF rule as ask_yes_no: taking the default on EOF is how an
+    # unattended run silently ends up with a config nobody chose. A default
+    # is still applied for an EMPTY answer from a real operator (they saw the
+    # prompt and pressed Enter) — but not for "there is no operator".
     if [[ -n "$default" ]]; then
-        read -r -p "$prompt [$default] " var
+        if ! read -r -p "$prompt [$default] " var; then
+            echo "" >&2
+            fail "No input available (EOF) while prompting: $prompt"
+        fi
         echo "${var:-$default}"
     else
-        read -r -p "$prompt " var
+        if ! read -r -p "$prompt " var; then
+            echo "" >&2
+            fail "No input available (EOF) while prompting: $prompt"
+        fi
         echo "$var"
     fi
 }
@@ -910,11 +930,26 @@ enroll_sensors() {
   from then on it pulls via key auth (no password stored).
 TXT
 
+    # Bounded. The EOF fix above is the root-cause fix; this is the backstop,
+    # because an unbounded `while` around an interactive prompt is a
+    # spin-forever waiting to happen and enrollment is genuinely optional —
+    # the warn below already tells the operator how to finish it later.
+    local -i enrolled=0 attempts=0
+    local -ir MAX_ENROLL_ATTEMPTS=20
     while ask_yes_no "Enroll a sensor now?" "y"; do
-        if ! "$helper"; then
+        attempts+=1
+        if "$helper"; then
+            enrolled+=1
+        else
             warn "Enrollment did not complete; re-run later: ./scripts/enroll-sensor.sh"
         fi
+        if (( attempts >= MAX_ENROLL_ATTEMPTS )); then
+            warn "Stopping after ${MAX_ENROLL_ATTEMPTS} enrollment attempts."
+            warn "Add the rest with: ./scripts/enroll-sensor.sh"
+            break
+        fi
     done
+    info "Sensors enrolled this run: ${enrolled}"
     info "Add more sensors anytime:  ./scripts/enroll-sensor.sh"
     info "List / remove:             ./scripts/enroll-sensor.sh --list | --remove NAME"
 }
