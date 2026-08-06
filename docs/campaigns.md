@@ -4,10 +4,9 @@
 
 A single scanning IP is a data point. The **same concrete artifact** turning up
 from many IPs is intelligence. When ≥2 distinct attacker IPs deliver the same
-malware, plant the same SSH key, or present the same client fingerprint, they're
-almost certainly the same actor or toolkit — so we roll them into one STIX
-**Campaign** node. In OpenCTI you then see one coordinated operation instead of
-N disconnected indicators.
+malware or plant the same SSH key, that shared object is something an actor had
+to put there — so we roll them into one STIX **Campaign** node. In OpenCTI you
+then see one operation instead of N disconnected indicators.
 
 ## Grouping basis — shared concrete IoC only
 
@@ -20,8 +19,55 @@ behavioural buckets like "everyone scanning cPanel" — that's too loose
 |---|---|---|---|
 | Dropped malware | `session.malware_hashes` (sha256) | `malware:<sha256>` | File |
 | Planted SSH key | `session.planted_ssh_keys[].fingerprint` | `sshkey:<fp>` | Cryptographic-Key |
-| SSH client fingerprint | `session.hassh` | `hassh:<hash>` | Cryptographic-Key |
-| TLS client fingerprint | `session.ja3` | `ja3:<hash>` | Cryptographic-Key |
+
+### Removed 2026-08-05: HASSH and JA3 are NOT campaign artifacts
+
+A Campaign asserts coordinated activity by an **actor**. A HASSH or JA3
+fingerprint identifies the SSH/TLS **library the client was built against** — it
+groups software, not actors.
+
+Measured on the live corpus: **217 of 243** generated campaigns clustered on one
+of these. For **136 of the 157** JA3 campaigns the hive held *more* distinct IPs
+carrying that fingerprint than the campaign claimed — median **4.5×**, worst
+**117×**. One campaign asserted *"4 distinct source IPs presented the identical
+TLS client fingerprint — the same client toolkit"* for a JA3 that **468** IPs
+carried. The three largest HASSH campaigns were stock library defaults: libssh
+0.9.x (999 IPs claimed, 1,406 in the hive), a scanner advertising every
+algorithm ever defined, and stock OpenSSH 9.x.
+
+Deleting those campaigns would not have helped — they regenerate from
+`extract_artifacts()`. The defect was the SDO choice, not the data.
+
+The fingerprints remain valuable and are still emitted as **Cryptographic-Key**
+observables with `related-to` edges to the IPs that presented them, which says
+*"these hosts run the same tooling"* rather than *"these hosts are one actor"*.
+
+> **Known gap:** within a single cycle `_dedup` returns `None` for an SCO
+> already emitted in that bundle, and the edge is nested inside `if ck:` — so k
+> IPs sharing a fingerprint in one cycle currently produce **1** edge, not k.
+> Edges accrue across cycles as IPs recur. Tracked separately.
+
+### Known unresolved: the threshold is the wrong knob
+
+`MIN_CAMPAIGN_MEMBERS = 2` remains, and raising it would be a mistake. The live
+distribution of surviving campaigns is:
+
+```
+sha256:  {2:8, 3:12, 4:1, 9:1, 252:1, 485:1}
+sshkey:  {4:1, 485:1}
+```
+
+Raising the floor to 3 would delete the eight two-IP malware pairs — the *most*
+defensible entries, since a SHA-256 identifies an exact build — while leaving
+the 485-IP claim untouched. The problem is artifact **popularity**, not small n:
+the `mdrfckr` planted SSH key is the most copy-pasted persistence one-liner on
+the internet, and its campaign asserts *"the same actor or botnet maintaining
+cross-host persistence"* across 485 IPs — a stronger claim than the JA3 sentence
+removed above, on a larger population.
+
+The right lever is a popularity guard: compare a campaign's member count against
+the hive-wide distinct-IP count for that artifact, and suppress or soften when
+the campaign covers only a small fraction of it.
 
 ## Why it needs cross-cycle state
 
