@@ -17,7 +17,27 @@ Cryptographic-Key observables with `related-to` edges to every IP that
 presented them, which says "these hosts run the same tooling" rather than
 "these hosts are one actor".
 
-KNOWN REMAINING WEAKNESS: MIN_CAMPAIGN_MEMBERS = 2 is still low for the
+KNOWN REMAINING WEAKNESS: MIN_CAMPAIGN_MEMBERS = 2
+
+#: Upper bound. An artifact shared by MORE than this many distinct IPs is
+#: commodity, not coordination — and a Campaign asserting one actor over it is
+#: the same false claim that HASSH/JA3 grouping made, one level down.
+#:
+#: Calibrated against the live corpus 2026-08-05, not guessed. Across 409
+#: artifacts shared by >=2 IPs: median 5, p90 46, max 1009. Setting the cut at
+#: 50 sits just past the ninetieth percentile — it catches the commodity tail
+#: while leaving nine in ten artifacts untouched. The artifacts it removes are
+#: exactly the known-bad ones: the `mdrfckr` planted SSH key and its
+#: authorized_keys file (489 IPs each — the same artifact counted twice), and
+#: the SHA-256 of a single newline (254 IPs, produced by
+#: `echo > /etc/hosts.deny`). A cut at 100 would still admit a 60-90 member
+#: grouping that nothing distinguishes from commodity reuse.
+#:
+#: The FLOOR stays at 2 deliberately. The median is 5 and the smallest malware
+#: pairs are the most defensible entries — a SHA-256 identifies an exact build.
+#: Raising the floor would delete good intelligence to fix a problem at the
+#: opposite end of the distribution.
+MAX_CAMPAIGN_MEMBERS = 50 is still low for the
 artifact types that survive. A shared malware hash can be commodity reuse,
 and the `mdrfckr` planted SSH key is the most copy-pasted persistence
 one-liner on the internet — it was claimed as a single 485-IP campaign. The
@@ -68,6 +88,26 @@ logger = logging.getLogger(__name__)
 #: concrete artifact. Two is the floor for "coordinated" — a single IP with a
 #: unique malware drop is just one drop, not a campaign.
 MIN_CAMPAIGN_MEMBERS = 2
+
+#: Upper bound. An artifact shared by MORE than this many distinct IPs is
+#: commodity, not coordination — and a Campaign asserting one actor over it is
+#: the same false claim that HASSH/JA3 grouping made, one level down.
+#:
+#: Calibrated against the live corpus 2026-08-05, not guessed. Across 409
+#: artifacts shared by >=2 IPs: median 5, p90 46, max 1009. Setting the cut at
+#: 50 sits just past the ninetieth percentile — it catches the commodity tail
+#: while leaving nine in ten artifacts untouched. The artifacts it removes are
+#: exactly the known-bad ones: the `mdrfckr` planted SSH key and its
+#: authorized_keys file (489 IPs each — the same artifact counted twice), and
+#: the SHA-256 of a single newline (254 IPs, produced by
+#: `echo > /etc/hosts.deny`). A cut at 100 would still admit a 60-90 member
+#: grouping that nothing distinguishes from commodity reuse.
+#:
+#: The FLOOR stays at 2 deliberately. The median is 5 and the smallest malware
+#: pairs are the most defensible entries — a SHA-256 identifies an exact build.
+#: Raising the floor would delete good intelligence to fix a problem at the
+#: opposite end of the distribution.
+MAX_CAMPAIGN_MEMBERS = 50
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -206,6 +246,7 @@ def emit_campaigns(
     re-emitting every member every cycle.
     """
     out: list[dict] = []
+    suppressed: list[tuple] = []
     for key in sorted(set(cycle_keys)):
         try:
             rows = state.get_campaign_artifact_rows(key)
@@ -215,6 +256,12 @@ def emit_campaigns(
         if not rows:
             continue
         distinct_ips = {r["src_ip"] for r in rows}
+        if len(distinct_ips) > MAX_CAMPAIGN_MEMBERS:
+            # Commodity, not a campaign. Counted and logged rather than
+            # silently skipped: a suppression nobody reports is
+            # indistinguishable from an extractor that found nothing.
+            suppressed.append((key, len(distinct_ips)))
+            continue
         if len(distinct_ips) < MIN_CAMPAIGN_MEMBERS:
             continue
         pending = [r for r in rows if not r["emitted"]]
@@ -273,5 +320,13 @@ def emit_campaigns(
         logger.info(
             f"campaign materialised: {key} — {len(distinct_ips)} IP(s), "
             f"+{len(pending)} new edge(s)"
+        )
+    if suppressed:
+        logger.info(
+            "campaigns: suppressed %d commodity artifact(s) over the %d-IP "
+            "ceiling (shared too widely to attribute to one actor): %s",
+            len(suppressed), MAX_CAMPAIGN_MEMBERS,
+            ", ".join(f"{k}={n}" for k, n in sorted(
+                suppressed, key=lambda x: -x[1])[:5]),
         )
     return out

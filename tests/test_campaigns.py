@@ -177,3 +177,40 @@ def test_same_ip_twice_is_not_two_members(state_db, cfg, now_utc):
         "a SECOND distinct IP should cross the threshold — if this is empty "
         "the test above passed for the wrong reason"
     )
+
+
+def test_a_widely_shared_artifact_is_not_a_campaign(state_db, cfg, now_utc):
+    """The ceiling. An artifact carried by more IPs than any actor plausibly
+    controls is commodity, not coordination.
+
+    Calibrated on the live corpus: 409 shared artifacts, median 5, p90 46,
+    max 1009. The ones this removes are the known-bad ones — the `mdrfckr`
+    planted SSH key (489 IPs, the most copy-pasted persistence one-liner on
+    the internet) and the SHA-256 of a single newline (254 IPs, produced by
+    `echo > /etc/hosts.deny`)."""
+    key = f"malware:{_SHA}"
+    for i in range(campaigns.MAX_CAMPAIGN_MEMBERS + 1):
+        campaigns.record_session_artifacts(
+            state_db, _session(f"10.1.{i // 256}.{i % 256}",
+                               now_utc + timedelta(seconds=i), malware=[_SHA]))
+    assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) == [], (
+        "an artifact over the ceiling still materialised as a Campaign"
+    )
+
+
+def test_just_under_the_ceiling_still_materialises(state_db, cfg, now_utc):
+    """Positive control — the ceiling must not suppress everything."""
+    key = f"malware:{_SHA}"
+    for i in range(campaigns.MAX_CAMPAIGN_MEMBERS):
+        campaigns.record_session_artifacts(
+            state_db, _session(f"10.2.{i // 256}.{i % 256}",
+                               now_utc + timedelta(seconds=i), malware=[_SHA]))
+    out = campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key])
+    assert out, "a campaign at exactly the ceiling was wrongly suppressed"
+
+
+def test_the_floor_stays_at_two():
+    """Raising it would delete the smallest malware pairs — the most
+    defensible entries, since a SHA-256 identifies an exact build."""
+    assert campaigns.MIN_CAMPAIGN_MEMBERS == 2
+    assert campaigns.MAX_CAMPAIGN_MEMBERS == 50
