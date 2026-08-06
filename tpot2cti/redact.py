@@ -80,7 +80,7 @@ class SensorRedactor:
             logger.warning(
                 "sensor redaction is using the DEFAULT public secret — "
                 "pseudonyms are confirmable by anyone who guesses a hostname. "
-                "Set TPOT2CTI_REDACTION_SECRET (or OPENCTI_TOKEN) before "
+                "Set TPOT2CTI_REDACTION_SECRET (or OPENCTI_ADMIN_TOKEN) before "
                 "sharing anything externally."
             )
         self._names = {h.lower(): _pseudonym(h, self._secret)
@@ -221,5 +221,14 @@ def from_env(env: Optional[dict] = None) -> SensorRedactor:
         hostnames=_split("TPOT2CTI_SENSOR_HOSTNAMES"),
         addresses=_split("TPOT_HONEYPOT_IPS") + _split("TPOT2CTI_EXCLUDED_SRC_NETS"),
         secret=(e.get("TPOT2CTI_REDACTION_SECRET")
-                or e.get("OPENCTI_TOKEN") or "tpot2cti-default-redaction-secret"),
+                # OPENCTI_ADMIN_TOKEN is what setup.sh writes and what the
+                # deployed .env actually carries. The first cut read
+                # OPENCTI_TOKEN, which exists in NO .env, setup.sh, or
+                # compose file — so the live fleet silently fell back to the
+                # public constant below and every sensor pseudonym was
+                # reproducible by anyone holding this repo. OPENCTI_TOKEN is
+                # kept as a secondary for any deployment that does set it.
+                or e.get("OPENCTI_ADMIN_TOKEN")
+                or e.get("OPENCTI_TOKEN")
+                or SensorRedactor.DEFAULT_SECRET),
     )

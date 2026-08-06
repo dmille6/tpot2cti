@@ -213,3 +213,39 @@ def test_the_publisher_logs_the_breakdown():
     src = inspect.getsource(publisher.Publisher.publish)
     assert "begin_cycle()" in src, "counters are never reset per publish"
     assert "sensor redaction" in src, "redaction count is never logged"
+
+
+def test_the_secret_falls_back_to_the_variable_the_deployment_actually_sets():
+    """The first cut read OPENCTI_TOKEN, which appears in no .env, no
+    setup.sh and no compose file. The deployment writes OPENCTI_ADMIN_TOKEN.
+    So the live fleet fell back to the PUBLIC repo constant and every sensor
+    pseudonym was reproducible by anyone holding this repo — while the
+    warning told operators to set a variable that does not exist."""
+    r = from_env({"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2",
+                  "OPENCTI_ADMIN_TOKEN": "real-deployment-secret"})
+    assert r.using_default_secret is False, (
+        "OPENCTI_ADMIN_TOKEN is not being used — pseudonyms are public"
+    )
+    a = r.redact({"description": "hivev2"})["description"]
+    b = from_env({"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2"}).redact(
+        {"description": "hivev2"})["description"]
+    assert a != b, "the configured secret changed nothing"
+
+
+def test_an_explicit_redaction_secret_still_wins():
+    HOSTS = {"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2"}
+    r = from_env({**HOSTS, "TPOT2CTI_REDACTION_SECRET": "explicit",
+                  "OPENCTI_ADMIN_TOKEN": "fallback"})
+    assert r.using_default_secret is False
+    assert r.redact({"description": "hivev2"})["description"] != \
+        from_env({**HOSTS, "OPENCTI_ADMIN_TOKEN": "fallback"}).redact(
+            {"description": "hivev2"})["description"]
+
+
+def test_net_containment_works_through_from_env():
+    """All other containment tests build SensorRedactor directly; this
+    covers the exact wiring the operator configures."""
+    r = from_env({"TPOT2CTI_EXCLUDED_SRC_NETS": "10.0.0.0/8",
+                  "TPOT2CTI_REDACTION_SECRET": "s"})
+    out = r.redact({"content": "talked to 10.4.5.6"})
+    assert "10.4.5.6" not in out["content"]
