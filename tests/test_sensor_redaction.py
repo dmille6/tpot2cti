@@ -164,3 +164,52 @@ def test_the_default_secret_is_flagged():
     """A pseudonym derived from a public constant is confirmable by anyone."""
     assert SensorRedactor([], [], secret="").using_default_secret is True
     assert SensorRedactor([], [], secret="real").using_default_secret is False
+
+
+# ── redaction must be visible, and must handle mapped v6 ─────────────────
+
+def test_an_ipv4_mapped_ipv6_literal_is_redacted():
+    """`::ffff:10.0.0.1` parses as version 6 but denotes a version-4
+    address. Without unmapping, the version guard silently rejects every
+    match and the token leaks."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "mapped ::ffff:10.0.0.1 here"})
+    assert "::ffff:10.0.0.1" not in out["content"]
+    assert r.counts.get("address-in-sensor-net") == 1
+
+
+def test_a_mapped_address_outside_the_net_is_kept():
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "v6 ::ffff:8.8.8.8 stays"})
+    assert "8.8.8.8" in out["content"] and r.redactions == 0
+
+
+def test_redactions_are_counted_by_reason():
+    """A bare total cannot distinguish 'we pseudonymised a label' from 'we
+    destroyed an attacker IP because a configured net was too broad'."""
+    r = SensorRedactor(["hivev2"], ["10.0.0.0/8", "203.0.113.7"], secret="s")
+    r.redact({"content": "hivev2 at 203.0.113.7 saw 10.4.5.6",
+              "x_opencti_labels": ["sensor:hivev2"]})
+    assert r.counts["sensor-hostname"] >= 1
+    assert r.counts["configured-address"] >= 1
+    assert r.counts["address-in-sensor-net"] >= 1
+    assert r.counts["sensor-label"] >= 1
+    assert sum(r.counts.values()) == r.redactions
+
+
+def test_begin_cycle_resets_counts():
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    r.redact({"content": "10.1.1.1"})
+    assert r.redactions == 1
+    r.begin_cycle()
+    assert r.redactions == 0 and r.counts == {}
+
+
+def test_the_publisher_logs_the_breakdown():
+    """A control that rewrites published text silently is indistinguishable
+    from one that is broken."""
+    import inspect
+    from tpot2cti import publisher
+    src = inspect.getsource(publisher.Publisher.publish)
+    assert "begin_cycle()" in src, "counters are never reset per publish"
+    assert "sensor redaction" in src, "redaction count is never logged"

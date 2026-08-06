@@ -249,7 +249,19 @@ class Publisher:
         # are shareable STIX objects; publishing them tells an adversary
         # which addresses are honeypots.
         if self.redactor is not None:
+            self.redactor.begin_cycle()
             objects = self.redactor.redact_all(objects)
+            if self.redactor.redactions:
+                # Logged, not silent. This control REWRITES published text,
+                # and `address-in-sensor-net` in particular destroys ATTACKER
+                # addresses when a configured net is broader than intended —
+                # which is the product. A silent rewrite is indistinguishable
+                # from a broken one, so the breakdown goes in the log.
+                logger.info(
+                    "[%s] sensor redaction: %d replacement(s) %s",
+                    cycle_id, self.redactor.redactions,
+                    dict(sorted(self.redactor.counts.items())),
+                )
 
         # --- Step 0: cross-cycle state merge ----------------------------
         # Per the V0 finding on pycti UPSERT overwriting scalar fields + the 2026-05-21 live-find: pycti's UPSERT

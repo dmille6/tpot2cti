@@ -40,7 +40,11 @@ logger = logging.getLogger(__name__)
 #: Matches IPv4 and bracketless IPv6 literals in free text, so they can be
 #: tested for membership of a configured sensor network.
 _IP_LITERAL_RE = re.compile(
-    r"\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    # IPv4-mapped IPv6 FIRST (::ffff:10.0.0.1) — the bare-IPv4 branch would
+    # otherwise capture only the trailing dotted quad, so the token never
+    # parses as one address and containment never runs on it.
+    r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){1,6}:?\d{1,3}(?:\.\d{1,3}){3}(?![\w.])"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
     # Empty groups are allowed so the "::" compressed form matches
     # (2001:db8::dead:beef). ip_address() is the real validator — this only
     # has to find candidate tokens.
@@ -108,6 +112,21 @@ class SensorRedactor:
         )
         self._repl = {**self._names, **self._addrs}
         self.redactions = 0
+        #: Per-reason counts, reset by `begin_cycle()`. A control that
+        #: silently rewrites published text is indistinguishable from one
+        #: that is broken — and this one destroys ATTACKER addresses when
+        #: they fall inside a configured sensor net, which is the product.
+        #: That has to be visible, not inferred.
+        self.counts: dict = {}
+
+    def _bump(self, reason: str) -> None:
+        self.redactions += 1
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+
+    def begin_cycle(self) -> None:
+        """Reset per-cycle counters. Called by the publisher each publish."""
+        self.redactions = 0
+        self.counts = {}
 
     def _sub_nets(self, value: str) -> str:
         """Replace any IP literal that falls inside a configured network."""
@@ -120,10 +139,19 @@ class SensorRedactor:
                 addr = ipaddress.ip_address(token)
             except ValueError:
                 return token
-            for net in self._nets:
-                if addr.version == net.version and addr in net:
-                    self.redactions += 1
-                    return "<sensor-address>"
+            # An IPv4-mapped IPv6 literal (::ffff:10.0.0.1) parses as
+            # version 6 but denotes a version-4 address, so it must be tested
+            # against v4 nets too — otherwise the version guard silently
+            # rejects every match and the token leaks.
+            candidates = [addr]
+            mapped = getattr(addr, "ipv4_mapped", None)
+            if mapped is not None:
+                candidates.append(mapped)
+            for cand in candidates:
+                for net in self._nets:
+                    if cand.version == net.version and cand in net:
+                        self._bump("address-in-sensor-net")
+                        return "<sensor-address>"
             return token
         return _IP_LITERAL_RE.sub(_one, value)
 
@@ -133,9 +161,11 @@ class SensorRedactor:
         # text was never configured.
         if self._pattern:
             def _one(m: re.Match) -> str:
-                self.redactions += 1
-                return self._repl.get(m.group(0).lower(),
-                                      self._repl.get(m.group(0), "<redacted>"))
+                tok = m.group(0)
+                repl = self._repl.get(tok.lower(), self._repl.get(tok, "<redacted>"))
+                self._bump("sensor-hostname" if repl.startswith("sensor-")
+                           else "configured-address")
+                return repl
             value = self._pattern.sub(_one, value)
         return self._sub_nets(value)
 
@@ -153,7 +183,7 @@ class SensorRedactor:
             for lbl in labels:
                 if isinstance(lbl, str) and lbl.lower().startswith("sensor:"):
                     host = lbl.split(":", 1)[1].strip().lower()
-                    self.redactions += 1
+                    self._bump("sensor-label")
                     # Pseudonymise on the fly for hostnames not in the
                     # configured list. Deriving it here rather than emitting
                     # "<redacted>" keeps per-sensor correlation working even
