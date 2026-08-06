@@ -31,8 +31,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import logging
 import re
 from typing import Any, Iterable, Optional
+
+logger = logging.getLogger(__name__)
+
+#: Matches IPv4 and bracketless IPv6 literals in free text, so they can be
+#: tested for membership of a configured sensor network.
+_IP_LITERAL_RE = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    # Empty groups are allowed so the "::" compressed form matches
+    # (2001:db8::dead:beef). ip_address() is the real validator — this only
+    # has to find candidate tokens.
+    r"|(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])"
+)
 
 #: Fields whose free text is rendered for humans and therefore leaks.
 _TEXT_FIELDS = (
@@ -49,12 +62,32 @@ def _pseudonym(hostname: str, secret: str) -> str:
 class SensorRedactor:
     """Replaces sensor hostnames and own addresses in outbound objects."""
 
+    #: Sentinel for "no secret was configured". A pseudonym derived from a
+    #: PUBLIC constant is confirmable by anyone: guess a hostname, compute the
+    #: HMAC, compare. That defeats the point of pseudonymising at all, so it
+    #: is warned about loudly rather than accepted silently.
+    DEFAULT_SECRET = "tpot2cti-default-redaction-secret"
+
     def __init__(self, hostnames: Iterable[str], addresses: Iterable[str],
                  *, secret: str) -> None:
-        self._secret = secret or "tpot2cti-default-redaction-secret"
+        self._secret = secret or self.DEFAULT_SECRET
+        self.using_default_secret = (self._secret == self.DEFAULT_SECRET)
+        if self.using_default_secret:
+            logger.warning(
+                "sensor redaction is using the DEFAULT public secret — "
+                "pseudonyms are confirmable by anyone who guesses a hostname. "
+                "Set TPOT2CTI_REDACTION_SECRET (or OPENCTI_TOKEN) before "
+                "sharing anything externally."
+            )
         self._names = {h.lower(): _pseudonym(h, self._secret)
                        for h in hostnames if h}
         self._addrs: dict[str, str] = {}
+        # Networks are matched by CONTAINMENT, not as literal strings. The
+        # first cut compiled "10.0.0.0/8" into the same regex as the bare
+        # addresses, so it only ever matched the literal text "10.0.0.0/8" —
+        # an actual sensor address INSIDE that net, which is the whole point
+        # of configuring a net, sailed straight through unredacted.
+        self._nets: list = []
         for a in addresses:
             a = (a or "").strip()
             if not a:
@@ -64,8 +97,7 @@ class SensorRedactor:
                 self._addrs[a] = "<sensor-address>"
             except ValueError:
                 try:                   # ...or a whole net
-                    net = ipaddress.ip_network(a, strict=False)
-                    self._addrs[str(net)] = "<sensor-net>"
+                    self._nets.append(ipaddress.ip_network(a, strict=False))
                 except ValueError:
                     continue
         # Longest-first so a /24 net string never half-matches an address.
@@ -77,15 +109,35 @@ class SensorRedactor:
         self._repl = {**self._names, **self._addrs}
         self.redactions = 0
 
-    def _sub_text(self, value: str) -> str:
-        if not self._pattern:
+    def _sub_nets(self, value: str) -> str:
+        """Replace any IP literal that falls inside a configured network."""
+        if not self._nets:
             return value
 
         def _one(m: re.Match) -> str:
-            self.redactions += 1
-            return self._repl.get(m.group(0).lower(),
-                                  self._repl.get(m.group(0), "<redacted>"))
-        return self._pattern.sub(_one, value)
+            token = m.group(0)
+            try:
+                addr = ipaddress.ip_address(token)
+            except ValueError:
+                return token
+            for net in self._nets:
+                if addr.version == net.version and addr in net:
+                    self.redactions += 1
+                    return "<sensor-address>"
+            return token
+        return _IP_LITERAL_RE.sub(_one, value)
+
+    def _sub_text(self, value: str) -> str:
+        # Exact names/addresses first, then containment for everything that
+        # survived — so a net-member address is caught even though its exact
+        # text was never configured.
+        if self._pattern:
+            def _one(m: re.Match) -> str:
+                self.redactions += 1
+                return self._repl.get(m.group(0).lower(),
+                                      self._repl.get(m.group(0), "<redacted>"))
+            value = self._pattern.sub(_one, value)
+        return self._sub_nets(value)
 
     def redact(self, obj: dict) -> dict:
         """Return `obj` with sensor identity removed. Mutates a shallow copy."""

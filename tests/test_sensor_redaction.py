@@ -117,3 +117,50 @@ def test_an_empty_configuration_does_not_crash():
     r = SensorRedactor([], [], secret="s")
     o = {"type": "note", "content": "nothing to redact"}
     assert r.redact(o)["content"] == "nothing to redact"
+
+
+# ── CIDR containment (the security control was false) ────────────────────
+
+def test_an_address_inside_a_configured_net_is_redacted():
+    """The bug: nets were compiled into the same regex as bare addresses, so
+    `10.0.0.0/8` only ever matched the literal TEXT "10.0.0.0/8". An actual
+    sensor address inside that net — the entire reason to configure a net —
+    passed through unredacted."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "attacker reached 10.4.5.6 on the sensor net"})
+    assert "10.4.5.6" not in out["content"]
+    assert "<sensor-address>" in out["content"]
+
+
+def test_addresses_outside_the_net_are_left_alone():
+    """Positive control — over-redacting would destroy the attacker IPs that
+    are the actual product."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "attacker 8.8.8.8 hit 203.0.113.9"})
+    assert "8.8.8.8" in out["content"] and "203.0.113.9" in out["content"]
+    assert r.redactions == 0
+
+
+def test_ipv6_containment():
+    r = SensorRedactor([], ["2001:db8::/32"], secret="s")
+    out = r.redact({"content": "from 2001:db8::dead:beef inbound"})
+    assert "2001:db8::dead:beef" not in out["content"]
+
+
+def test_a_v4_address_is_not_matched_against_a_v6_net():
+    r = SensorRedactor([], ["2001:db8::/32"], secret="s")
+    out = r.redact({"content": "plain 10.4.5.6 here"})
+    assert "10.4.5.6" in out["content"]
+
+
+def test_literal_addresses_still_work_alongside_nets():
+    r = SensorRedactor([], ["10.0.0.0/8", "203.0.113.7"], secret="s")
+    out = r.redact({"content": "10.1.2.3 and 203.0.113.7 and 8.8.4.4"})
+    assert "10.1.2.3" not in out["content"] and "203.0.113.7" not in out["content"]
+    assert "8.8.4.4" in out["content"]
+
+
+def test_the_default_secret_is_flagged():
+    """A pseudonym derived from a public constant is confirmable by anyone."""
+    assert SensorRedactor([], [], secret="").using_default_secret is True
+    assert SensorRedactor([], [], secret="real").using_default_secret is False
