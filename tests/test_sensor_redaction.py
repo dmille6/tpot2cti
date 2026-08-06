@@ -1,0 +1,119 @@
+"""Sensor identity must not reach a shareable STIX object.
+
+Measured on the live corpus 2026-08-05: 1,034 Notes and 4,442 Sighting
+descriptions embedded a sensor-side public IP, and every parser-labelled
+object carried a `sensor:<hostname>` label. A honeypot's value depends on
+not being identifiable as one — published sensor addresses get null-routed
+or fed garbage.
+
+Redaction lives in the publisher, not the builders, because
+`sensor_hostname` appears 59 times in stix/builder.py alone and every
+emission path funnels through publish() — including the three (malware
+ingest, noisefloor, blocklists) that never touch the builder.
+"""
+from __future__ import annotations
+
+import pytest
+
+from tpot2cti.redact import SensorRedactor, from_env
+
+ENV = {
+    "TPOT2CTI_SENSOR_HOSTNAMES": "hivev2,rail-prod-01",
+    "TPOT_HONEYPOT_IPS": "99.18.26.18,99.18.26.21",
+    "TPOT2CTI_EXCLUDED_SRC_NETS": "10.0.0.0/8",
+    "TPOT2CTI_REDACTION_SECRET": "test-secret",
+}
+
+
+def _r():
+    return from_env(ENV)
+
+
+def test_a_sensor_hostname_never_survives_a_description():
+    r = _r()
+    o = r.redact({"type": "indicator", "description":
+                  "Malicious IP 1.2.3.4 observed via Cowrie on sensor 'hivev2'."})
+    assert "hivev2" not in o["description"]
+    assert "sensor-" in o["description"], "correlation pseudonym was lost"
+
+
+def test_a_sensor_address_never_survives_a_note():
+    r = _r()
+    o = r.redact({"type": "note", "content":
+                  "Attacker engaged T-Pot sensor at 99.18.26.18 port 8443"})
+    assert "99.18.26.18" not in o["content"]
+    assert "<sensor-address>" in o["content"]
+
+
+@pytest.mark.parametrize("field", [
+    "description", "x_opencti_description", "content", "abstract", "name",
+])
+def test_every_human_readable_field_is_scrubbed(field):
+    r = _r()
+    o = r.redact({"type": "note", field: "seen on hivev2 / 99.18.26.21"})
+    assert "hivev2" not in o[field] and "99.18.26.21" not in o[field]
+
+
+def test_sensor_labels_are_pseudonymised_not_dropped():
+    r = _r()
+    o = r.redact({"type": "url", "x_opencti_labels":
+                  ["sensor:hivev2", "cowrie", "honeypot"]})
+    labels = o["x_opencti_labels"]
+    assert "sensor:hivev2" not in labels
+    assert any(l.startswith("sensor:sensor-") for l in labels), labels
+    assert "cowrie" in labels and "honeypot" in labels, "unrelated labels lost"
+
+
+def test_an_unconfigured_sensor_is_still_pseudonymised_in_labels():
+    """The label is the one place the hostname is recoverable from the object
+    itself, so an operator who has not enumerated every sensor still gets
+    label redaction."""
+    o = _r().redact({"type": "url", "x_opencti_labels": ["sensor:never-listed"]})
+    assert o["x_opencti_labels"] == ["sensor:sensor-6cfdeece"] or \
+        o["x_opencti_labels"][0].startswith("sensor:sensor-")
+    assert "never-listed" not in o["x_opencti_labels"][0]
+
+
+def test_pseudonyms_are_stable_and_distinct():
+    """Stable so cross-object correlation survives; distinct so two sensors
+    do not collapse into one."""
+    a, b = _r(), _r()
+    x = a.redact({"description": "hivev2"})["description"]
+    y = b.redact({"description": "hivev2"})["description"]
+    z = a.redact({"description": "rail-prod-01"})["description"]
+    assert x == y, "pseudonym is not stable across runs"
+    assert x != z, "two sensors collapsed to one pseudonym"
+
+
+def test_the_pseudonym_is_not_the_hostname_hashed_without_a_secret():
+    """An outside reader must not be able to confirm a guessed hostname."""
+    import hashlib
+    plain = hashlib.sha256(b"hivev2").hexdigest()[:8]
+    got = _r().redact({"description": "hivev2"})["description"]
+    assert plain not in got
+
+
+def test_redaction_is_on_by_default_in_the_publisher():
+    """The un-bypassable property. A producer that constructs a Publisher
+    without thinking about redaction must still get it."""
+    import inspect
+    from tpot2cti import publisher
+    src = inspect.getsource(publisher.Publisher.__init__)
+    assert "from_env" in src, "Publisher no longer defaults the redactor on"
+    pub_src = inspect.getsource(publisher.Publisher.publish)
+    assert "self.redactor.redact_all(objects)" in pub_src, (
+        "publish() no longer redacts — every emission path leaks again"
+    )
+
+
+def test_objects_without_text_are_untouched():
+    r = _r()
+    o = {"type": "ipv4-addr", "value": "1.2.3.4"}
+    assert r.redact(o) == o
+    assert r.redactions == 0
+
+
+def test_an_empty_configuration_does_not_crash():
+    r = SensorRedactor([], [], secret="s")
+    o = {"type": "note", "content": "nothing to redact"}
+    assert r.redact(o)["content"] == "nothing to redact"

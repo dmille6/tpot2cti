@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from tpot2cti.opencti_client import OpenCTIClient
+from tpot2cti.redact import SensorRedactor
 from tpot2cti.state import CycleState
 from tpot2cti.stix.types import (
     KNOWN_STIX_TYPES,
@@ -187,9 +188,22 @@ class Publisher:
         state: Optional[CycleState] = None,
         *,
         indexing_delay_seconds: Optional[int] = None,
+        redactor: Optional["SensorRedactor"] = None,
     ) -> None:
         self.client = client
         self.state = state
+        # Sensor-identity redaction. Lives HERE, not in the builders, because
+        # every emission path funnels through publish() — CORE, malware
+        # ingest, noisefloor, blocklists, selftest — including the three that
+        # never touch stix/builder.py. A new producer cannot forget to call
+        # it, because it does not: this does. See tpot2cti/redact.py.
+        # Default ON. A producer must pass redactor=False to opt out, which
+        # is deliberately awkward — the failure mode here is publishing the
+        # fleet's own sensor addresses to a shareable graph.
+        if redactor is None:
+            from tpot2cti.redact import from_env as _redactor_from_env
+            redactor = _redactor_from_env()
+        self.redactor = redactor or None
         # Per-instance override of the class-level default; lets main()
         # thread cfg.cycle.indexing_delay_seconds through without touching
         # the class attr (which tests reset to 0).
@@ -225,6 +239,17 @@ class Publisher:
         from tpot2cti.stix_ids import sdo_id
         bundle_id = sdo_id("bundle", "bundle", "cycle", str(cycle_id))
         errors: list[str] = []
+
+        # --- Step -1: sensor-identity redaction -------------------------
+        # Before anything else, including the cross-cycle merge, so a
+        # redacted description is what gets persisted and compared.
+        # Measured live 2026-08-05: 1,034 Notes and 4,442 Sighting
+        # descriptions embedded a sensor-side public IP, and every
+        # parser-labelled object carried a `sensor:<hostname>` label. Those
+        # are shareable STIX objects; publishing them tells an adversary
+        # which addresses are honeypots.
+        if self.redactor is not None:
+            objects = self.redactor.redact_all(objects)
 
         # --- Step 0: cross-cycle state merge ----------------------------
         # Per the V0 finding on pycti UPSERT overwriting scalar fields + the 2026-05-21 live-find: pycti's UPSERT
