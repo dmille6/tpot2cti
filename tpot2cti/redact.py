@@ -31,8 +31,25 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import logging
 import re
 from typing import Any, Iterable, Optional
+
+logger = logging.getLogger(__name__)
+
+#: Matches IPv4 and bracketless IPv6 literals in free text, so they can be
+#: tested for membership of a configured sensor network.
+_IP_LITERAL_RE = re.compile(
+    # IPv4-mapped IPv6 FIRST (::ffff:10.0.0.1) — the bare-IPv4 branch would
+    # otherwise capture only the trailing dotted quad, so the token never
+    # parses as one address and containment never runs on it.
+    r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){1,6}:?\d{1,3}(?:\.\d{1,3}){3}(?![\w.])"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    # Empty groups are allowed so the "::" compressed form matches
+    # (2001:db8::dead:beef). ip_address() is the real validator — this only
+    # has to find candidate tokens.
+    r"|(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])"
+)
 
 #: Fields whose free text is rendered for humans and therefore leaks.
 _TEXT_FIELDS = (
@@ -49,12 +66,32 @@ def _pseudonym(hostname: str, secret: str) -> str:
 class SensorRedactor:
     """Replaces sensor hostnames and own addresses in outbound objects."""
 
+    #: Sentinel for "no secret was configured". A pseudonym derived from a
+    #: PUBLIC constant is confirmable by anyone: guess a hostname, compute the
+    #: HMAC, compare. That defeats the point of pseudonymising at all, so it
+    #: is warned about loudly rather than accepted silently.
+    DEFAULT_SECRET = "tpot2cti-default-redaction-secret"
+
     def __init__(self, hostnames: Iterable[str], addresses: Iterable[str],
                  *, secret: str) -> None:
-        self._secret = secret or "tpot2cti-default-redaction-secret"
+        self._secret = secret or self.DEFAULT_SECRET
+        self.using_default_secret = (self._secret == self.DEFAULT_SECRET)
+        if self.using_default_secret:
+            logger.warning(
+                "sensor redaction is using the DEFAULT public secret — "
+                "pseudonyms are confirmable by anyone who guesses a hostname. "
+                "Set TPOT2CTI_REDACTION_SECRET (or OPENCTI_ADMIN_TOKEN) before "
+                "sharing anything externally."
+            )
         self._names = {h.lower(): _pseudonym(h, self._secret)
                        for h in hostnames if h}
         self._addrs: dict[str, str] = {}
+        # Networks are matched by CONTAINMENT, not as literal strings. The
+        # first cut compiled "10.0.0.0/8" into the same regex as the bare
+        # addresses, so it only ever matched the literal text "10.0.0.0/8" —
+        # an actual sensor address INSIDE that net, which is the whole point
+        # of configuring a net, sailed straight through unredacted.
+        self._nets: list = []
         for a in addresses:
             a = (a or "").strip()
             if not a:
@@ -64,8 +101,7 @@ class SensorRedactor:
                 self._addrs[a] = "<sensor-address>"
             except ValueError:
                 try:                   # ...or a whole net
-                    net = ipaddress.ip_network(a, strict=False)
-                    self._addrs[str(net)] = "<sensor-net>"
+                    self._nets.append(ipaddress.ip_network(a, strict=False))
                 except ValueError:
                     continue
         # Longest-first so a /24 net string never half-matches an address.
@@ -76,16 +112,62 @@ class SensorRedactor:
         )
         self._repl = {**self._names, **self._addrs}
         self.redactions = 0
+        #: Per-reason counts, reset by `begin_cycle()`. A control that
+        #: silently rewrites published text is indistinguishable from one
+        #: that is broken — and this one destroys ATTACKER addresses when
+        #: they fall inside a configured sensor net, which is the product.
+        #: That has to be visible, not inferred.
+        self.counts: dict = {}
 
-    def _sub_text(self, value: str) -> str:
-        if not self._pattern:
+    def _bump(self, reason: str) -> None:
+        self.redactions += 1
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+
+    def begin_cycle(self) -> None:
+        """Reset per-cycle counters. Called by the publisher each publish."""
+        self.redactions = 0
+        self.counts = {}
+
+    def _sub_nets(self, value: str) -> str:
+        """Replace any IP literal that falls inside a configured network."""
+        if not self._nets:
             return value
 
         def _one(m: re.Match) -> str:
-            self.redactions += 1
-            return self._repl.get(m.group(0).lower(),
-                                  self._repl.get(m.group(0), "<redacted>"))
-        return self._pattern.sub(_one, value)
+            token = m.group(0)
+            try:
+                addr = ipaddress.ip_address(token)
+            except ValueError:
+                return token
+            # An IPv4-mapped IPv6 literal (::ffff:10.0.0.1) parses as
+            # version 6 but denotes a version-4 address, so it must be tested
+            # against v4 nets too — otherwise the version guard silently
+            # rejects every match and the token leaks.
+            candidates = [addr]
+            mapped = getattr(addr, "ipv4_mapped", None)
+            if mapped is not None:
+                candidates.append(mapped)
+            for cand in candidates:
+                for net in self._nets:
+                    if cand.version == net.version and cand in net:
+                        self._bump("address-in-sensor-net")
+                        return "<sensor-address>"
+            return token
+        return _IP_LITERAL_RE.sub(_one, value)
+
+    def _sub_text(self, value: str) -> str:
+        # Exact names/addresses first, then containment for everything that
+        # survived — so a net-member address is caught even though its exact
+        # text was never configured.
+        if self._pattern:
+            def _one(m: re.Match) -> str:
+                tok = m.group(0)
+                repl = self._repl.get(tok.lower(), self._repl.get(tok, "<redacted>"))
+                self._bump("sensor-hostname" if repl.startswith("sensor-")
+                           else "configured-address")
+                return repl
+            value = self._pattern.sub(_one, value)
+        return self._sub_nets(value)
 
     def redact(self, obj: dict) -> dict:
         """Return `obj` with sensor identity removed. Mutates a shallow copy."""
@@ -101,7 +183,7 @@ class SensorRedactor:
             for lbl in labels:
                 if isinstance(lbl, str) and lbl.lower().startswith("sensor:"):
                     host = lbl.split(":", 1)[1].strip().lower()
-                    self.redactions += 1
+                    self._bump("sensor-label")
                     # Pseudonymise on the fly for hostnames not in the
                     # configured list. Deriving it here rather than emitting
                     # "<redacted>" keeps per-sensor correlation working even
@@ -139,5 +221,14 @@ def from_env(env: Optional[dict] = None) -> SensorRedactor:
         hostnames=_split("TPOT2CTI_SENSOR_HOSTNAMES"),
         addresses=_split("TPOT_HONEYPOT_IPS") + _split("TPOT2CTI_EXCLUDED_SRC_NETS"),
         secret=(e.get("TPOT2CTI_REDACTION_SECRET")
-                or e.get("OPENCTI_TOKEN") or "tpot2cti-default-redaction-secret"),
+                # OPENCTI_ADMIN_TOKEN is what setup.sh writes and what the
+                # deployed .env actually carries. The first cut read
+                # OPENCTI_TOKEN, which exists in NO .env, setup.sh, or
+                # compose file — so the live fleet silently fell back to the
+                # public constant below and every sensor pseudonym was
+                # reproducible by anyone holding this repo. OPENCTI_TOKEN is
+                # kept as a secondary for any deployment that does set it.
+                or e.get("OPENCTI_ADMIN_TOKEN")
+                or e.get("OPENCTI_TOKEN")
+                or SensorRedactor.DEFAULT_SECRET),
     )

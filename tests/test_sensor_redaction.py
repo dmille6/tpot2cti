@@ -117,3 +117,135 @@ def test_an_empty_configuration_does_not_crash():
     r = SensorRedactor([], [], secret="s")
     o = {"type": "note", "content": "nothing to redact"}
     assert r.redact(o)["content"] == "nothing to redact"
+
+
+# ── CIDR containment (the security control was false) ────────────────────
+
+def test_an_address_inside_a_configured_net_is_redacted():
+    """The bug: nets were compiled into the same regex as bare addresses, so
+    `10.0.0.0/8` only ever matched the literal TEXT "10.0.0.0/8". An actual
+    sensor address inside that net — the entire reason to configure a net —
+    passed through unredacted."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "attacker reached 10.4.5.6 on the sensor net"})
+    assert "10.4.5.6" not in out["content"]
+    assert "<sensor-address>" in out["content"]
+
+
+def test_addresses_outside_the_net_are_left_alone():
+    """Positive control — over-redacting would destroy the attacker IPs that
+    are the actual product."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "attacker 8.8.8.8 hit 203.0.113.9"})
+    assert "8.8.8.8" in out["content"] and "203.0.113.9" in out["content"]
+    assert r.redactions == 0
+
+
+def test_ipv6_containment():
+    r = SensorRedactor([], ["2001:db8::/32"], secret="s")
+    out = r.redact({"content": "from 2001:db8::dead:beef inbound"})
+    assert "2001:db8::dead:beef" not in out["content"]
+
+
+def test_a_v4_address_is_not_matched_against_a_v6_net():
+    r = SensorRedactor([], ["2001:db8::/32"], secret="s")
+    out = r.redact({"content": "plain 10.4.5.6 here"})
+    assert "10.4.5.6" in out["content"]
+
+
+def test_literal_addresses_still_work_alongside_nets():
+    r = SensorRedactor([], ["10.0.0.0/8", "203.0.113.7"], secret="s")
+    out = r.redact({"content": "10.1.2.3 and 203.0.113.7 and 8.8.4.4"})
+    assert "10.1.2.3" not in out["content"] and "203.0.113.7" not in out["content"]
+    assert "8.8.4.4" in out["content"]
+
+
+def test_the_default_secret_is_flagged():
+    """A pseudonym derived from a public constant is confirmable by anyone."""
+    assert SensorRedactor([], [], secret="").using_default_secret is True
+    assert SensorRedactor([], [], secret="real").using_default_secret is False
+
+
+# ── redaction must be visible, and must handle mapped v6 ─────────────────
+
+def test_an_ipv4_mapped_ipv6_literal_is_redacted():
+    """`::ffff:10.0.0.1` parses as version 6 but denotes a version-4
+    address. Without unmapping, the version guard silently rejects every
+    match and the token leaks."""
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "mapped ::ffff:10.0.0.1 here"})
+    assert "::ffff:10.0.0.1" not in out["content"]
+    assert r.counts.get("address-in-sensor-net") == 1
+
+
+def test_a_mapped_address_outside_the_net_is_kept():
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    out = r.redact({"content": "v6 ::ffff:8.8.8.8 stays"})
+    assert "8.8.8.8" in out["content"] and r.redactions == 0
+
+
+def test_redactions_are_counted_by_reason():
+    """A bare total cannot distinguish 'we pseudonymised a label' from 'we
+    destroyed an attacker IP because a configured net was too broad'."""
+    r = SensorRedactor(["hivev2"], ["10.0.0.0/8", "203.0.113.7"], secret="s")
+    r.redact({"content": "hivev2 at 203.0.113.7 saw 10.4.5.6",
+              "x_opencti_labels": ["sensor:hivev2"]})
+    assert r.counts["sensor-hostname"] >= 1
+    assert r.counts["configured-address"] >= 1
+    assert r.counts["address-in-sensor-net"] >= 1
+    assert r.counts["sensor-label"] >= 1
+    assert sum(r.counts.values()) == r.redactions
+
+
+def test_begin_cycle_resets_counts():
+    r = SensorRedactor([], ["10.0.0.0/8"], secret="s")
+    r.redact({"content": "10.1.1.1"})
+    assert r.redactions == 1
+    r.begin_cycle()
+    assert r.redactions == 0 and r.counts == {}
+
+
+def test_the_publisher_logs_the_breakdown():
+    """A control that rewrites published text silently is indistinguishable
+    from one that is broken."""
+    import inspect
+    from tpot2cti import publisher
+    src = inspect.getsource(publisher.Publisher.publish)
+    assert "begin_cycle()" in src, "counters are never reset per publish"
+    assert "sensor redaction" in src, "redaction count is never logged"
+
+
+def test_the_secret_falls_back_to_the_variable_the_deployment_actually_sets():
+    """The first cut read OPENCTI_TOKEN, which appears in no .env, no
+    setup.sh and no compose file. The deployment writes OPENCTI_ADMIN_TOKEN.
+    So the live fleet fell back to the PUBLIC repo constant and every sensor
+    pseudonym was reproducible by anyone holding this repo — while the
+    warning told operators to set a variable that does not exist."""
+    r = from_env({"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2",
+                  "OPENCTI_ADMIN_TOKEN": "real-deployment-secret"})
+    assert r.using_default_secret is False, (
+        "OPENCTI_ADMIN_TOKEN is not being used — pseudonyms are public"
+    )
+    a = r.redact({"description": "hivev2"})["description"]
+    b = from_env({"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2"}).redact(
+        {"description": "hivev2"})["description"]
+    assert a != b, "the configured secret changed nothing"
+
+
+def test_an_explicit_redaction_secret_still_wins():
+    HOSTS = {"TPOT2CTI_SENSOR_HOSTNAMES": "hivev2"}
+    r = from_env({**HOSTS, "TPOT2CTI_REDACTION_SECRET": "explicit",
+                  "OPENCTI_ADMIN_TOKEN": "fallback"})
+    assert r.using_default_secret is False
+    assert r.redact({"description": "hivev2"})["description"] != \
+        from_env({**HOSTS, "OPENCTI_ADMIN_TOKEN": "fallback"}).redact(
+            {"description": "hivev2"})["description"]
+
+
+def test_net_containment_works_through_from_env():
+    """All other containment tests build SensorRedactor directly; this
+    covers the exact wiring the operator configures."""
+    r = from_env({"TPOT2CTI_EXCLUDED_SRC_NETS": "10.0.0.0/8",
+                  "TPOT2CTI_REDACTION_SECRET": "s"})
+    out = r.redact({"content": "talked to 10.4.5.6"})
+    assert "10.4.5.6" not in out["content"]
