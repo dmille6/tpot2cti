@@ -2,10 +2,26 @@
 
 A single scanning IP is a data point; the *same concrete artifact* turning up
 from many IPs is intelligence. When two or more distinct attacker IPs deliver
-the same malware, plant the same SSH key, or present the same client
-fingerprint (HASSH / JA3), they're almost certainly the same actor or toolkit.
-This module rolls those into a first-class STIX **Campaign** node so OpenCTI
-shows one coordinated operation instead of N disconnected indicators.
+the same malware or plant the same SSH key, that shared object is something
+an actor had to put there. This module rolls those into a first-class STIX
+**Campaign** node so OpenCTI shows one operation instead of N disconnected
+indicators.
+
+**HASSH and JA3 are deliberately NOT campaign artifacts** (removed
+2026-08-05). They identify the SSH/TLS library the client was built against,
+which groups SOFTWARE, not actors. Measured live: 217 of 243 generated
+campaigns clustered on one, and for 136 of the 157 JA3 campaigns the hive
+held more distinct IPs carrying that fingerprint than the campaign claimed —
+median 4.5x, worst 117x. The fingerprints are still emitted as
+Cryptographic-Key observables with `related-to` edges to every IP that
+presented them, which says "these hosts run the same tooling" rather than
+"these hosts are one actor".
+
+KNOWN REMAINING WEAKNESS: MIN_CAMPAIGN_MEMBERS = 2 is still low for the
+artifact types that survive. A shared malware hash can be commodity reuse,
+and the `mdrfckr` planted SSH key is the most copy-pasted persistence
+one-liner on the internet — it was claimed as a single 485-IP campaign. The
+threshold and a popularity guard for planted keys are unresolved.
 
 Why this needs state (cf. attacker_profile.py):
   The second IP sharing an artifact almost always arrives in a LATER cycle than

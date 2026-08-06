@@ -158,8 +158,22 @@ def test_third_ip_adds_one_edge_no_duplicate(state_db, cfg, now_utc):
 
 def test_same_ip_twice_is_not_two_members(state_db, cfg, now_utc):
     """The same IP re-presenting an artifact must NOT cross the threshold."""
-    key = f"ja3:fpZ"
-    campaigns.record_session_artifacts(state_db, _session("9.9.9.9", now_utc, ja3="fpZ"))
+    # Uses a malware hash: a JA3 here would make this test VACUOUS, because
+    # ja3 is no longer collected as an artifact, so emit_campaigns would
+    # return [] without ever exercising same-IP de-duping.
+    key = f"malware:{_SHA}"
     campaigns.record_session_artifacts(
-        state_db, _session("9.9.9.9", now_utc + timedelta(minutes=10), ja3="fpZ"))
+        state_db, _session("9.9.9.9", now_utc, malware=[_SHA]))
+    campaigns.record_session_artifacts(
+        state_db, _session("9.9.9.9", now_utc + timedelta(minutes=10),
+                           malware=[_SHA]))
+    # Positive control: the rows ARE being recorded, so [] below means
+    # "one IP is not two members", not "nothing was stored".
     assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) == []
+    campaigns.record_session_artifacts(
+        state_db, _session("9.9.9.8", now_utc + timedelta(minutes=20),
+                           malware=[_SHA]))
+    assert campaigns.emit_campaigns(state_db, _fresh_builder(cfg), [key]) != [], (
+        "a SECOND distinct IP should cross the threshold — if this is empty "
+        "the test above passed for the wrong reason"
+    )
