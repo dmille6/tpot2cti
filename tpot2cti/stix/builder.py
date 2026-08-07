@@ -1066,8 +1066,17 @@ class STIXBuilder:
         # a busy catch-up window produced ~947k duplicate attack-pattern
         # dicts, ballooning memory and overflowing SQLite's bind-variable
         # limit in the publisher's pre-dedup state lookup (2026-07-19 →
-        # 08-04 ingestion outage). All five callers already guard with
-        # `if ap:` / `if not ap: continue`, so None is the correct contract.
+        # 08-04 ingestion outage). All five callers guard with `if ap:` /
+        # `if not ap: continue`.
+        #
+        # That guard is NOT the correct contract, and this comment used to
+        # claim it was. None here is ambiguous: "no such technique" and
+        # "already emitted in this bundle" are different answers, and callers
+        # that need a per-session edge TO an already-emitted AttackPattern
+        # drop it. See _emit_process for the shape of the fix. Known open
+        # defect for attack-pattern, vulnerability, file, url and domain --
+        # tracked separately; not introduced here, and unchanged by this
+        # change (those ids were already content-addressed).
         return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_session_attack_patterns(self, session: AttackSession) -> list[dict]:
@@ -1430,8 +1439,9 @@ class STIXBuilder:
         true of the transcript itself stays here.
 
         x_opencti_created_at is kept and is the session timestamp. It is NOT
-        attribution: it is "first time this transcript was seen", and because
-        cycles run forward in time the first writer is the earliest observation.
+        attribution -- no IP, no sensor -- but nor is it a reliable "first ever
+        seen": across cycles the object is rebuilt with the current session's
+        timestamp. See the comment at the field.
 
         Returns None in TWO distinguishable cases — recon-only drop, and
         already-emitted-this-bundle. Callers must not conflate them; use
@@ -1501,11 +1511,15 @@ class STIXBuilder:
             "x_opencti_labels": sorted(set(
                 parser_labels_for(session.event_type) + ["command-transcript"]
             )),
-            # Kept deliberately. This is NOT attribution -- it carries no IP and
-            # no sensor. It means "first time this transcript was seen", and
-            # because cycles run forward in time the first writer is the
-            # earliest observation. Dropping it would lose the only timestamp
-            # on the object with nowhere else to recover it from today.
+            # Kept deliberately. This is NOT attribution -- it carries no IP
+            # and no sensor -- and dropping it would leave the object with no
+            # timestamp at all and nowhere to recover one from.
+            #
+            # Read it as "a session that ran this transcript", NOT as "first
+            # ever seen": _emitted_ids is per-bundle, so a transcript already
+            # published in an earlier cycle is rebuilt with the CURRENT
+            # session's timestamp. Whether the original survives is OpenCTI's
+            # merge behaviour, which we do not control from here.
             "x_opencti_created_at": session.first_seen.isoformat(),
         }
         return self._dedup(self._stamp(obj))
@@ -2198,8 +2212,10 @@ class STIXBuilder:
         # was never emitted at all: a dangling ref OpenCTI accepts and then
         # never resolves. Content-addressing would have made that WORSE, not
         # better, because the id is now always derivable even when the node is
-        # absent. Taking the id from the object that was actually appended
-        # removes the failure mode instead of guarding it.
+        # absent. Taking the id from the CALLER -- which knows whether the
+        # node exists in this bundle, whether or not it was the one to append
+        # it (see _emit_process) -- removes the failure mode instead of
+        # guarding it.
         if process_id and file_ids:
             for sha, fid in file_ids.items():
                 if rel := self.build_relationship(
