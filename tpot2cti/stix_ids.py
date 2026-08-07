@@ -173,7 +173,7 @@ def process_command_line(commands: list[str]) -> str:
         # into one Process. Digest the omitted tail instead — different tails
         # give different ids, and the count is still shown for the analyst.
         tail = "\n".join(commands[MAX_COMMANDS_PER_PROCESS:])
-        digest = hashlib.sha256(tail.encode("utf-8", "replace")).hexdigest()[:12]
+        digest = hashlib.sha256(tail.encode("utf-8", "replace")).hexdigest()[:16]
         marker = (
             f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more "
             f"(tail sha256:{digest})"
