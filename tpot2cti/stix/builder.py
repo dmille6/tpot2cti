@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import contextlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -808,6 +809,10 @@ class STIXBuilder:
         #: "the extractor found nothing" and "we stopped publishing our own
         #: attack surface".
         self.rejected_own_surface_urls = 0
+        #: Relationships emitted with no session in scope, so no start_time.
+        #: 100% of edges carried the 1970 epoch sentinel before this existed.
+        self.untimed_relationships = 0
+        self._session_ctx: Optional[AttackSession] = None
         # Sensor identity, used to refuse own-surface URLs. Same source the
         # publisher redacts with, so one configuration governs both.
         try:
@@ -1969,7 +1974,25 @@ class STIXBuilder:
         dst_id: str,
         *,
         description: Optional[str] = None,
+        session: Optional[AttackSession] = None,
     ) -> Optional[dict]:
+        """Build an SRO, stamped with WHEN the activity happened.
+
+        `start_time`/`stop_time` come from the session's observed window. This
+        matters more than it sounds: measured on the live corpus 2026-08-06,
+        **100% of emitted relationships carried the epoch sentinel
+        1970-01-01** — `related-to` 59,644/59,644, `based-on` 34,563/34,563,
+        `indicates` 31,425/31,425. The highest-degree attacker's 3,014 edges
+        had a `start_time` cardinality of ONE. "What did attacker X do, in
+        order" was unanswerable by construction, and OpenCTI's decay model had
+        nothing real to decay against.
+
+        The session is taken from an explicit argument when given, otherwise
+        from the session currently being built (see `session_context`). That
+        fallback exists so this did not become 40 call-site edits — the
+        21-copies shape that `docs/REVIEW_PLAYBOOK.md` §1.1 warns about, where
+        the fix lands in some copies and the next contributor misses the rest.
+        """
         if not (src_id and dst_id and relationship_type) or src_id == dst_id:
             return None
         obj = {
@@ -1981,7 +2004,30 @@ class STIXBuilder:
         }
         if description:
             obj["description"] = description
+        ctx = session if session is not None else self._session_ctx
+        if ctx is not None and getattr(ctx, "first_seen", None) is not None:
+            obj["start_time"] = ctx.first_seen.isoformat()
+            if getattr(ctx, "last_seen", None) is not None:
+                obj["stop_time"] = ctx.last_seen.isoformat()
+        else:
+            # Counted, never silent. A rising number here means a producer is
+            # emitting edges outside any session context and the graph is
+            # quietly losing its time dimension again.
+            self.untimed_relationships += 1
         return self._dedup(self._stamp(obj))
+
+    @contextlib.contextmanager
+    def session_context(self, session: Optional[AttackSession]):
+        """Make `session` the default time source for relationships built
+        inside this block. Set once by the orchestrator around each
+        `build_*_session` dispatch, so every SRO a builder emits is timed
+        without threading an argument through 40 call sites."""
+        prev = self._session_ctx
+        self._session_ctx = session
+        try:
+            yield
+        finally:
+            self._session_ctx = prev
 
     def build_sighting(
         self,
