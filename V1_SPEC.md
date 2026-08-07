@@ -331,7 +331,7 @@ Docker compose healthcheck uses this.
 | `stixfile` | One per unique `sha256` of captured malware | hash only — no bytes in core |
 | `url` | URLs extracted from Cowrie commands, HTTP req/res, etc. | full URL |
 | `domain-name` | Domains in SNI, HTTP host, URL hostnames | apex + subdomain |
-| `process` | One per session that ran commands | `command_line` = joined commands |
+| `process` | One per distinct command TRANSCRIPT, shared across the sessions that ran it | `command_line` = canonical joined commands |
 | `cryptographic-key` | Per HASSH, JA3, JA3S, HTTP-header-hash | fingerprint value |
 | `indicator` | Per high-confidence pattern (file hash, URL, IP) | STIX pattern syntax |
 | `note` | Session summary + daily aggregates | markdown body |
@@ -359,7 +359,7 @@ Seed examples:
 | `stixfile` | `stixfile:sha256:<sha256>` |
 | `url` | `url:<full-url>` |
 | `domain-name` | `domain-name:<fqdn>` |
-| `process` | `process:<sensor>:<session_id>` |
+| `process` | `process:<canonical command_line>` (content-addressed) |
 | `cryptographic-key` | `cryptographic-key:<value>` |
 | `location` (country) | `location:country:<iso2>` |
 | `location` (city) | `location:city:<iso2>:<city>` |

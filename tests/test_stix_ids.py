@@ -27,7 +27,7 @@ CASES = [
     ("generate_file_id",                      ("a" * 64,)),
     ("generate_url_id",                       ("http://evil.example/x",)),
     ("generate_domain_id",                    ("evil.example",)),
-    ("generate_process_id",                   ("node1", "sess001")),
+    ("generate_process_id",                   (["uname -a", "cat /etc/passwd"],)),
     ("generate_cryptographic_key_id",         ("deadbeef",)),
     ("generate_autonomous_system_id",         (64500,)),
     ("generate_country_location_id",          ("US",)),

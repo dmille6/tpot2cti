@@ -56,6 +56,9 @@ from tpot2cti.stix_ids import (
     generate_malware_id,
     generate_marking_definition_id,
     generate_process_id,
+    process_command_line,
+    MAX_COMMANDS_PER_PROCESS,
+    _TMPFILE_RE,
     sdo_id,
     generate_relationship_id,
     generate_sensor_id,
@@ -90,11 +93,11 @@ _UNATTRIBUTED_SRC = "an unattributed source (spoofed X-Forwarded-For)"
 #: Cap on raw/decoded payload text embedded in a salvage Note.
 _UNATTRIBUTED_RAW_CAP = 4 * 1024
 
-# Process command_line cap (matches PoC convention)
-MAX_COMMANDS_PER_PROCESS = 50
+# Process command_line cap and temp-path normalisation now live in stix_ids,
+# next to generate_process_id: since the Process id IS the canonical command
+# line, a second copy of either here could drift and split the id family.
+# Re-exported so existing importers keep working.
 
-# Ephemeral temp-file paths in scp malware-drop probes; normalized to dedupe noise.
-_TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}")
 
 # Attacker-IP validation/canonicalization + deterministic ids live in
 # tpot2cti.stix_ids: `canonical_ip`, `attacker_ip_observable_id`,
@@ -1063,8 +1066,17 @@ class STIXBuilder:
         # a busy catch-up window produced ~947k duplicate attack-pattern
         # dicts, ballooning memory and overflowing SQLite's bind-variable
         # limit in the publisher's pre-dedup state lookup (2026-07-19 →
-        # 08-04 ingestion outage). All five callers already guard with
-        # `if ap:` / `if not ap: continue`, so None is the correct contract.
+        # 08-04 ingestion outage). All five callers guard with `if ap:` /
+        # `if not ap: continue`.
+        #
+        # That guard is NOT the correct contract, and this comment used to
+        # claim it was. None here is ambiguous: "no such technique" and
+        # "already emitted in this bundle" are different answers, and callers
+        # that need a per-session edge TO an already-emitted AttackPattern
+        # drop it. See _emit_process for the shape of the fix. Known open
+        # defect for attack-pattern, vulnerability, file, url and domain --
+        # tracked separately; not introduced here, and unchanged by this
+        # change (those ids were already content-addressed).
         return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_session_attack_patterns(self, session: AttackSession) -> list[dict]:
@@ -1418,15 +1430,22 @@ class STIXBuilder:
     def build_process(self, session: AttackSession, commands: list[str]) -> Optional[dict]:
         """Process SDO carrying the attacker's command transcript.
 
-        Enriched per the same pattern as build_ipv4 / build_url / etc.
-        (port of PoC's observable enrichment): x_opencti_description
-        names the attacker + sensor + parser context, x_opencti_labels
-        carries the parser-source tags, x_opencti_created_at is the
-        actual session timestamp so OpenCTI's "Original Creation Date"
-        column reflects when the attack ran (not when the connector
-        ingested it). Per the live cycle 16 review — a bare Process
-        with just command_line and TLP marking is hard to use; the
-        analyst can't tell which sensor/parser the commands came from.
+        CONTENT-ADDRESSED and therefore SHARED: one object per distinct
+        transcript, not per session. That inverts the enrichment rule this
+        method used to follow. The old docstring described naming the attacker
+        and sensor in x_opencti_description the way build_ipv4 / build_url do —
+        correct for a per-session object, false the moment two sessions share
+        one. Per-session facts now live on the edges and Notes; only what is
+        true of the transcript itself stays here.
+
+        x_opencti_created_at is kept and is the session timestamp. It is NOT
+        attribution -- no IP, no sensor -- but nor is it a reliable "first ever
+        seen": across cycles the object is rebuilt with the current session's
+        timestamp. See the comment at the field.
+
+        Returns None in TWO distinguishable cases — recon-only drop, and
+        already-emitted-this-bundle. Callers must not conflate them; use
+        _emit_process, which does the distinguishing.
         """
         if not commands:
             return None
@@ -1435,42 +1454,72 @@ class STIXBuilder:
         # keeps the full transcript. See _session_is_recon_only.
         if self.config.cycle.drop_recon_process and _session_is_recon_only(commands):
             return None
-        # Cap commands to MAX_COMMANDS_PER_PROCESS for bundle-size sanity
-        capped = commands[:MAX_COMMANDS_PER_PROCESS]
-        # Normalize ephemeral temp-file paths (e.g. automated scp malware-drop
-        # probes: scp -qt "/tmp/<random>") so near-identical sessions do not
-        # each spawn a unique Process observable.
-        capped = [_TMPFILE_RE.sub(r"\1/<tmpfile>", c) for c in capped]
-        truncated_marker = (
-            f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more"
-            if len(commands) > MAX_COMMANDS_PER_PROCESS else ""
-        )
-        cmd_line = "\n".join(capped) + truncated_marker
-        # Pure scp-to-tempfile noise collapses to one content-addressed Process
-        # (keeps the TTP signal as a single observable with many sightings).
-        _stripped = [c.strip() for c in capped if c.strip()]
-        _is_scp_noise = bool(_stripped) and all(
-            c.startswith("scp ") and "/<tmpfile>" in c for c in _stripped
-        )
-        _proc_id = (
-            sdo_id("process", "process", session.sensor_hostname, cmd_line)
-            if _is_scp_noise
-            else generate_process_id(session.sensor_hostname, session.session_id)
-        )
+        cmd_line = process_command_line(commands)
+        # CONTENT-ADDRESSED, always. The id is the command transcript.
+        #
+        # It used to be `generate_process_id(sensor, session_id)` — unique per
+        # session — with content-addressing applied ONLY to a narrow
+        # scp-to-tempfile case. Measured on the live corpus 2026-08-06, that
+        # cost: a single Process observable had accumulated **11,485 alias
+        # STIX ids**, and roughly 332,000 distinct ids had collapsed into
+        # 3,663 objects.
+        #
+        # Nothing appeared broken because OpenCTI recomputes its own
+        # content-derived `standard_id` for Process and files ours as an
+        # alias. But the consequences were real: `object_max_state` carried
+        # 1,015,137 rows for a ~108k-object graph, every Process was re-emitted
+        # under a NEW id every cycle so the publisher could never skip it, and
+        # the observable index ran 7.3 KB/doc against 3.6 KB for SDOs — the
+        # alias arrays being the difference.
+        #
+        # A Process here models the command sequence, not one execution of it.
+        # Two attackers running identical commands SHOULD reach one observable,
+        # with the `related-to` edges to each IP carrying who ran it — which is
+        # the collapse OpenCTI was performing anyway. Deriving the same id
+        # ourselves just stops us fighting it.
+        #
+        # ID-FAMILY BREAK: existing Process ids will not be re-derived. The
+        # OBJECTS survive, because OpenCTI had already merged them by content;
+        # only the stale alias arrays are orphaned.
+        _proc_id = generate_process_id(commands)
         obj = {
             "type": "process",
             "id": _proc_id,
             "command_line": cmd_line,
+            # NO per-session attribution on this object. It is now shared by
+            # every attacker who ran this transcript, so "executed by attacker
+            # 1.2.3.4 on sensor foo" would be true only for whichever session
+            # happened to write it first and false for all the rest -- the
+            # pipeline asserting what it has not established. Who ran it and
+            # from where lives on the Process -> IPv4 relationship and on the
+            # session Notes.
+            #
+            # The sensor: label is dropped for the same reason: one transcript
+            # seen on three sensors would otherwise be tagged with one of them.
+            # event_type is out of the DESCRIPTION too -- one transcript seen
+            # via two parsers would otherwise rewrite the description on every
+            # cycle, churning the object. The parser LABELS stay, because
+            # OpenCTI accumulates labels as a set rather than replacing them.
             "x_opencti_description": (
-                f"Command sequence executed by attacker {session.src_ip} "
-                f"in a {session.event_type} session on sensor "
-                f"{session.sensor_hostname!r} "
-                f"({len(commands)} command(s), "
-                f"first seen {session.first_seen.isoformat()})."
+                f"Command sequence observed in honeypot sessions "
+                f"({len(commands)} command(s)). Which attacker ran it, from "
+                f"where, on which sensor and when is carried by the "
+                f"relationships to the source addresses and by the session "
+                f"Notes — not by this object, which is shared by every "
+                f"session that ran this transcript."
             ),
             "x_opencti_labels": sorted(set(
-                parser_labels_for(session.event_type, session.sensor_hostname) + ["command-transcript"]
+                parser_labels_for(session.event_type) + ["command-transcript"]
             )),
+            # Kept deliberately. This is NOT attribution -- it carries no IP
+            # and no sensor -- and dropping it would leave the object with no
+            # timestamp at all and nowhere to recover one from.
+            #
+            # Read it as "a session that ran this transcript", NOT as "first
+            # ever seen": _emitted_ids is per-bundle, so a transcript already
+            # published in an earlier cycle is rebuilt with the CURRENT
+            # session's timestamp. Whether the original survives is OpenCTI's
+            # merge behaviour, which we do not control from here.
             "x_opencti_created_at": session.first_seen.isoformat(),
         }
         return self._dedup(self._stamp(obj))
@@ -2095,7 +2144,41 @@ class STIXBuilder:
     # (main.run_cycle) dispatches to the right method via _PARSER_DISPATCH.
     # ──────────────────────────────────────────────────────────────────
 
-    def _link_download_chain(self, session: AttackSession) -> list[dict]:
+    def _emit_process(
+        self, session: AttackSession, out: list[dict],
+    ) -> Optional[str]:
+        """Append the Process if it is new to this bundle, and return the id to
+        anchor its edges on -- or None if there is no Process to anchor.
+
+        These are DIFFERENT questions, and conflating them is a live bug that
+        content-addressing created. build_process returns None for two reasons:
+        the session was recon-only and dropped, OR _dedup already emitted this
+        object in this bundle. Under the old session-scoped ids the second case
+        was nearly unreachable -- every session had its own id. Now that
+        identical transcripts share an id, it is the COMMON case: the second
+        and every later session running a known transcript got None, so
+        `if proc:` was false and both its Process -> IPv4 and Process -> File
+        edges were silently dropped.
+
+        That would have deleted exactly the attribution this change moves onto
+        the relationships, for exactly the sessions that share a transcript.
+        _emitted_ids tells the two None cases apart -- the same distinction
+        build_url's callers already have to make.
+        """
+        if not session.commands:
+            return None
+        proc = self.build_process(session, session.commands)
+        if proc:
+            out.append(proc)
+            return proc["id"]
+        pid = generate_process_id(session.commands)
+        # Already in this bundle -> the node exists, anchor on it.
+        # Not in this bundle -> build_process dropped it, do not anchor.
+        return pid if pid in self._emitted_ids else None
+
+    def _link_download_chain(
+        self, session: AttackSession, *, process_id: Optional[str],
+    ) -> list[dict]:
         """Intra-session attack-chain edges so the full story is navigable.
 
         Two edges, both referencing already-emitted objects by their
@@ -2118,11 +2201,25 @@ class STIXBuilder:
             for sha in session.malware_hashes if sha
         }
         # Process → File (command session dropped these files)
-        if session.commands and file_ids:
-            proc_id = generate_process_id(session.sensor_hostname, session.session_id)
+        # process_id is HANDED IN, never recomputed. It is a required kwarg so
+        # a caller cannot forget to answer the question; None means "this
+        # session emitted no Process" (no commands, or build_process dropped a
+        # recon-only session under cycle.drop_recon_process).
+        #
+        # It used to be recomputed here from the session. That made the edge
+        # silently order-dependent -- correct only because build_process ran
+        # earlier in the same function -- and it could anchor on a Process that
+        # was never emitted at all: a dangling ref OpenCTI accepts and then
+        # never resolves. Content-addressing would have made that WORSE, not
+        # better, because the id is now always derivable even when the node is
+        # absent. Taking the id from the CALLER -- which knows whether the
+        # node exists in this bundle, whether or not it was the one to append
+        # it (see _emit_process) -- removes the failure mode instead of
+        # guarding it.
+        if process_id and file_ids:
             for sha, fid in file_ids.items():
                 if rel := self.build_relationship(
-                    proc_id, "related-to", fid,
+                    process_id, "related-to", fid,
                     description=f"Command session dropped file sha256:{sha[:16]}…",
                 ):
                     out.append(rel)
@@ -2264,17 +2361,13 @@ class STIXBuilder:
                     out.append(rel)
 
         # Process (commands)
-        process_id: Optional[str] = None
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                process_id = proc["id"]
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands run by {session.src_ip} in Cowrie session",
-                ):
-                    out.append(rel)
+        process_id = self._emit_process(session, out)
+        if process_id:
+            if rel := self.build_relationship(
+                process_id, "related-to", ipv4_id,
+                description=f"Commands run by {session.src_ip} in Cowrie session",
+            ):
+                out.append(rel)
 
         # File downloads → StixFile + Indicator + URL/Domain
         for sha256 in session.malware_hashes:
@@ -2328,11 +2421,11 @@ class STIXBuilder:
         # command_line field. Per the V0 "don't emit 50K Notes/day" finding + the 2026-05-21 user
         # decision: ONE rolling Note per attacker IP scales; 50 per-session
         # Notes per attacker do not.
-        _ = process_id  # referenced above; kept for future per-session links
+
 
         # Intra-session attack chain: Process→File (dropped) + URL→File
         # (downloaded-from). Makes the command→malware→source story navigable.
-        out.extend(self._link_download_chain(session))
+        out.extend(self._link_download_chain(session, process_id=process_id))
 
         return out
 
@@ -2534,7 +2627,8 @@ class STIXBuilder:
 
         # Rare but valuable: a captured follow-up binary. Emit the File
         # observable + URL→File / probe→File edges via the shared chain.
-        out.extend(self._link_download_chain(session))
+        # Honeytrap has no command transcript, so no Process to anchor on.
+        out.extend(self._link_download_chain(session, process_id=None))
 
         return out
 
@@ -3175,15 +3269,13 @@ class STIXBuilder:
             return out
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands executed by {session.src_ip}",
-                ):
-                    out.append(rel)
+        chain_process_id = self._emit_process(session, out)
+        if chain_process_id:
+            if rel := self.build_relationship(
+                chain_process_id, "related-to", ipv4_id,
+                description=f"Commands executed by {session.src_ip}",
+            ):
+                out.append(rel)
 
 
         for sha256 in session.malware_hashes:
@@ -3225,7 +3317,8 @@ class STIXBuilder:
                     out.append(rel)
         # Intra-session attack chain: URL→File (downloaded-from) +
         # Process→File where commands are present (e.g. adbhoney).
-        out.extend(self._link_download_chain(session))
+        out.extend(self._link_download_chain(
+            session, process_id=chain_process_id))
         return out
 
     def build_adbhoney_session(self, session: AttackSession) -> list[dict]:
@@ -3316,15 +3409,13 @@ class STIXBuilder:
                     description=f"{session.event_type} activity from {session.src_ip}",
                 )):
                     out.append(rel)
-        if session.commands:
-            proc = self.build_process(session, session.commands)
-            if proc:
-                out.append(proc)
-                if rel := self.build_relationship(
-                    proc["id"], "related-to", ipv4_id,
-                    description=f"Commands from {session.src_ip}",
-                ):
-                    out.append(rel)
+        _pid = self._emit_process(session, out)
+        if _pid:
+            if rel := self.build_relationship(
+                _pid, "related-to", ipv4_id,
+                description=f"Commands from {session.src_ip}",
+            ):
+                out.append(rel)
         # Payload/dropper URLs in the command transcript: SSH & protocol
         # honeypots log `wget http://c2/x.sh` but never run it, so the
         # payload URL + C2 host are IOCs we would otherwise lose. (Cowrie

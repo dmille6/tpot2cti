@@ -114,7 +114,7 @@ def test_cowrie_chain_links_process_and_url_to_file(builder):
     objs = builder.build_cowrie_session(s)
     fid = generate_file_id(_SHA)
     # Process → File (command session dropped the file)
-    pid = generate_process_id(s.sensor_hostname, s.session_id)
+    pid = generate_process_id(s.commands)
     assert any(r["source_ref"] == pid and r["target_ref"] == fid for r in _rels(objs)), \
         "missing Process→File edge"
     # URL → File (downloaded-from)
@@ -133,9 +133,7 @@ def test_malware_family_chain_links_url_to_file_no_process(builder):
     assert any(r["source_ref"] == uid and r["target_ref"] == fid for r in _rels(objs)), \
         "missing URL→File edge"
     # no commands → no Process node, so no Process→File edge
-    from tpot2cti.stix_ids import generate_process_id
-    pid = generate_process_id(s.sensor_hostname, s.session_id)
-    assert not any(r["source_ref"] == pid for r in _rels(objs))
+    assert not any(r.get("source_ref", "").startswith("process--") for r in _rels(objs))
 
 
 def test_no_chain_edges_without_downloads(builder):

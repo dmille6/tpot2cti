@@ -43,7 +43,9 @@ Why this exists (read this before changing anything!)
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import re
 import uuid
 from typing import Any, Optional
 
@@ -130,9 +132,69 @@ def generate_domain_id(fqdn: str) -> str:
     return sdo_id("domain-name", "domain-name", fqdn.lower())
 
 
-def generate_process_id(sensor: str, session_id: str) -> str:
-    """Process SCO id. Seed: ``process:<sensor>:<session_id>``."""
-    return sdo_id("process", "process", sensor, session_id)
+#: Commands beyond this are summarised rather than carried verbatim.
+MAX_COMMANDS_PER_PROCESS = 50
+
+#: Ephemeral temp-file paths in automated malware-drop probes
+#: (e.g. ``scp -qt /tmp/<random>``). Normalised so near-identical sessions
+#: reach one Process instead of one each.
+_TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}")
+
+
+def process_command_line(commands: list[str]) -> str:
+    """The canonical ``command_line`` for a Process — and, because Process ids
+    are content-addressed, its identity.
+
+    Lives here, next to the id generator, so the two cannot drift.
+
+    KNOWN UNDER-NORMALISATION: only the four temp dirs above are collapsed.
+    Live data has ~222 ``scp -t /usr/local/bin/<random>`` transcripts that miss
+    it, and PIDs, epochs, UUIDs and random filenames elsewhere in a command
+    will each fragment identity. Before content-addressing this only affected
+    how OpenCTI merged; now it also fragments our emitted id and defeats the
+    publisher's skip. It over-splits (many ids for one behaviour) rather than
+    over-merging (one id for two behaviours), so it is safe, but widening the
+    pattern is real remaining work.
+    """
+    if isinstance(commands, str):
+        # A str slices and iterates without error, so passing one here silently
+        # content-addresses on the first 50 CHARACTERS. Caught in review only
+        # because a Process->File edge stopped matching; nothing else would
+        # have surfaced it.
+        raise TypeError(
+            "process_command_line takes the command LIST, not a joined string"
+        )
+    capped = commands[:MAX_COMMANDS_PER_PROCESS]
+    capped = [_TMPFILE_RE.sub(r"\1/<tmpfile>", c) for c in capped]
+    marker = ""
+    if len(commands) > MAX_COMMANDS_PER_PROCESS:
+        # A COUNT here would be an identity bug: two sessions sharing the first
+        # 50 commands but with different tails of the SAME length would collide
+        # into one Process. Digest the omitted tail instead — different tails
+        # give different ids, and the count is still shown for the analyst.
+        tail = "\n".join(commands[MAX_COMMANDS_PER_PROCESS:])
+        digest = hashlib.sha256(tail.encode("utf-8", "replace")).hexdigest()[:16]
+        marker = (
+            f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more "
+            f"(tail sha256:{digest})"
+        )
+    return "\n".join(capped) + marker
+
+
+def generate_process_id(commands: list[str]) -> str:
+    """Process SCO id. Seed: ``process:<canonical command_line>``.
+
+    CONTENT-ADDRESSED. The old signature was ``(sensor, session_id)``, which
+    minted a fresh id for every session — 11,485 alias ids on a single live
+    observable. It is gone rather than deprecated: a session-scoped Process id
+    is never the right call, so the way to write one should not exist.
+
+    Takes the raw command LIST, not a string, and canonicalises internally.
+    Accepting a pre-canonicalised string would let a caller pass a plain
+    ``"\n".join(commands)`` and silently fork the id family, with nothing to
+    catch it — the signature makes that unwriteable.
+    """
+    return sdo_id("process", "process", process_command_line(commands))
 
 
 def generate_cryptographic_key_id(value: str) -> str:
