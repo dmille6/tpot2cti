@@ -979,6 +979,10 @@ def run_cycle(
         # extractor that never found anything, and a rejection rate moving
         # from 3% to 60% must be visible without reading DEBUG logs.
         "rejected_urls": builder.rejected_urls,
+        # Subset of rejected_urls whose host was one of OUR sensors. Separate
+        # because this number is the difference between "the extractor found
+        # nothing" and "we stopped publishing our own attack surface".
+        "rejected_own_surface_urls": builder.rejected_own_surface_urls,
         "rejected_domains": builder.rejected_domains,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
@@ -1028,6 +1032,7 @@ def run_cycle(
         f"sdos_by_type={dict(sdos_by_type)} publish_ok={publish_ok} "
         f"dedup={dedup_before}->{dedup_after} ({dedup_pct:.1f}%) "
         f"rejected_urls={builder.rejected_urls} "
+        f"(own_surface={builder.rejected_own_surface_urls}) "
         f"rejected_domains={builder.rejected_domains}"
     )
     return summary

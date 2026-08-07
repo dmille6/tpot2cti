@@ -167,9 +167,20 @@ Closure check. If a site cannot be typed, the set is wrong.
 | `builder.py:3167` | `_CMD_URL_RE` over `session.commands` | `SHELL_COMMAND` | no — correct only because ConPot no longer poisons `commands` |
 | `builder.py:2079/2989/3133` | `build_process(session.commands)` | `SHELL_COMMAND` | no |
 
-The only behavioural change at contract-introduction is line 2248 — which is
-the defect. Everything else is annotation. **That is the point:** the contract
-is cheap to adopt precisely because most call sites are already honest.
+**CORRECTION 2026-08-06 — this table was wrong, and the error mattered.**
+It named `builder.py:2248` (Suricata SNI/Host) as the only behavioural change.
+The dominant own-surface producer is actually `_build_web_session()`
+(`builder.py:2725`), fed by `h0neytr4p.py:387`, which reconstructs a full URL
+from the INBOUND `Host` header plus the request URI and appends it to
+`session.urls`. That path produced the majority of 53,880 own-surface Url
+observables measured after the 2026-08-06 backfill — the largest object type
+in the graph.
+
+So the contract is NOT "cheap to adopt because most call sites are already
+honest". Annotating it is cheap; LANDING it shrinks the Url corpus by ~98%.
+That is the right outcome, but it must be stated as the outcome. A separate
+host guard in `build_url` now refuses own-surface URLs directly, because a
+53,880-object fire should not wait on a multi-day refactor.
 
 Mailoney is the outstanding one. It appends received SMTP verbs to
 `session.commands` (measured live: score 75, T1059, a Process SDO reading

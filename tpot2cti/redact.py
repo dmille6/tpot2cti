@@ -119,6 +119,36 @@ class SensorRedactor:
         #: That has to be visible, not inferred.
         self.counts: dict = {}
 
+    def is_sensor_host(self, host: str) -> bool:
+        """True if `host` names one of OUR sensors — an address, a network
+        member, or a configured hostname.
+
+        Public predicate, deliberately separate from `redact()`. The builder
+        needs to REFUSE an object whose host is ours; it must not rewrite the
+        value, because a redacted URL is still a published URL and the string
+        `https://<sensor-address>/wp-login.php` is worse than no object at
+        all — it asserts an attacker resource that does not exist.
+        """
+        if not host:
+            return False
+        h = str(host).strip().lower().rstrip(".")
+        if not h:
+            return False
+        if h in self._names:                      # configured hostname
+            return True
+        if h in self._addrs:                      # configured literal address
+            return True
+        try:
+            addr = ipaddress.ip_address(h)
+        except ValueError:
+            return False
+        candidates = [addr]
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None:
+            candidates.append(mapped)
+        return any(c.version == n.version and c in n
+                   for c in candidates for n in self._nets)
+
     def _bump(self, reason: str) -> None:
         self.redactions += 1
         self.counts[reason] = self.counts.get(reason, 0) + 1

@@ -803,6 +803,18 @@ class STIXBuilder:
         #: confusion more than once.
         self.rejected_urls = 0
         self.rejected_domains = 0
+        #: Subset of rejected_urls whose host was one of OUR sensors. Counted
+        #: separately because this number moving is the difference between
+        #: "the extractor found nothing" and "we stopped publishing our own
+        #: attack surface".
+        self.rejected_own_surface_urls = 0
+        # Sensor identity, used to refuse own-surface URLs. Same source the
+        # publisher redacts with, so one configuration governs both.
+        try:
+            from tpot2cti.redact import from_env as _redactor_from_env
+            self._redactor = _redactor_from_env()
+        except Exception:      # pragma: no cover — never break the builder
+            self._redactor = None
 
         # Stable IDs for the operator + TLP marking — referenced everywhere
         self.operator_identity_id = generate_identity_id(
@@ -1290,6 +1302,42 @@ class STIXBuilder:
             # blocked, hunted or attributed by any consumer.
             self.rejected_urls += 1
             return None
+
+        # OUR OWN SURFACE IS NOT AN INDICATOR.
+        #
+        # Measured on the live corpus 2026-08-06 after a 19-day backfill:
+        # 53,880 Url observables, the LARGEST object type in the graph —
+        # larger than ipv4-addr — and every sampled value was a sensor's own
+        # address, e.g. https://<sensor-ip>/vtigercrm/AboSala7.php. Those are
+        # attackers probing us; publishing them tells a consumer that OUR
+        # attack surface is attacker infrastructure.
+        #
+        # The dominant producer is NOT the Suricata SNI path (which
+        # docs/EVIDENCE.md wrongly named): h0neytr4p.py:387 reconstructs a
+        # full URL from the inbound `Host` header plus the request URI and
+        # appends it to `session.urls`, which _build_web_session then emits
+        # verbatim with a "<attacker> requested <url>" edge.
+        #
+        # Refused, not redacted. A redacted URL is still a published URL, and
+        # `https://<sensor-address>/wp-login.php` asserts an attacker resource
+        # that does not exist.
+        #
+        # JNDI/Log4Shell URLs are EXEMPT: their host is frequently an
+        # unresolved template by design, the payload itself is the evidence,
+        # and build_unattributed_payload_objects anchors an entire
+        # Sighting/Note/CVE graph on the URL's id — rejecting one there would
+        # silently delete that graph, which is the dangling-anchor defect
+        # fixed in fix/output-syntactic-validation, reintroduced backwards.
+        if self._redactor is not None:
+            from urllib.parse import urlsplit
+            parts = urlsplit(url)
+            if parts.scheme.lower() not in _JNDI_SCHEMES:
+                host = (parts.hostname or "").strip().lower()
+                if host and self._redactor.is_sensor_host(host):
+                    self.rejected_urls += 1
+                    self.rejected_own_surface_urls += 1
+                    return None
+
         obj = {
             "type": "url",
             "id": generate_url_id(url),
