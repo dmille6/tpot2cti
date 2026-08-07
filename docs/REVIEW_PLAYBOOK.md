@@ -101,6 +101,20 @@ passes for the wrong reason.
 - **Hit:** `setup.sh` (repo root) spun 88,404 times on EOF because `read`'s failure was
   ignored and fell through to a `"y"` default.
 
+### Q8. "Did this turn a repeated defect class into an enforced contract at
+the choke point — or just fix this instance?"
+The generalisation of Q2, and the one §1 exists to serve. A fix that leaves
+the mechanism intact will regenerate.
+
+- **Would have caught earlier:** ConPot and Mailoney were both fixed while
+  `build_url` / `build_domain` / `build_process` still had no required
+  `evidence=`. Two instances, class open.
+- **Counter-example done right:** removing `hassh`/`ja3` from
+  `extract_artifacts` rather than deleting 217 bad Campaign SDOs, which would
+  have regenerated on the next cycle.
+- **Ask:** where is the choke point, and is the guard there or at the call
+  sites? See §1.2.
+
 ---
 
 ## 3. Operating notes for multi-model review
@@ -111,8 +125,10 @@ passes for the wrong reason.
   local file first and reference it in the prompt.
 - **`codex exec` hangs on stdin** unless redirected: `codex exec "$P" < /dev/null`,
   and `2>/dev/null` to suppress a ~1.2 MB model-catalog error blob.
-- **Claude subagents build their own venv and do run the suite.** Never treat a
-  codex MERGE verdict as test-backed.
+- **Give codex the venv path explicitly.** It is not that codex *cannot* run
+  pytest — it may simply not have the repo's deps. Handed a venv path it runs
+  the suite and reports real output. Without one it reviews statically, so an
+  unqualified MERGE verdict from it is not test-backed.
 - **Put the measured numbers in the prompt.** Reviews that were handed live
   figures disputed the diagnosis; reviews without them only reviewed the plan.
 - **Ask explicitly for disagreement.** "Do not just agree with us" changed the
@@ -122,16 +138,41 @@ passes for the wrong reason.
 
 ## 4. Does this file earn its keep?
 
-Track, per review round, how many findings came from **review** versus were
-**self-caught before review**.
+**Admission rule.** Only add an entry if it would have caught a defect that
+was actually shipped or actually found in review. No entry from theory. This
+is what stops the file growing without bound until nobody reads it.
 
-| date | round | review-found | self-caught |
-|---|---|---|---|
-| 2026-08-05 | 3 branches, 6 reviews | 1 blocker + ~12 should-fix | 2 (dangling ref, tftp scheme) |
-| 2026-08-05 | mailoney | 4 (incl. false bare-scan premise) | 1 (stale docstring) |
-| 2026-08-06 | redaction ×4 rounds | 4 (containment, visibility, mapped-v6, secret var) | 0 |
-| 2026-08-06 | own-surface URLs | 2 (wrong producer, JNDI trap) | 1 (bare-path count) |
+**Tag every serious review finding** (blocker / should-fix) as one of:
 
-Roughly **12:1 against self-catching**. If that ratio does not move over the
-next several rounds, this playbook is not working — say so and stop
-maintaining it. A file nobody measures is the same defect class it documents.
+| tag | meaning |
+|---|---|
+| `Q1`…`Q8` | a repeat of a class this playbook already documents |
+| `new-class` | a real finding the playbook does not cover — **add it** |
+| `self-caught` | found before review reached it |
+
+**The falsifiable test.** Across comparable substantial rounds,
+**`Q1`…`Q8`-tagged review findings should decline** while `new-class` findings
+persist. That is what "the playbook is working" looks like: the known traps
+get caught before review, and review spends its time on genuinely new ground.
+
+**Failure looks like the same Q-tag appearing round after round.** If that
+happens the playbook is being read and not used — delete it, or move that
+class into a mechanical check, which is stronger than prose anyway.
+
+A raw review-found-vs-self-caught ratio was the first version of this metric
+and it is not good enough: it can improve because reviews got lazier or the
+branches got simpler, and "self-caught" is self-reported by the party being
+measured. Tagging by class is harder to game because the tag names the trap.
+
+### Scoreboard
+
+| date | round | Q-tagged repeats | new-class | self-caught |
+|---|---|---|---|---|
+| 2026-08-05 | 3 branches, 6 reviews | — (baseline, pre-playbook) | 13 | 2 |
+| 2026-08-05 | mailoney | — | 4 | 1 |
+| 2026-08-06 | redaction ×4 rounds | — | 4 | 0 |
+| 2026-08-06 | own-surface URLs | — | 2 | 1 |
+| 2026-08-06 | this playbook | — | 3 (Q8 missing, `setup.sh` hole, weak metric) | 0 |
+
+The pre-playbook rounds are the baseline: roughly **12:1** review-found versus
+self-caught, all `new-class` by definition since nothing was written down yet.
