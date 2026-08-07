@@ -521,3 +521,11 @@ If you'd like to become a maintainer, the path is:
 
 Thanks again for being here. The project is better for every
 contribution.
+
+## Reviewing a change
+
+Hand [`REVIEW_PLAYBOOK.md`](REVIEW_PLAYBOOK.md) to the reviewer along with the
+diff. It records defects that actually occurred here and the questions that
+caught them — every entry has a date, a file and a number. Section 4 tracks
+whether it is still earning its keep; if the review-vs-self-caught ratio stops
+moving, delete it rather than maintain it.
