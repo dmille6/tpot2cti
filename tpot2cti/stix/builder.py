@@ -96,6 +96,28 @@ MAX_COMMANDS_PER_PROCESS = 50
 # Ephemeral temp-file paths in scp malware-drop probes; normalized to dedupe noise.
 _TMPFILE_RE = re.compile(r"(/tmp|/var/tmp|/dev/shm|/run/shm)/[A-Za-z0-9._-]{5,}")
 
+
+def _process_command_line(commands: list[str]) -> str:
+    """The canonical `command_line` for a Process -- and, since Process ids are
+    content-addressed, its identity.
+
+    This lives in ONE function on purpose. build_process emits the Process and
+    _link_download_chain anchors an edge on it; when each derived the string
+    itself they could drift, and a drifted anchor is a dangling relationship
+    that OpenCTI accepts and silently never resolves.
+    """
+    # Cap for bundle-size sanity.
+    capped = commands[:MAX_COMMANDS_PER_PROCESS]
+    # Normalize ephemeral temp-file paths (e.g. automated scp malware-drop
+    # probes: scp -qt "/tmp/<random>") so near-identical sessions do not each
+    # spawn a unique Process observable.
+    capped = [_TMPFILE_RE.sub(r"\1/<tmpfile>", c) for c in capped]
+    marker = (
+        f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more"
+        if len(commands) > MAX_COMMANDS_PER_PROCESS else ""
+    )
+    return "\n".join(capped) + marker
+
 # Attacker-IP validation/canonicalization + deterministic ids live in
 # tpot2cti.stix_ids: `canonical_ip`, `attacker_ip_observable_id`,
 # `attacker_ip_indicator_id`. Every attacker-IP id in this file goes
@@ -1435,28 +1457,34 @@ class STIXBuilder:
         # keeps the full transcript. See _session_is_recon_only.
         if self.config.cycle.drop_recon_process and _session_is_recon_only(commands):
             return None
-        # Cap commands to MAX_COMMANDS_PER_PROCESS for bundle-size sanity
-        capped = commands[:MAX_COMMANDS_PER_PROCESS]
-        # Normalize ephemeral temp-file paths (e.g. automated scp malware-drop
-        # probes: scp -qt "/tmp/<random>") so near-identical sessions do not
-        # each spawn a unique Process observable.
-        capped = [_TMPFILE_RE.sub(r"\1/<tmpfile>", c) for c in capped]
-        truncated_marker = (
-            f"\n... and {len(commands) - MAX_COMMANDS_PER_PROCESS} more"
-            if len(commands) > MAX_COMMANDS_PER_PROCESS else ""
-        )
-        cmd_line = "\n".join(capped) + truncated_marker
-        # Pure scp-to-tempfile noise collapses to one content-addressed Process
-        # (keeps the TTP signal as a single observable with many sightings).
-        _stripped = [c.strip() for c in capped if c.strip()]
-        _is_scp_noise = bool(_stripped) and all(
-            c.startswith("scp ") and "/<tmpfile>" in c for c in _stripped
-        )
-        _proc_id = (
-            sdo_id("process", "process", session.sensor_hostname, cmd_line)
-            if _is_scp_noise
-            else generate_process_id(session.sensor_hostname, session.session_id)
-        )
+        cmd_line = _process_command_line(commands)
+        # CONTENT-ADDRESSED, always. The id is the command transcript.
+        #
+        # It used to be `generate_process_id(sensor, session_id)` — unique per
+        # session — with content-addressing applied ONLY to a narrow
+        # scp-to-tempfile case. Measured on the live corpus 2026-08-06, that
+        # cost: a single Process observable had accumulated **11,485 alias
+        # STIX ids**, and roughly 332,000 distinct ids had collapsed into
+        # 3,663 objects.
+        #
+        # Nothing appeared broken because OpenCTI recomputes its own
+        # content-derived `standard_id` for Process and files ours as an
+        # alias. But the consequences were real: `object_max_state` carried
+        # 1,015,137 rows for a ~108k-object graph, every Process was re-emitted
+        # under a NEW id every cycle so the publisher could never skip it, and
+        # the observable index ran 7.3 KB/doc against 3.6 KB for SDOs — the
+        # alias arrays being the difference.
+        #
+        # A Process here models the command sequence, not one execution of it.
+        # Two attackers running identical commands SHOULD reach one observable,
+        # with the `related-to` edges to each IP carrying who ran it — which is
+        # the collapse OpenCTI was performing anyway. Deriving the same id
+        # ourselves just stops us fighting it.
+        #
+        # ID-FAMILY BREAK: existing Process ids will not be re-derived. The
+        # OBJECTS survive, because OpenCTI had already merged them by content;
+        # only the stale alias arrays are orphaned.
+        _proc_id = generate_process_id(cmd_line)
         obj = {
             "type": "process",
             "id": _proc_id,
@@ -2118,8 +2146,15 @@ class STIXBuilder:
             for sha in session.malware_hashes if sha
         }
         # Process → File (command session dropped these files)
-        if session.commands and file_ids:
-            proc_id = generate_process_id(session.sensor_hostname, session.session_id)
+        # The id must be derived exactly as build_process derives it (shared
+        # helper), and the Process must ACTUALLY have been emitted -- it is
+        # dropped for recon-only sessions when cycle.drop_recon_process is set,
+        # and anchoring on a Process that will never exist is a dangling ref.
+        # Same reasoning as the URL path below.
+        proc_id = generate_process_id(
+            _process_command_line(session.commands),
+        ) if session.commands else None
+        if proc_id and file_ids and proc_id in self._emitted_ids:
             for sha, fid in file_ids.items():
                 if rel := self.build_relationship(
                     proc_id, "related-to", fid,

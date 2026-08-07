@@ -130,9 +130,18 @@ def generate_domain_id(fqdn: str) -> str:
     return sdo_id("domain-name", "domain-name", fqdn.lower())
 
 
-def generate_process_id(sensor: str, session_id: str) -> str:
-    """Process SCO id. Seed: ``process:<sensor>:<session_id>``."""
-    return sdo_id("process", "process", sensor, session_id)
+def generate_process_id(command_line: str) -> str:
+    """Process SCO id. Seed: ``process:<command_line>``.
+
+    CONTENT-ADDRESSED. The old signature was ``(sensor, session_id)``, which
+    minted a fresh id for every session — 11,485 alias ids on a single live
+    observable. It is gone rather than deprecated: a session-scoped Process id
+    is never the right call, so the way to write one should not exist.
+
+    Callers must pass the canonical string from
+    ``builder._process_command_line``, not a raw command list.
+    """
+    return sdo_id("process", "process", command_line)
 
 
 def generate_cryptographic_key_id(value: str) -> str:
