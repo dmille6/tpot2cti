@@ -1086,6 +1086,72 @@ class STIXBuilder:
             node_id=attacker_ip_indicator_id(ip),
         )
 
+    def _emit_country_location(
+        self, country_code: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Country Location node.
+
+        Geo nodes are the most-shared objects in the graph -- thousands of
+        attacker IPs resolve to a few hundred countries -- so under `if
+        country:` only the FIRST attacker per country per bundle kept its
+        `located-at` edge and everyone else silently had no country at all.
+
+        The id upper-cases the code, matching build_country_location's
+        `cc = country_code.upper()`.
+        """
+        return self._emit_node(
+            self.build_country_location(country_code, *args, **kwargs),
+            out=out,
+            node_id=(generate_country_location_id(country_code.upper())
+                     if country_code else None),
+        )
+
+    def _emit_city_location(
+        self, country_code: str, city: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """City Location node. Same sharing profile as country, same id
+        upper-casing of the country code; the city is used verbatim, as
+        build_city_location does."""
+        return self._emit_node(
+            self.build_city_location(country_code, city, *args, **kwargs),
+            out=out,
+            node_id=(generate_city_location_id(country_code.upper(), city)
+                     if country_code and city else None),
+        )
+
+    def _emit_autonomous_system(
+        self, asn, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Autonomous-System node. Heavily shared -- one hosting AS fronts
+        thousands of attacker IPs, which is exactly the `belongs-to` fan-in an
+        analyst wants and exactly what the gate was deleting."""
+        return self._emit_node(
+            self.build_autonomous_system(asn, *args, **kwargs),
+            out=out,
+            node_id=generate_autonomous_system_id(asn) if asn is not None else None,
+        )
+
+    def _emit_ipv4(
+        self, ip: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """IPv4 observable, for edges pointing AT an address.
+
+        build_ipv4 does not call _dedup itself -- it delegates to
+        _build_ip_observable, which does. That indirection is why the first
+        completeness check missed this family entirely, and why the check now
+        follows return values through helpers instead of looking for a
+        literal _dedup call.
+
+        The id canonicalises via canonical_ip, matching build_ipv4's
+        `fam = canonical_ip(ip)` / `fam[1]`.
+        """
+        fam = canonical_ip(ip)
+        return self._emit_node(
+            self.build_ipv4(ip, **kwargs),
+            out=out,
+            node_id=generate_ipv4_id(fam[1]) if fam and fam[0] == "ipv4" else None,
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Foundation objects
     # ──────────────────────────────────────────────────────────────────
@@ -2761,11 +2827,11 @@ class STIXBuilder:
                 # edge dangles into MISSING_REFERENCE.
                 target_ip = event.dst_ip or session.src_ip
                 if target_ip:
-                    target_ipv4 = self.build_ipv4(target_ip, session=session)
-                    if target_ipv4:
-                        out.append(target_ipv4)
+                    target_ipv4_id = self._emit_ipv4(
+                        target_ip, out=out, session=session)
+                    if target_ipv4_id:
                         if rel := self.build_relationship(
-                            domain_id, "resolves-to", target_ipv4["id"],
+                            domain_id, "resolves-to", target_ipv4_id,
                             description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
                         ):
                             out.append(rel)
@@ -3003,39 +3069,39 @@ class STIXBuilder:
 
         # GeoIP (logstash-enriched)
         if event.src_country_code:
-            country = self.build_country_location(
-                event.src_country_code, event.src_country_name, session=session,
+            country_id = self._emit_country_location(
+                event.src_country_code, event.src_country_name,
+                out=out, session=session,
             )
-            if country:
-                out.append(country)
+            if country_id:
                 rel = self.build_relationship(
-                    ip_obj["id"], "located-at", country["id"],
+                    ip_obj["id"], "located-at", country_id,
                     description=f"{event.src_ip} geolocated to {event.src_country_code}",
                 )
                 if rel:
                     out.append(rel)
             if event.src_city:
-                city = self.build_city_location(
-                    event.src_country_code, event.src_city, session=session,
+                city_id = self._emit_city_location(
+                    event.src_country_code, event.src_city,
+                    out=out, session=session,
                 )
-                if city:
-                    out.append(city)
+                if city_id:
                     rel = self.build_relationship(
-                        ip_obj["id"], "located-at", city["id"],
+                        ip_obj["id"], "located-at", city_id,
                         description=f"{event.src_ip} geolocated to {event.src_city}",
                     )
                     if rel:
                         out.append(rel)
 
         if event.src_asn:
-            asn = self.build_autonomous_system(
-                event.src_asn, event.src_as_org, session=session,
+            asn_id = self._emit_autonomous_system(
+                event.src_asn, event.src_as_org,
+                out=out, session=session,
             )
-            if asn:
-                out.append(asn)
+            if asn_id:
                 # Use the canonical STIX "belongs-to" for IPv4 → AS
                 rel = self.build_relationship(
-                    ip_obj["id"], "belongs-to", asn["id"],
+                    ip_obj["id"], "belongs-to", asn_id,
                     description=f"{event.src_ip} belongs to AS{event.src_asn}",
                 )
                 if rel:

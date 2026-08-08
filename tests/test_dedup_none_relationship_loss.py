@@ -31,6 +31,10 @@ from tpot2cti.stix_ids import (
     generate_cryptographic_key_id,
     attacker_ip_indicator_id,
     attacker_ip_observable_id,
+    generate_country_location_id,
+    generate_city_location_id,
+    generate_autonomous_system_id,
+    generate_ipv4_id,
 )
 
 NOW = datetime(2026, 8, 7, tzinfo=timezone.utc)
@@ -515,4 +519,99 @@ def test_a_second_session_from_one_ip_keeps_its_sighting(builder):
     assert sightings, (
         "second session from the same IP produced no Sighting on its "
         "Indicator — observed counts are understated"
+    )
+
+
+# ── Round four: the nodes an allowlist wrongly excused ────────────────────
+#
+# Round three added a completeness test and, in the same commit, EXCUSED the
+# geo/ASN nodes there on the claim that their inbound edges are identical
+# across sessions. That claim was false and codex reproduced the loss: the
+# edge source is the attacker's IP, so two attackers in one country produce
+# two DIFFERENT edges to one SHARED node — the exact shape of this defect.
+# A wrong allowlist entry is worse than a missing test, because it tells the
+# next reader the question was already answered.
+#
+# Geo and ASN are the most-shared nodes in the graph: thousands of attacker
+# IPs resolve to a few hundred countries and a few thousand ASNs. So this was
+# not a rare corner — under `if country:` only the first attacker per country
+# per bundle had a country at all.
+
+def _ctx(builder, ip, *, cc="DE", city="Berlin", asn=64512):
+    ev = ParsedEvent(
+        src_ip=ip, timestamp=NOW, sensor_hostname="s1", event_type="Cowrie",
+        dst_port=22, src_country_code=cc, src_asn=asn,
+    )
+    ev.src_city = city
+    ev.meta = {}
+    return builder.build_attacker_context(ev, session=AttackSession.from_event(ev))
+
+
+def test_a_second_attacker_in_the_same_country_still_gets_located_at(builder):
+    a = _ctx(builder, IP_A)
+    b = _ctx(builder, IP_B)
+    loc = [o for o in a if o.get("type") == "location" and o.get("country") == "DE"]
+    assert loc, "guard: the first attacker must emit the country node"
+    assert not any(o.get("type") == "location" and o.get("country") == "DE"
+                   and "city" not in o for o in b), \
+        "guard: the shared country node must NOT be re-emitted — that is the dedup"
+    assert _edges(b, attacker_ip_observable_id(IP_B), "located-at",
+                  generate_country_location_id("DE")), (
+        "second attacker in the same country has no located-at edge — the "
+        "country node then shows one IP instead of every attacker from it"
+    )
+
+
+def test_a_second_attacker_in_the_same_city_still_gets_located_at(builder):
+    _ctx(builder, IP_A)
+    b = _ctx(builder, IP_B)
+    assert _edges(b, attacker_ip_observable_id(IP_B), "located-at",
+                  generate_city_location_id("DE", "Berlin")), \
+        "second attacker in the same city lost its located-at edge"
+
+
+def test_a_second_attacker_in_the_same_asn_still_belongs_to_it(builder):
+    _ctx(builder, IP_A)
+    b = _ctx(builder, IP_B)
+    assert _edges(b, attacker_ip_observable_id(IP_B), "belongs-to",
+                  generate_autonomous_system_id(64512)), (
+        "second attacker in the same ASN lost its belongs-to edge — one "
+        "hosting AS fronting thousands of IPs is exactly the fan-in an "
+        "analyst wants and exactly what the gate was deleting"
+    )
+
+
+def test_a_second_domain_resolving_to_a_known_ip_keeps_its_resolves_to(builder):
+    """Suricata SNI -> destination IP.
+
+    The one codex found that I had argued was a false positive. My reasoning
+    was that build_ipv4 does not call _dedup — true, and irrelevant: it
+    RETURNS _build_ip_observable(...), which does. That indirection is also
+    why the first version of the completeness test missed this whole family.
+
+    Two different SNI domains hitting the same destination address is the
+    normal case (shared CDN or hosting IP), and the second one lost its edge.
+    """
+    dst = "198.51.100.7"
+
+    def alert(ip, sni):
+        ev = ParsedEvent(
+            src_ip=ip, timestamp=NOW, sensor_hostname="s1",
+            event_type="Suricata", dst_port=443, dst_ip=dst,
+            src_country_code="DE", src_asn=64512,
+        )
+        ev.meta = {"tls_sni": sni, "signature": "ET TLS test",
+                   "signature_id": 2002}
+        return builder.build_suricata_alert(AttackSession.from_event(ev))
+
+    a = alert(IP_A, "first.example")
+    b = alert(IP_B, "second.example")
+    dst_id = generate_ipv4_id(dst)
+    assert _edges(a, generate_domain_id("first.example"), "resolves-to", dst_id), \
+        "guard: the first domain must get its resolves-to edge"
+    assert not any(o.get("id") == dst_id for o in b), \
+        "guard: the shared destination IP must NOT be re-emitted"
+    assert _edges(b, generate_domain_id("second.example"), "resolves-to", dst_id), (
+        "second domain resolving to an already-emitted IP lost its "
+        "resolves-to edge — shared hosting then shows one domain"
     )
