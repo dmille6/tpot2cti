@@ -302,3 +302,62 @@ def test_as_dt_is_total(builder):
     assert builder._as_dt("2026-08-07T09:00:00Z") == \
         datetime(2026, 8, 7, 9, tzinfo=timezone.utc), "Z suffix"
     assert builder._as_dt("2026-08-07T09:00:00.123456+00:00").microsecond == 123456
+
+
+# ── the four kept/dup combinations, exhaustively ──────────────────────────
+#
+# Widening was two independent "is this one wider?" checks, which is subtly
+# wrong when the KEPT edge is start-only: an earlier duplicate moved the start
+# back and left the stop absent, silently dropping the later point that was
+# actually observed. Found by codex walking the combinations, which is why
+# they are now all pinned rather than sampled.
+
+def _mk(builder, A, B, first, last):
+    from tpot2cti.parsers.base import AttackSession
+    s = AttackSession(src_ip="203.0.113.1", session_id="c", sensor_hostname="s1",
+                      event_type="Cowrie", first_seen=first, last_seen=last)
+    return builder.build_relationship(A, "related-to", B, session=s)
+
+
+def test_every_kept_dup_combination_covers_all_observed_points(builder, cfg):
+    from datetime import datetime, timezone
+    from tpot2cti.stix.builder import STIXBuilder
+    t = lambda h: datetime(2026, 8, 7, h, tzinfo=timezone.utc)
+    A = "ipv4-addr--00000000-0000-5000-8000-000000000020"
+    B = "url--00000000-0000-5000-8000-000000000021"
+
+    # (kept first, kept last, dup first, dup last, expected start, expected end)
+    # A `last` EARLIER than `first` makes the guard emit a start-only edge.
+    cases = [
+        ("full / full",             t(10), t(11), t(14), t(15), t(10), t(15)),
+        ("full / start-only",       t(10), t(11), t(14), t(9),  t(10), t(14)),
+        ("start-only / full",       t(14), t(9),  t(10), t(11), t(10), t(14)),
+        ("start-only / start-only", t(14), t(9),  t(10), t(9),  t(10), t(14)),
+        ("dup entirely earlier",    t(14), t(15), t(9),  t(10), t(9),  t(15)),
+    ]
+    for i, (name, kf, kl, df, dl, want_start, want_end) in enumerate(cases):
+        b = STIXBuilder(cfg)      # fresh, so each case starts clean
+        kept = _mk(b, A, B, kf, kl)
+        assert kept is not None, f"{name}: guard — kept edge must exist"
+        _mk(b, A, B, df, dl)
+        got_start = b._as_dt(kept["start_time"])
+        got_end = b._as_dt(kept.get("stop_time")) or got_start
+        assert got_start == want_start, f"{name}: start {got_start} != {want_start}"
+        assert got_end == want_end, (
+            f"{name}: window ends {got_end}, but {want_end} was observed"
+        )
+        assert got_end >= got_start, f"{name}: inverted window"
+
+
+def test_a_session_with_mixed_timezone_awareness_does_not_crash(builder):
+    """build_relationship compared last >= first directly, which raises."""
+    from datetime import datetime, timezone
+    from tpot2cti.parsers.base import AttackSession
+    s = AttackSession(src_ip="203.0.113.1", session_id="mix", sensor_hostname="s1",
+                      event_type="Cowrie",
+                      first_seen=datetime(2026, 8, 7, 10, tzinfo=timezone.utc),
+                      last_seen=datetime(2026, 8, 7, 11))     # naive
+    rel = builder.build_relationship(
+        "ipv4-addr--00000000-0000-5000-8000-000000000022", "related-to",
+        "url--00000000-0000-5000-8000-000000000023", session=s)
+    assert rel["start_time"], "the edge should still carry its start"

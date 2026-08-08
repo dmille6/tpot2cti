@@ -923,20 +923,36 @@ class STIXBuilder:
             # without any is the same unearned assertion in miniature.
             return
 
-        d_start, d_stop = self._as_dt(dup.get("start_time")), self._as_dt(dup.get("stop_time"))
-        k_start, k_stop = self._as_dt(kept.get("start_time")), self._as_dt(kept.get("stop_time"))
+        # Both sides collapse to (earliest point, latest point) FIRST, then
+        # the union is taken. Doing it as two independent "is this one wider?"
+        # checks was subtly wrong: a start-only kept edge at 14:00 meeting an
+        # earlier duplicate moved the start back to 10:00 and left the stop
+        # absent, silently dropping the 14:00 point that was actually
+        # observed. A start-only observation is a closed window of zero width,
+        # not a window with no end, and treating it that way makes the four
+        # kept/dup combinations fall out of one min/max.
+        def _bounds(rel):
+            start = self._as_dt(rel.get("start_time"))
+            stop = self._as_dt(rel.get("stop_time"))
+            return start, (stop or start)
 
-        # A start-only observation still PROVES activity at that instant, so it
-        # can push the stop out even with no stop of its own. Without this, the
-        # start-only edges the stop>=start guard deliberately creates could
-        # never widen anything -- the original bug surviving in a narrower form.
-        d_end = d_stop or d_start
-        k_end = k_stop or k_start
+        k_start, k_end = _bounds(kept)
+        d_start, d_end = _bounds(dup)
 
-        if d_start is not None and (k_start is None or d_start < k_start):
-            kept["start_time"] = d_start.isoformat()
-        if d_end is not None and (k_end is None or d_end > k_end):
-            kept["stop_time"] = d_end.isoformat()
+        starts = [x for x in (k_start, d_start) if x is not None]
+        ends = [x for x in (k_end, d_end) if x is not None]
+        if not starts:
+            return
+        new_start, new_end = min(starts), max(ends) if ends else None
+
+        kept["start_time"] = new_start.isoformat()
+        if new_end is not None and new_end > new_start:
+            kept["stop_time"] = new_end.isoformat()
+        # new_end == new_start means every observation was the same instant.
+        # Leave the edge start-only rather than assert an end: the stop>=start
+        # guard produces start-only edges precisely when the end is UNKNOWN,
+        # and writing start==stop would turn "we do not know" into "it ended
+        # exactly then".
 
     # ──────────────────────────────────────────────────────────────────
     # Emit-and-anchor: _dedup's counterpart
@@ -2440,11 +2456,14 @@ class STIXBuilder:
             # and a rejected bundle is a bad way to find out. An inverted pair
             # means we do not actually know the window, so publish the start
             # and stay quiet about the end rather than assert a wrong one.
-            if last is not None and last >= first:
-                obj["start_time"] = first.isoformat()
+            # Compared through _as_dt, not directly: a session whose bounds
+            # differ in tz-awareness raises TypeError on `>=`, which would
+            # abort the build mid-bundle.
+            f_dt = self._as_dt(first.isoformat())
+            l_dt = self._as_dt(last.isoformat()) if last is not None else None
+            obj["start_time"] = first.isoformat()
+            if f_dt is not None and l_dt is not None and l_dt >= f_dt:
                 obj["stop_time"] = last.isoformat()
-            else:
-                obj["start_time"] = first.isoformat()
         else:
             # Counted, never silent. A rising number here means a producer is
             # emitting edges outside any session context and the graph is
