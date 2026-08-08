@@ -211,3 +211,59 @@ def test_an_inverted_window_publishes_no_stop_time(builder):
         "published stop_time < start_time — STIX-invalid, and OpenCTI rejects "
         "the whole bundle over it"
     )
+
+
+def test_a_start_only_observation_still_pushes_the_stop_out(builder):
+    """A hole opened by the stop>=start guard itself.
+
+    That guard deliberately emits start-only edges. If only a duplicate's
+    stop_time could widen the kept stop, those observations would widen
+    nothing — the original recurring-edge bug surviving in a narrower form.
+    A start-only observation still PROVES activity at that instant.
+    """
+    from datetime import datetime, timezone
+    from tpot2cti.parsers.base import AttackSession
+    A = "ipv4-addr--00000000-0000-5000-8000-00000000000c"
+    B = "url--00000000-0000-5000-8000-00000000000d"
+    t = lambda h, m=0: datetime(2026, 8, 7, h, m, tzinfo=timezone.utc)
+
+    kept = _win(builder, A, B, t(10, 0), t(10, 5))
+    # inverted -> start-only, per the guard
+    inverted = AttackSession(src_ip="203.0.113.1", session_id="i",
+                             sensor_hostname="s1", event_type="Cowrie",
+                             first_seen=t(14), last_seen=t(9))
+    builder.build_relationship(A, "related-to", B, session=inverted)
+    assert kept["stop_time"] == t(14).isoformat(), (
+        "a start-only observation at 14:00 did not push the stop past 10:05"
+    )
+
+
+def test_windows_are_compared_as_instants_not_as_strings(builder):
+    """_parse_timestamp does not normalise to UTC, so an offset survives.
+
+    This fixture is built so string order DISAGREES with chronological order,
+    which the obvious version of this test does not do: the duplicate's end
+    is "2026-08-07T10:30:00+02:00" = 08:30Z, EARLIER than the kept 09:00Z —
+    but as a string "10:30…" sorts after "09:00…". Comparing strings would
+    widen the stop BACKWARDS, publishing an end before an observation we
+    already had.
+    """
+    from datetime import datetime, timezone, timedelta
+    from tpot2cti.parsers.base import AttackSession
+    A = "ipv4-addr--00000000-0000-5000-8000-00000000000e"
+    B = "url--00000000-0000-5000-8000-00000000000f"
+    utc = lambda h, m=0: datetime(2026, 8, 7, h, m, tzinfo=timezone.utc)
+    plus2 = timezone(timedelta(hours=2))
+
+    kept = _win(builder, A, B, utc(8), utc(9))          # 08:00Z – 09:00Z
+    earlier_but_sorts_later = AttackSession(
+        src_ip="203.0.113.1", session_id="tz", sensor_hostname="s1",
+        event_type="Cowrie",
+        first_seen=datetime(2026, 8, 7, 10, tzinfo=plus2),      # 08:00Z
+        last_seen=datetime(2026, 8, 7, 10, 30, tzinfo=plus2),   # 08:30Z
+    )
+    builder.build_relationship(A, "related-to", B, session=earlier_but_sorts_later)
+    assert builder._as_dt(kept["stop_time"]) == utc(9), (
+        f"stop moved to {kept['stop_time']} — string comparison widened the "
+        "window BACKWARDS across a timezone offset"
+    )

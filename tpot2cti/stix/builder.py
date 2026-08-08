@@ -875,6 +875,24 @@ class STIXBuilder:
             self._timed_relationships[oid] = obj
         return obj
 
+    @staticmethod
+    def _as_dt(value: Optional[str]):
+        """Parse a STIX timestamp for COMPARISON.
+
+        Not string comparison. Lexicographic order equals chronological order
+        only if every value carries the same UTC offset, and _parse_timestamp
+        does not normalise: an input with +02:00 stays +02:00, so "…T09:00+02:00"
+        sorts before "…T08:30+00:00" while being LATER. Normalising here keeps
+        that out of the window arithmetic.
+        """
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return dt if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
     def _widen_relationship_window(self, oid: str, dup: dict) -> None:
         """Union the duplicate's observation window into the one we kept.
 
@@ -892,13 +910,25 @@ class STIXBuilder:
         kept = self._timed_relationships.get(oid)
         if kept is None:
             # The kept copy had no window at all (emitted outside a session
-            # context). A later timed observation is strictly better than none.
+            # context). A later timed observation is strictly better than none,
+            # but attaching one session's times to an edge that was emitted
+            # without any is the same unearned assertion in miniature.
             return
-        start, stop = dup.get("start_time"), dup.get("stop_time")
-        if start and start < kept.get("start_time", start):
-            kept["start_time"] = start
-        if stop and stop > kept.get("stop_time", ""):
-            kept["stop_time"] = stop
+
+        d_start, d_stop = self._as_dt(dup.get("start_time")), self._as_dt(dup.get("stop_time"))
+        k_start, k_stop = self._as_dt(kept.get("start_time")), self._as_dt(kept.get("stop_time"))
+
+        # A start-only observation still PROVES activity at that instant, so it
+        # can push the stop out even with no stop of its own. Without this, the
+        # start-only edges the stop>=start guard deliberately creates could
+        # never widen anything -- the original bug surviving in a narrower form.
+        d_end = d_stop or d_start
+        k_end = k_stop or k_start
+
+        if d_start is not None and (k_start is None or d_start < k_start):
+            kept["start_time"] = d_start.isoformat()
+        if d_end is not None and (k_end is None or d_end > k_end):
+            kept["stop_time"] = d_end.isoformat()
 
     # ──────────────────────────────────────────────────────────────────
     # Emit-and-anchor: _dedup's counterpart
