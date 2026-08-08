@@ -1131,6 +1131,21 @@ class STIXBuilder:
             node_id=generate_autonomous_system_id(asn) if asn is not None else None,
         )
 
+    def _emit_ip_observable(
+        self, ip: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """The attacker's own address (v4 or v6), for build_attacker_context.
+
+        Distinct from _emit_ipv4, which is for an address the attacker POINTED
+        AT. Same id helper as build_ip_observable: attacker_ip_observable_id,
+        which canonicalises and picks the family.
+        """
+        return self._emit_node(
+            self.build_ip_observable(ip, *args, **kwargs),
+            out=out,
+            node_id=attacker_ip_observable_id(ip),
+        )
+
     def _emit_ipv4(
         self, ip: str, *, out: list[dict], **kwargs,
     ) -> Optional[str]:
@@ -2817,15 +2832,24 @@ class STIXBuilder:
             # resolves-to observation after the first.
             domain_id = self._emit_domain(fqdn, out=out, session=session)
             if domain_id:
-                # Domain-Name → resolves-to → IPv4-Addr (dst_ip preferred,
-                # since the SNI/host refers to the destination the
-                # attacker is trying to reach; if no dst_ip, fall back to
-                # the alert's src_ip per V1_SPEC §5.2 phrasing).
-                # Build the target observable via build_ipv4 so it is (a)
-                # validated (malformed/IPv6 dst_ip → skipped, not a bad SCO)
-                # and (b) present IN this bundle — otherwise the resolves-to
-                # edge dangles into MISSING_REFERENCE.
-                target_ip = event.dst_ip or session.src_ip
+                # Domain-Name → resolves-to → IPv4-Addr. The SNI/Host names
+                # the DESTINATION the attacker is trying to reach, so only
+                # dst_ip can answer it.
+                #
+                # There used to be an `or session.src_ip` fallback here. It
+                # asserted that the requested name resolves to the ATTACKER's
+                # own address, which no observation establishes — the attacker
+                # sent us a name and we saw where the packet came from, which
+                # are unrelated facts. It was masked until now: build_ipv4
+                # returned None for an address attacker-context had already
+                # emitted this bundle, so the edge was skipped by accident.
+                # Content-anchoring the id removed the accident and exposed
+                # the assertion, which is the wrong half to keep.
+                #
+                # _emit_ipv4 keeps the observable validated (malformed / IPv6
+                # dst_ip is skipped rather than published as a bad SCO) and
+                # present IN this bundle, so the edge cannot dangle.
+                target_ip = event.dst_ip
                 if target_ip:
                     target_ipv4_id = self._emit_ipv4(
                         target_ip, out=out, session=session)
@@ -3062,10 +3086,23 @@ class STIXBuilder:
         enrichment + pivot menu external_references.
         """
         out: list[dict] = []
-        ip_obj = self.build_ip_observable(event.src_ip, session=session)
-        if not ip_obj:
+        # The attacker's own address. Emitted through the wrapper, so a repeat
+        # of this IP inside one bundle still yields an anchor id rather than
+        # aborting the whole context.
+        #
+        # This used to `return out` when build_ip_observable returned None.
+        # That conflated "not a usable address" with "already emitted this
+        # bundle", and the second meaning silently dropped the geo and ASN
+        # edges below. Harmless only while a repeated IP carries identical
+        # enrichment -- which is not guaranteed: GeoIP can resolve the same
+        # address to a different city or ASN on two events in one window, and
+        # then those edges are genuinely different and genuinely lost. That
+        # was the last excuse standing in the sweep's allowlist; it does not
+        # need excusing now.
+        ip_id = self._emit_ip_observable(event.src_ip, out=out, session=session)
+        if not ip_id:
             return out
-        out.append(ip_obj)
+        ip_obj = {"id": ip_id}
 
         # GeoIP (logstash-enriched)
         if event.src_country_code:

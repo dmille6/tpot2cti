@@ -61,16 +61,6 @@ ALLOWED = {
     # Stops being true if any caller starts doing `if sensor:` before an edge.
     "build_sensor_identity": "callers use the deterministic id, not the object",
 
-    # The attacker's OWN address. Every edge out of build_attacker_context is
-    # keyed on this same IP (located-at country/city, belongs-to ASN), so a
-    # duplicate really is the identical set of edges and build_relationship
-    # dedups them. Contrast build_ipv4 / build_referenced_ipv4, which describe
-    # an address the attacker POINTED AT — there the other endpoint varies per
-    # session, which is why those are wrapped. Stops being true if
-    # build_attacker_context ever emits an edge whose other end is
-    # per-session (a sighting, a timestamped edge, a sensor).
-    "build_ip_observable": "attacker's own IP; all its edges are IP-keyed",
-
     # No callers. Kept because build_ip_indicator handles v6 attackers and a
     # v6 observable will be wanted; wrap it the moment it gains a caller.
     "build_ipv6": "no callers today",
@@ -98,23 +88,75 @@ def _dedup_builders_and_wrappers():
                if isinstance(n, ast.ClassDef) and n.name == "STIXBuilder")
     fns = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
 
+    def _own_nodes(fn):
+        """fn's body, NOT descending into nested function definitions.
+
+        `ast.walk` crosses into inner functions, so a closure containing
+        `return self._dedup(...)` would mark its ENCLOSING method as
+        dedup-returning. False positives here are only noise, but they train
+        people to add allowlist excuses, which is how a wrong excuse gets in.
+        """
+        stack, seen_fn = list(ast.iter_child_nodes(fn)), []
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            seen_fn.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        return seen_fn
+
+    def _calls_dedup(expr, seen):
+        """Does this expression evaluate to something _dedup produced?
+
+        Handles the shapes that actually occur, and a couple that do not yet:
+        a direct call, either arm of a ternary, and a walrus. A bare Name is
+        resolved below by looking at what was assigned to it.
+        """
+        if isinstance(expr, ast.IfExp):
+            return _calls_dedup(expr.body, seen) or _calls_dedup(expr.orelse, seen)
+        if isinstance(expr, ast.NamedExpr):
+            return _calls_dedup(expr.value, seen)
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            return expr.func.attr == "_dedup" or returns_deduped(expr.func.attr, seen)
+        return False
+
     def returns_deduped(name, seen=None):
         seen = seen if seen is not None else set()
         if name in seen or name not in fns:
             return False
         seen.add(name)
-        for node in ast.walk(fns[name]):
+        body = _own_nodes(fns[name])
+
+        # Names assigned from a deduped expression, so `obj = self._dedup(...)`
+        # followed by `return obj` is not a false negative. This is the shape
+        # the first corrected walk still missed.
+        deduped_names = {
+            t.id
+            for node in body if isinstance(node, ast.Assign)
+            if _calls_dedup(node.value, seen)
+            for t in node.targets if isinstance(t, ast.Name)
+        }
+        for node in body:
             if not isinstance(node, ast.Return) or node.value is None:
                 continue
-            v = node.value
-            if isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute):
-                if v.func.attr == "_dedup":
-                    return True
-                if returns_deduped(v.func.attr, seen):
-                    return True
+            if _calls_dedup(node.value, seen):
+                return True
+            if isinstance(node.value, ast.Name) and node.value.id in deduped_names:
+                return True
         return False
 
+    # Union with the blunt "mentions _dedup at all" check. Static analysis of
+    # returns can always be evaded by a shape nobody anticipated, and the two
+    # failure directions are not symmetric: a false POSITIVE costs an allowlist
+    # line, a false NEGATIVE is the production bug this whole file exists to
+    # stop. So over-report on purpose.
+    mentions_dedup = {
+        n for n in fns if n.startswith("build_")
+        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                and c.func.attr == "_dedup" for c in _own_nodes(fns[n]))
+    }
     dedupers = {n for n in fns if n.startswith("build_") and returns_deduped(n)}
+    dedupers |= mentions_dedup
     wrappers = {n for n in fns if n.startswith("_emit_")}
     return dedupers, wrappers
 

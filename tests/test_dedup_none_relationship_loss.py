@@ -615,3 +615,64 @@ def test_a_second_domain_resolving_to_a_known_ip_keeps_its_resolves_to(builder):
         "second domain resolving to an already-emitted IP lost its "
         "resolves-to edge — shared hosting then shows one domain"
     )
+
+
+# ── Round five: the last excuse, and an assertion the fix exposed ─────────
+
+def test_the_same_ip_with_different_geo_still_gets_both_edges(builder):
+    """The case that killed the final allowlist entry.
+
+    build_attacker_context used to `return out` the moment
+    build_ip_observable returned None — conflating "not a usable address"
+    with "already emitted this bundle". Harmless only while a repeated IP
+    carries identical enrichment, which is not guaranteed: GeoIP can resolve
+    one address to a different city or ASN on two events in the same window.
+    Constructed by codex on review; it returned [] before the fix.
+    """
+    def ctx(cc, city, asn):
+        ev = ParsedEvent(
+            src_ip=IP_A, timestamp=NOW, sensor_hostname="s1",
+            event_type="Cowrie", dst_port=22,
+            src_country_code=cc, src_asn=asn,
+        )
+        ev.src_city = city
+        ev.meta = {}
+        return builder.build_attacker_context(
+            ev, session=AttackSession.from_event(ev))
+
+    ctx("DE", "Berlin", 64512)
+    second = ctx("DE", "Munich", 64513)
+    assert second, "the whole attacker context was dropped for a repeated IP"
+    assert _edges(second, attacker_ip_observable_id(IP_A), "located-at",
+                  generate_city_location_id("DE", "Munich")), \
+        "the second city seen for this IP produced no located-at edge"
+    assert _edges(second, attacker_ip_observable_id(IP_A), "belongs-to",
+                  generate_autonomous_system_id(64513)), \
+        "the second ASN seen for this IP produced no belongs-to edge"
+
+
+def test_an_sni_never_resolves_to_the_attackers_own_address(builder):
+    """A Suricata alert with SNI but no dst_ip must assert NOTHING.
+
+    There was an `or session.src_ip` fallback: with no destination recorded,
+    the code claimed the requested name resolves to the ATTACKER's address.
+    Nothing establishes that — they sent us a name, and separately we saw
+    where the packet came from. It was masked because build_ipv4 returned
+    None for an address attacker-context had already emitted, so the edge was
+    skipped by accident; anchoring the id removed the accident and left the
+    assertion. This keeps the skip and drops the claim.
+    """
+    ev = ParsedEvent(
+        src_ip=IP_A, timestamp=NOW, sensor_hostname="s1",
+        event_type="Suricata", dst_port=443, dst_ip=None,
+        src_country_code="DE", src_asn=64512,
+    )
+    ev.meta = {"tls_sni": DOMAIN, "signature": "ET TLS test",
+               "signature_id": 2003}
+    objs = builder.build_suricata_alert(AttackSession.from_event(ev))
+    assert any(o.get("type") == "domain-name" for o in objs), \
+        "guard: the SNI domain itself must still be emitted"
+    assert not [o for o in objs if o.get("relationship_type") == "resolves-to"], (
+        "emitted a resolves-to edge with no destination address — the only "
+        "candidate left is the attacker's own IP, which is not a resolution"
+    )
