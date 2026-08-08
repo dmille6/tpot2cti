@@ -832,6 +832,10 @@ class STIXBuilder:
 
         # Per-bundle dedup caches
         self._emitted_ids: set[str] = set()
+        #: id -> the relationship dict actually kept in this bundle, so a
+        #: later observation of the same edge can widen its window rather
+        #: than be dropped. See _widen_relationship_window.
+        self._timed_relationships: dict[str, dict] = {}
 
     # ──────────────────────────────────────────────────────────────────
     # Object stamping (created_by_ref + markings + confidence + timestamps)
@@ -863,9 +867,38 @@ class STIXBuilder:
         if not oid:
             return obj  # let the publisher's validator complain later
         if oid in self._emitted_ids:
+            if obj.get("type") == "relationship":
+                self._widen_relationship_window(oid, obj)
             return None
         self._emitted_ids.add(oid)
+        if obj.get("type") == "relationship" and "start_time" in obj:
+            self._timed_relationships[oid] = obj
         return obj
+
+    def _widen_relationship_window(self, oid: str, dup: dict) -> None:
+        """Union the duplicate's observation window into the one we kept.
+
+        A relationship id is (source, target, type) -- deliberately, so the
+        same fact seen twice is one edge. But start_time / stop_time describe
+        an OBSERVATION, and there are many observations per edge. Dropping the
+        duplicate outright published the FIRST session's window as though it
+        were the whole story: an attacker hitting the same URL at 10:00 and
+        again at 14:00 got an edge claiming activity ended at 10:05.
+
+        That is this project's recurring defect -- asserting a bound nothing
+        established -- so the window widens to cover every observation instead.
+        A wide window is honest about what we saw; a narrow one is not.
+        """
+        kept = self._timed_relationships.get(oid)
+        if kept is None:
+            # The kept copy had no window at all (emitted outside a session
+            # context). A later timed observation is strictly better than none.
+            return
+        start, stop = dup.get("start_time"), dup.get("stop_time")
+        if start and start < kept.get("start_time", start):
+            kept["start_time"] = start
+        if stop and stop > kept.get("stop_time", ""):
+            kept["stop_time"] = stop
 
     # ──────────────────────────────────────────────────────────────────
     # Emit-and-anchor: _dedup's counterpart
@@ -2360,14 +2393,29 @@ class STIXBuilder:
         if description:
             obj["description"] = description
         ctx = session if session is not None else self._session_ctx
-        if ctx is not None and getattr(ctx, "first_seen", None) is not None:
-            obj["start_time"] = ctx.first_seen.isoformat()
-            if getattr(ctx, "last_seen", None) is not None:
-                obj["stop_time"] = ctx.last_seen.isoformat()
+        first = getattr(ctx, "first_seen", None) if ctx is not None else None
+        if first is not None:
+            last = getattr(ctx, "last_seen", None)
+            # STIX 2.1 requires stop_time >= start_time and OpenCTI rejects
+            # violations outright. Correlators sort ascending so this should
+            # hold, but build_relationship accepts ANY session from any caller
+            # and a rejected bundle is a bad way to find out. An inverted pair
+            # means we do not actually know the window, so publish the start
+            # and stay quiet about the end rather than assert a wrong one.
+            if last is not None and last >= first:
+                obj["start_time"] = first.isoformat()
+                obj["stop_time"] = last.isoformat()
+            else:
+                obj["start_time"] = first.isoformat()
         else:
             # Counted, never silent. A rising number here means a producer is
             # emitting edges outside any session context and the graph is
             # quietly losing its time dimension again.
+            #
+            # Counts ATTEMPTS, not emissions: a duplicate edge is dropped by
+            # _dedup after this point, so the number can exceed the untimed
+            # edges actually in the bundle. That is the right direction for a
+            # smoke alarm, but do not read it as a bundle census.
             self.untimed_relationships += 1
         return self._dedup(self._stamp(obj))
 
@@ -3436,108 +3484,116 @@ class STIXBuilder:
             # where grouping degenerates to one group per URL.
             session.session_id = f"{session.session_id}:{key}"
 
-            out.extend(self.build_sensor_context(first.sensor_hostname))
 
-            # The URL's id, NOT the built object, anchors this graph.
-            # build_url returns None when _dedup has already emitted that
-            # URL in this bundle — which happens whenever a normal web
-            # session referenced the same value. Keying off the returned
-            # object would then discard the Domain, CVE, Sighting and Note
-            # for an endpoint we DID observe, purely because the SCO was
-            # already present. The id is deterministic, so referencing it
-            # is always valid — but ONLY because the group was skipped above
-            # if the URL could not be validated, and only if the id is taken
-            # from the canonical (stripped) value the SCO is published under.
-            url_id = generate_url_id(canon_url)
-            if u := self.build_url(url, session=session):
-                out.append(u)
-            # The per-header URL variants are real observations, so emit
-            # them too — but under this one group's Sighting/Note rather
-            # than a graph each.
-            for variant in extra_urls[:_MAX_WEB_URLS]:
-                if uv := self.build_url(variant, session=session):
-                    out.append(uv)
-            if len(extra_urls) > _MAX_WEB_URLS:
-                logger.info(
-                    f"unattributed salvage: {key} — emitted "
-                    f"{_MAX_WEB_URLS + 1} of {len(extra_urls) + 1} URL "
-                    f"variants (capped)"
-                )
+            # The synthetic session is the ONLY timestamp source this
+            # salvage graph has, and it was built and then not used for
+            # the edges: every relationship below was emitted outside any
+            # session context and came out untimed. The comment above says
+            # the session carries first/last seen, which made it read as
+            # though the edges did too.
+            with self.session_context(session):
+                out.extend(self.build_sensor_context(first.sensor_hostname))
 
-            # Every edge below anchors on a DETERMINISTIC id rather than on
-            # the builder's return value. `_dedup` returns None for an
-            # object already emitted in this bundle — which happens from
-            # the second C2 group onward, and from the first if a normal
-            # web session emitted the same CVE/technique earlier in the
-            # cycle (the scanner sprays the whole hive, so that is the
-            # common case, not the corner case). Gating the relationship
-            # on the object would drop the edge for evidence we really
-            # observed; the id is valid whether or not the SDO was
-            # re-emitted.
-            if host := payload.get("host"):
-                # build_domain returns None for BOTH "already emitted"
-                # and "malformed". Only the first is safe to reference —
-                # an edge to a malformed domain that was never built (and
-                # never will be) is a dangling ref. _emit_domain tells the
-                # two cases apart.
-                domain_id = self._emit_domain(host, out=out, session=session)
-                if domain_id and (
-                    rel := self.build_relationship(
-                        url_id, "resolves-to", domain_id,
-                        description=f"C2 endpoint {url[:120]} resolves to {host}",
+                # The URL's id, NOT the built object, anchors this graph.
+                # build_url returns None when _dedup has already emitted that
+                # URL in this bundle — which happens whenever a normal web
+                # session referenced the same value. Keying off the returned
+                # object would then discard the Domain, CVE, Sighting and Note
+                # for an endpoint we DID observe, purely because the SCO was
+                # already present. The id is deterministic, so referencing it
+                # is always valid — but ONLY because the group was skipped above
+                # if the URL could not be validated, and only if the id is taken
+                # from the canonical (stripped) value the SCO is published under.
+                url_id = generate_url_id(canon_url)
+                if u := self.build_url(url, session=session):
+                    out.append(u)
+                # The per-header URL variants are real observations, so emit
+                # them too — but under this one group's Sighting/Note rather
+                # than a graph each.
+                for variant in extra_urls[:_MAX_WEB_URLS]:
+                    if uv := self.build_url(variant, session=session):
+                        out.append(uv)
+                if len(extra_urls) > _MAX_WEB_URLS:
+                    logger.info(
+                        f"unattributed salvage: {key} — emitted "
+                        f"{_MAX_WEB_URLS + 1} of {len(extra_urls) + 1} URL "
+                        f"variants (capped)"
                     )
-                ):
-                    out.append(rel)
 
-            if cve := first.meta.get("matched_cve"):
-                vuln_id = self._emit_vulnerability(
-                    cve, out=out,
+                # Every edge below anchors on a DETERMINISTIC id rather than on
+                # the builder's return value. `_dedup` returns None for an
+                # object already emitted in this bundle — which happens from
+                # the second C2 group onward, and from the first if a normal
+                # web session emitted the same CVE/technique earlier in the
+                # cycle (the scanner sprays the whole hive, so that is the
+                # common case, not the corner case). Gating the relationship
+                # on the object would drop the edge for evidence we really
+                # observed; the id is valid whether or not the SDO was
+                # re-emitted.
+                if host := payload.get("host"):
+                    # build_domain returns None for BOTH "already emitted"
+                    # and "malformed". Only the first is safe to reference —
+                    # an edge to a malformed domain that was never built (and
+                    # never will be) is a dangling ref. _emit_domain tells the
+                    # two cases apart.
+                    domain_id = self._emit_domain(host, out=out, session=session)
+                    if domain_id and (
+                        rel := self.build_relationship(
+                            url_id, "resolves-to", domain_id,
+                            description=f"C2 endpoint {url[:120]} resolves to {host}",
+                        )
+                    ):
+                        out.append(rel)
+
+                if cve := first.meta.get("matched_cve"):
+                    vuln_id = self._emit_vulnerability(
+                        cve, out=out,
+                        description=(
+                            f"Exploitation attempt observed via "
+                            f"{first.event_type} on sensor "
+                            f"{first.sensor_hostname!r}. Source address not "
+                            f"recoverable — the honeypot reports the "
+                            f"attacker-controlled X-Forwarded-For header as "
+                            f"the client address."
+                        ),
+                    )
+                    if vuln_id and (rel := self.build_relationship(
+                        url_id, "related-to", vuln_id,
+                        description=f"C2 endpoint delivered in a {cve} payload",
+                    )):
+                        out.append(rel)
+
+                if attack_type := first.meta.get("attack_type"):
+                    ap_id = self._emit_attack_pattern(
+                        attack_type, first.meta.get("mitre_technique"),
+                        out=out, session=session,
+                    )
+                    if ap_id and (rel := self.build_relationship(
+                        url_id, "related-to", ap_id,
+                        description=f"C2 endpoint used by {attack_type}",
+                    )):
+                        out.append(rel)
+
+                if sighting := self.build_sighting(
+                    url_id, first.sensor_hostname, session,
+                    count=len(group),
                     description=(
-                        f"Exploitation attempt observed via "
-                        f"{first.event_type} on sensor "
-                        f"{first.sensor_hostname!r}. Source address not "
-                        f"recoverable — the honeypot reports the "
-                        f"attacker-controlled X-Forwarded-For header as "
-                        f"the client address."
+                        f"{len(group)} exploitation attempt(s) carrying this C2 "
+                        f"endpoint, observed by {first.event_type}. No source "
+                        f"address: see the attached Note."
                     ),
+                    id_discriminator="unattributed",
+                ):
+                    out.append(sighting)
+
+                note = self.build_session_note(
+                    session,
+                    self._unattributed_note_body(url, extra_urls, payload, group),
+                    abstract=f"Unattributed {first.event_type} payload → {key[:80]}",
+                    object_refs=[url_id],
                 )
-                if vuln_id and (rel := self.build_relationship(
-                    url_id, "related-to", vuln_id,
-                    description=f"C2 endpoint delivered in a {cve} payload",
-                )):
-                    out.append(rel)
-
-            if attack_type := first.meta.get("attack_type"):
-                ap_id = self._emit_attack_pattern(
-                    attack_type, first.meta.get("mitre_technique"),
-                    out=out, session=session,
-                )
-                if ap_id and (rel := self.build_relationship(
-                    url_id, "related-to", ap_id,
-                    description=f"C2 endpoint used by {attack_type}",
-                )):
-                    out.append(rel)
-
-            if sighting := self.build_sighting(
-                url_id, first.sensor_hostname, session,
-                count=len(group),
-                description=(
-                    f"{len(group)} exploitation attempt(s) carrying this C2 "
-                    f"endpoint, observed by {first.event_type}. No source "
-                    f"address: see the attached Note."
-                ),
-                id_discriminator="unattributed",
-            ):
-                out.append(sighting)
-
-            note = self.build_session_note(
-                session,
-                self._unattributed_note_body(url, extra_urls, payload, group),
-                abstract=f"Unattributed {first.event_type} payload → {key[:80]}",
-                object_refs=[url_id],
-            )
-            if note:
-                out.append(note)
+                if note:
+                    out.append(note)
 
         return out
 
