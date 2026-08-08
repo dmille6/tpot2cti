@@ -784,25 +784,33 @@ def run_cycle(
                 # method route through build_driveby_session (the ~20
                 # parsers that produce the minimal IP + Sighting graph).
                 method_name = _PARSER_DISPATCH.get(parser.type_name)
-                if method_name and hasattr(builder, method_name):
-                    objs = getattr(builder, method_name)(session)
-                elif method_name:
-                    # Listed in dispatch table but the builder doesn't
-                    # have the method — programmer error, not data error.
-                    logger.error(
-                        f"_PARSER_DISPATCH names {method_name!r} for "
-                        f"parser type_name={parser.type_name!r} but "
-                        f"builder has no such method; falling back to "
-                        f"build_driveby_session"
-                    )
-                    objs = builder.build_driveby_session(session)
-                else:
-                    objs = builder.build_driveby_session(session)
-                all_objects.extend(objs)
-                # Behaviour-driven ATT&CK techniques — applies uniformly to
-                # EVERY parser from the normalised session signals (not just
-                # Suricata/web). See tpot2cti/attack_mapping.py.
-                all_objects.extend(builder.build_session_attack_patterns(session))
+                # One choke point makes every relationship this session emits
+                # carry the time it actually happened. Before this, 100% of
+                # emitted edges carried the 1970 epoch sentinel and command
+                # ordering was impossible by construction. Set here rather
+                # than threaded through ~40 build_relationship call sites.
+                with builder.session_context(session):
+                    if method_name and hasattr(builder, method_name):
+                        objs = getattr(builder, method_name)(session)
+                    elif method_name:
+                        # Listed in dispatch table but the builder doesn't
+                        # have the method — programmer error, not data error.
+                        logger.error(
+                            f"_PARSER_DISPATCH names {method_name!r} for "
+                            f"parser type_name={parser.type_name!r} but "
+                            f"builder has no such method; falling back to "
+                            f"build_driveby_session"
+                        )
+                        objs = builder.build_driveby_session(session)
+                    else:
+                        objs = builder.build_driveby_session(session)
+                    all_objects.extend(objs)
+                    # Behaviour-driven ATT&CK techniques — applies uniformly
+                    # to EVERY parser from the normalised session signals (not
+                    # just Suricata/web). Inside the context so its edges are
+                    # timed too. See tpot2cti/attack_mapping.py.
+                    all_objects.extend(
+                        builder.build_session_attack_patterns(session))
             except Exception as e:
                 # Per V1_SPEC §7: caught + logged; cycle continues.
                 logger.warning(
@@ -983,6 +991,10 @@ def run_cycle(
         # because this number is the difference between "the extractor found
         # nothing" and "we stopped publishing our own attack surface".
         "rejected_own_surface_urls": builder.rejected_own_surface_urls,
+        # Relationships emitted with no session in scope, hence no start_time.
+        # Should be ~0; a rising number means a producer is emitting edges
+        # outside any session and the graph is losing its time dimension.
+        "untimed_relationships": builder.untimed_relationships,
         "rejected_domains": builder.rejected_domains,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
