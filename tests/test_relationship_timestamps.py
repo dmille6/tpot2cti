@@ -267,3 +267,38 @@ def test_windows_are_compared_as_instants_not_as_strings(builder):
         f"stop moved to {kept['stop_time']} — string comparison widened the "
         "window BACKWARDS across a timezone offset"
     )
+
+
+def test_a_naive_and_an_aware_timestamp_can_be_compared(builder):
+    """Python raises TypeError comparing naive to aware datetimes.
+
+    _parse_timestamp's docstring claims aware UTC, but a tz-less input stays
+    naive. Two observations of one edge differing only in whether their source
+    carried an offset would crash the build mid-bundle. Found by codex.
+    """
+    from datetime import datetime, timezone
+    from tpot2cti.parsers.base import AttackSession
+    A = "ipv4-addr--00000000-0000-5000-8000-000000000010"
+    B = "url--00000000-0000-5000-8000-000000000011"
+
+    kept = _win(builder, A, B,
+                datetime(2026, 8, 7, 8, tzinfo=timezone.utc),
+                datetime(2026, 8, 7, 9, tzinfo=timezone.utc))
+    naive = AttackSession(src_ip="203.0.113.1", session_id="n",
+                          sensor_hostname="s1", event_type="Cowrie",
+                          first_seen=datetime(2026, 8, 7, 12),   # no tzinfo
+                          last_seen=datetime(2026, 8, 7, 13))
+    builder.build_relationship(A, "related-to", B, session=naive)  # must not raise
+    assert builder._as_dt(kept["stop_time"]) == datetime(2026, 8, 7, 13,
+                                                         tzinfo=timezone.utc), \
+        "a naive timestamp was read as something other than UTC"
+
+
+def test_as_dt_is_total(builder):
+    """Junk in must not raise — this runs inside the build loop."""
+    for junk in (None, "", "not-a-date", "2026-13-45T99:99:99", 12345):
+        assert builder._as_dt(junk) is None, junk
+    from datetime import datetime, timezone
+    assert builder._as_dt("2026-08-07T09:00:00Z") == \
+        datetime(2026, 8, 7, 9, tzinfo=timezone.utc), "Z suffix"
+    assert builder._as_dt("2026-08-07T09:00:00.123456+00:00").microsecond == 123456

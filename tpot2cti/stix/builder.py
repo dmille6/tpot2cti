@@ -882,16 +882,24 @@ class STIXBuilder:
         Not string comparison. Lexicographic order equals chronological order
         only if every value carries the same UTC offset, and _parse_timestamp
         does not normalise: an input with +02:00 stays +02:00, so "…T09:00+02:00"
-        sorts before "…T08:30+00:00" while being LATER. Normalising here keeps
-        that out of the window arithmetic.
+        sorts before "…T08:30+00:00" while being LATER.
+
+        ALWAYS returns an aware UTC datetime or None -- never a naive one.
+        _parse_timestamp's docstring claims it returns aware UTC, but a
+        tz-less input stays naive, and Python raises TypeError when a naive
+        and an aware datetime are compared. Two observations of one edge
+        differing only in whether their source carried an offset would then
+        crash the build mid-bundle. A naive value is read as UTC, which is
+        what the rest of the pipeline already assumes.
         """
         if not value:
             return None
         try:
             dt = datetime.fromisoformat(value)
-        except ValueError:
+        except (ValueError, TypeError):
             return None
-        return dt if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+            else dt.astimezone(timezone.utc)
 
     def _widen_relationship_window(self, oid: str, dup: dict) -> None:
         """Union the duplicate's observation window into the one we kept.
