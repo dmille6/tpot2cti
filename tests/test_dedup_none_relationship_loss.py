@@ -28,6 +28,9 @@ from tpot2cti.stix_ids import (
     generate_malware_id,
     generate_url_id,
     generate_vulnerability_id,
+    generate_cryptographic_key_id,
+    attacker_ip_indicator_id,
+    attacker_ip_observable_id,
 )
 
 NOW = datetime(2026, 8, 7, tzinfo=timezone.utc)
@@ -449,3 +452,67 @@ def test_ingest_still_emits_nothing_dangling_for_a_junk_family(builder):
         o.get("type") == "relationship" and "malware--" in o.get("target_ref", "")
         for o in objs
     ), "edge to a Malware SDO that does not exist"
+
+
+# ── Round three: the sites the review's list did not contain ──────────────
+#
+# The sweep above was worked from a review's enumeration of call sites. A
+# mechanical sweep of the file afterwards found three more deduping builders
+# nobody had listed: cryptographic-key, attacker SSH key, and IP indicator.
+# tests/test_dedup_none_sweep_is_complete.py now asks that question against
+# the AST so round four does not depend on someone noticing.
+#
+# These three matter more than most, because a SHARED node is the entire
+# point of each of them:
+#   - a HASSH/JA3 groups attackers using the same client toolchain
+#   - a planted SSH key groups attackers with the same C&C identity
+#   - an IP indicator collects every session from one attacker
+# so "many sessions reach this node" is the intended case, not the corner.
+
+def test_a_second_attacker_sharing_a_hassh_keeps_its_edge(builder):
+    """The HASSH pivot IS the set of attackers sharing it."""
+    hassh = "06046964c022c6407d15a27b12a6a4fb"
+    a = builder.build_cowrie_session(_session("Cowrie", ip=IP_A, hassh=hassh))
+    b = builder.build_cowrie_session(_session("Cowrie", ip=IP_B, hassh=hassh))
+    ck_id = generate_cryptographic_key_id(hassh)
+    assert _edges(a, ck_id, "related-to", attacker_ip_observable_id(IP_A)), \
+        "guard: first attacker must get the edge"
+    assert not any(o.get("id") == ck_id for o in b), \
+        "guard: the shared node must NOT be re-emitted — that is the dedup"
+    assert _edges(b, ck_id, "related-to", attacker_ip_observable_id(IP_B)), (
+        "second attacker sharing a HASSH lost its edge to the pivot — the "
+        "pivot then shows one IP instead of the group"
+    )
+
+
+def test_a_second_attacker_planting_the_same_ssh_key_keeps_its_edge(builder):
+    """Planted-key campaigns are hundreds of IPs on ONE key (e.g. mdrfckr)."""
+    key = {"fingerprint": "SHA256:" + "q" * 43, "key": "AAAAB3NzaC1yc2E" + "A" * 20,
+           "type": "ssh-rsa", "comment": "mdrfckr"}
+    a = builder.build_cowrie_session(_session("Cowrie", ip=IP_A, planted_ssh_keys=[key]))
+    b = builder.build_cowrie_session(_session("Cowrie", ip=IP_B, planted_ssh_keys=[key]))
+    ck_id = generate_cryptographic_key_id(key["fingerprint"])
+    assert _edges(a, attacker_ip_observable_id(IP_A), "related-to", ck_id), \
+        "guard: first planter must get the edge"
+    assert _edges(b, attacker_ip_observable_id(IP_B), "related-to", ck_id), (
+        "second IP planting the same key lost its edge — the campaign view "
+        "collapses to whichever IP happened to be parsed first"
+    )
+
+
+def test_a_second_session_from_one_ip_keeps_its_sighting(builder):
+    """One attacker, two sessions in a bundle (different parsers see them).
+
+    Each Sighting carries its own count, sensor and window, so dropping the
+    second understates observed volume by construction.
+    """
+    a = builder.build_cowrie_session(_session("Cowrie", ip=IP_A))
+    b = builder.build_cowrie_session(_session("Cowrie", ip=IP_A, session_id="s2"))
+    ind_id = attacker_ip_indicator_id(IP_A)
+    sightings = [o for o in b if o.get("type") == "sighting"
+                 and o.get("sighting_of_ref") == ind_id]
+    assert [o for o in a if o.get("type") == "sighting"], "guard: first has one"
+    assert sightings, (
+        "second session from the same IP produced no Sighting on its "
+        "Indicator — observed counts are understated"
+    )

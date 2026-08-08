@@ -1025,6 +1025,67 @@ class STIXBuilder:
             node_id=generate_malware_id(fam) if fam else None,
         )
 
+    def _emit_cryptographic_key(
+        self, value: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """HASSH / JA3 / SSH-client fingerprint SCO.
+
+        This one matters more than most. The whole POINT of a HASSH or JA3 node
+        is that MANY attackers share it -- that is what makes it a pivot -- so
+        the duplicate-in-bundle case is not an edge case here, it is the
+        intended use. Under `if ck:` the second and every later attacker
+        sharing a fingerprint lost their edge to it, which is precisely the
+        population the pivot exists to show.
+        """
+        return self._emit_node(
+            self.build_cryptographic_key(value, **kwargs),
+            out=out,
+            node_id=generate_cryptographic_key_id(value) if value else None,
+        )
+
+    def _emit_attacker_ssh_key(
+        self, key_info: dict, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Attacker SSH public key SCO (planted or authenticated).
+
+        Seeds off the FINGERPRINT, not the key blob -- build_attacker_ssh_key
+        hashes key_info["fingerprint"], and "planted" and "authenticated"
+        deliberately mint the same id for the same key material because that
+        shared id IS the pivot.
+
+        Same shape as _emit_cryptographic_key and the same reason for caring:
+        a planted key like the `mdrfckr` persistence key is shared by hundreds
+        of source IPs, so `if ck:` kept the first and dropped the rest.
+        """
+        fp = key_info.get("fingerprint") if isinstance(key_info, dict) else None
+        return self._emit_node(
+            self.build_attacker_ssh_key(key_info, **kwargs),
+            out=out,
+            node_id=generate_cryptographic_key_id(fp) if fp else None,
+        )
+
+    def _emit_ip_indicator(
+        self, ip: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Indicator for an attacker IP.
+
+        The id canonicalises the address first (attacker_ip_indicator_id ->
+        canonical_ip), matching build_ip_indicator, which reassigns
+        `ip = fam[1]` before hashing. Anchoring on the raw string would miss
+        for any non-canonical form.
+
+        One IP commonly produces several sessions in one bundle -- different
+        parsers see the same attacker -- and each session's Sighting carries
+        its own count, sensor and time window. Under `if ip_ind:` only the
+        first session's Sighting survived, so the observed counts were
+        understated by construction.
+        """
+        return self._emit_node(
+            self.build_ip_indicator(ip, **kwargs),
+            out=out,
+            node_id=attacker_ip_indicator_id(ip),
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Foundation objects
     # ──────────────────────────────────────────────────────────────────
@@ -2433,22 +2494,21 @@ class STIXBuilder:
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
 
         # HASSH fingerprint → Cryptographic-Key
         if session.hassh:
-            ck = self.build_cryptographic_key(session.hassh, session=session)
-            if ck:
-                out.append(ck)
+            ck_id = self._emit_cryptographic_key(
+                session.hassh, out=out, session=session)
+            if ck_id:
                 if rel := self.build_relationship(
-                    ck["id"], "related-to", ipv4_id,
+                    ck_id, "related-to", ipv4_id,
                     description=f"HASSH fingerprint observed from {session.src_ip}",
                 ):
                     out.append(rel)
@@ -2470,13 +2530,12 @@ class STIXBuilder:
         for key_info in (session.auth_pubkeys or []):
             if not key_info.get("fingerprint"):
                 continue
-            ck = self.build_attacker_ssh_key(
-                key_info, session=session, context="authenticated")
-            if not ck:
+            ck_id = self._emit_attacker_ssh_key(
+                key_info, out=out, session=session, context="authenticated")
+            if not ck_id:
                 continue
-            out.append(ck)
             if rel := self.build_relationship(
-                ipv4_id, "related-to", ck["id"],
+                ipv4_id, "related-to", ck_id,
                 description=(
                     f"Authenticated to {session.event_type} by public key "
                     f"(type={key_info.get('type')}) — attacker "
@@ -2489,14 +2548,13 @@ class STIXBuilder:
             fp = key_info.get("fingerprint")
             if not fp:
                 continue
-            ck = self.build_attacker_ssh_key(key_info, session=session)
-            if not ck:
+            ck_id = self._emit_attacker_ssh_key(key_info, out=out, session=session)
+            if not ck_id:
                 continue
-            out.append(ck)
             # IP observable → key (so the key's "Related Entities" tab
             # shows every IP that planted it — the campaign view).
             if rel := self.build_relationship(
-                ipv4_id, "related-to", ck["id"],
+                ipv4_id, "related-to", ck_id,
                 description=(
                     f"Planted SSH key (type={key_info.get('type')}, "
                     f"comment={key_info.get('comment') or '∅'!r}) "
@@ -2506,9 +2564,9 @@ class STIXBuilder:
                 out.append(rel)
             # IP Indicator → key (so the indicator-side knowledge tab
             # also shows the campaign pivot).
-            if ip_ind:
+            if ip_ind_id:
                 if rel := self.build_relationship(
-                    ip_ind["id"], "related-to", ck["id"],
+                    ip_ind_id, "related-to", ck_id,
                     description=f"Indicator for IP that planted SSH key {fp[:12]}…",
                 ):
                     out.append(rel)
@@ -2560,9 +2618,9 @@ class STIXBuilder:
 
         # Dual sighting (Indicator + Observable) — see build_dual_sighting
         # docstring for the OpenCTI UX rationale.
-        if ip_ind:
+        if ip_ind_id:
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_cowrie_sighting_description(session),
             ))
@@ -2606,11 +2664,10 @@ class STIXBuilder:
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
@@ -2639,7 +2696,7 @@ class STIXBuilder:
         # Fallback: if no recognized MITRE technique attached, emit a
         # generic "Network Attack" AttackPattern so we always have an
         # indicates-target per V1_SPEC §5.2.
-        if ip_ind and not attack_pattern_ids and self.config.cycle.emit_generic_attack_pattern:
+        if ip_ind_id and not attack_pattern_ids and self.config.cycle.emit_generic_attack_pattern:
             # "Network Attack" is one shared node for the whole bundle, so
             # every session but the first hit the duplicate case here.
             if generic_id := self._emit_attack_pattern(
@@ -2648,10 +2705,10 @@ class STIXBuilder:
                 attack_pattern_ids.append(generic_id)
 
         # Indicator → indicates → AttackPattern(s)
-        if ip_ind:
+        if ip_ind_id:
             for ap_id in attack_pattern_ids:
                 if rel := self.build_relationship(
-                    ip_ind["id"], "indicates", ap_id,
+                    ip_ind_id, "indicates", ap_id,
                     description=(
                         f"Suricata rule {meta.get('signature_id') or '?'}: "
                         f"{meta.get('signature') or 'alert'}"
@@ -2669,9 +2726,9 @@ class STIXBuilder:
                 cve, out=out,
                 description=f"Referenced by Suricata signature: {meta.get('signature')!r}",
             )
-            if vuln_id and ip_ind:
+            if vuln_id and ip_ind_id:
                 if rel := self.build_relationship(
-                    ip_ind["id"], "indicates", vuln_id,
+                    ip_ind_id, "indicates", vuln_id,
                     description=(
                         f"{session.src_ip} attempted exploit of {cve} "
                         f"(Suricata SID {meta.get('signature_id') or '?'})"
@@ -2728,9 +2785,9 @@ class STIXBuilder:
                     out.append(rel)
 
         # ── Dual sighting (Indicator + IPv4 observable) ───────────────
-        if ip_ind:
+        if ip_ind_id:
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=1,
             ))
 
@@ -2773,19 +2830,24 @@ class STIXBuilder:
         fp = port_intel.fingerprint_payload(printable, hex_str)
 
         # IP Indicator + based-on → IPv4 observable
+        # This one enriches the object IN PLACE before emitting, so it needs
+        # the dict, not just the id -- hence _emit_node directly rather than
+        # the _emit_ip_indicator wrapper. Same two-None contract either way.
         ip_ind = self.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
             self._enrich_honeytrap_indicator(ip_ind, session, scan_labels, scan_phrase, fp)
-            out.append(ip_ind)
+        ip_ind_id = self._emit_node(
+            ip_ind, out=out, node_id=attacker_ip_indicator_id(session.src_ip))
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
 
             # Dual sighting (Indicator + IPv4 observable).
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_honeytrap_sighting_description(session, event),
             ))
@@ -2876,12 +2938,12 @@ class STIXBuilder:
                 ipv4_id = attacker_ip_observable_id(first.src_ip)
 
             # IP Indicator + based-on → IPv4
-            ip_ind = self.build_ip_indicator(first.src_ip, session=session)
-            if ip_ind:
-                out.append(ip_ind)
+            ip_ind_id = self._emit_ip_indicator(
+                first.src_ip, out=out, session=session)
+            if ip_ind_id:
                 if ipv4_id:
                     if rel := self.build_relationship(
-                        ip_ind["id"], "based-on", ipv4_id,
+                        ip_ind_id, "based-on", ipv4_id,
                         description=f"IP indicator for {first.src_ip}",
                     ):
                         out.append(rel)
@@ -2893,7 +2955,7 @@ class STIXBuilder:
                 # signal protocols. If a maintainer wants per-event
                 # forensics, the raw doc is preserved on T-Pot's ES.
                 out.extend(self.build_dual_sighting(
-                    ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                    ip_ind_id, ipv4_id, session.sensor_hostname, session,
                     count=session.event_count,
                     description=render_fallback_sighting_description(first, unknown_type),
                 ))
@@ -3006,20 +3068,19 @@ class STIXBuilder:
         out.extend(self.build_attacker_context(first, session=session))
 
         # IP Indicator + Sighting
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             # based-on → IPv4 observable (already emitted above)
             ipv4_id = attacker_ip_observable_id(session.src_ip)
             rel = self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             )
             if rel:
                 out.append(rel)
             # Dual sighting (Indicator + IPv4 observable)
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
             ))
 
@@ -3503,11 +3564,10 @@ class STIXBuilder:
         for fp in (session.hassh, session.ja3):
             if not fp:
                 continue
-            ck = self.build_cryptographic_key(fp, session=session)
-            if ck:
-                out.append(ck)
+            ck_id = self._emit_cryptographic_key(fp, out=out, session=session)
+            if ck_id:
                 if rel := self.build_relationship(
-                    ck["id"], "related-to", ipv4_id,
+                    ck_id, "related-to", ipv4_id,
                     description=f"Client fingerprint observed from {session.src_ip}",
                 ):
                     out.append(rel)
