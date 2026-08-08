@@ -145,6 +145,14 @@ def _dedup_builders_and_wrappers():
                 return True
         return False
 
+    # KNOWN EVASION (codex, review round 4): aliasing defeats both checks --
+    #     deduper = self._dedup
+    #     return deduper(self._stamp(obj))
+    # because `_dedup` is then referenced, not called as an attribute. Nothing
+    # in this file does that and there is no reason to. Left documented rather
+    # than chased: a test that tries to be a type system stops being readable,
+    # and this one earns its keep on the shapes that actually occur.
+    #
     # Union with the blunt "mentions _dedup at all" check. Static analysis of
     # returns can always be evaded by a shape nobody anticipated, and the two
     # failure directions are not symmetric: a false POSITIVE costs an allowlist
