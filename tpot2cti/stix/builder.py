@@ -863,6 +863,311 @@ class STIXBuilder:
         return obj
 
     # ──────────────────────────────────────────────────────────────────
+    # Emit-and-anchor: _dedup's counterpart
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # `_dedup` answers "should this bundle carry the node?".  A caller that
+    # is about to draw an edge is asking a DIFFERENT question: "is there a
+    # node here to anchor on?".  The two answers are both spelled None and
+    # every caller conflated them.
+    #
+    #   * rejected / dropped -> no node in this bundle and never will be, so
+    #     an edge would dangle.  OpenCTI accepts a dangling ref and then
+    #     never resolves it.
+    #   * already emitted    -> the node IS here.  The edge is exactly what
+    #     we still owe, and dropping it deletes the per-session attribution
+    #     that makes the node worth publishing at all.
+    #
+    # Content-addressing turned the second case from nearly unreachable into
+    # the common one: identical values now share an id, so every session
+    # after the first in a bundle got None and silently lost its edges.
+    # `_emitted_ids` is what tells the two apart.
+    #
+    # `_emit_process` (below) was the first instance of this fix; these are
+    # the same shape for the other content-addressed types.  `out` and
+    # `node_id` are REQUIRED keyword arguments on the core helper so a caller
+    # cannot answer only half the question by forgetting an argument.
+
+    def _emit_node(
+        self,
+        obj: Optional[dict],
+        *,
+        out: list[dict],
+        node_id: Optional[str],
+    ) -> Optional[str]:
+        """Append `obj` if it was built, and return the id to anchor edges on.
+
+        Returns the anchor id, or None when this bundle has no such node.
+        `node_id` is the deterministic id the value hashes to; pass None when
+        the value cannot produce one (empty/malformed input).
+
+        Prefer the typed `_emit_*` wrappers below — they keep each type's id
+        derivation next to its build call, which is where it can be checked.
+        """
+        if obj is not None:
+            if node_id is not None and obj["id"] != node_id:
+                # The caller hashed a different value than build_* did — e.g.
+                # build_url canonicalises its input first. Trust the object we
+                # are actually appending, but say so loudly: left alone this
+                # silently drops the edge for every DUPLICATE of this object,
+                # which is the exact defect this helper exists to fix and is
+                # invisible from the first occurrence's correct behaviour.
+                logger.error(
+                    f"_emit_node: anchor id {node_id} != built id "
+                    f"{obj['id']} for {obj.get('type')} — per-session edges "
+                    f"to later duplicates of this object will be dropped"
+                )
+            out.append(obj)
+            return obj["id"]
+        # Not built. Only "already in this bundle" is safe to anchor on.
+        if node_id and node_id in self._emitted_ids:
+            return node_id
+        return None
+
+    def _emit_attack_pattern(
+        self,
+        name: str,
+        mitre_id: Optional[str] = None,
+        *,
+        out: list[dict],
+        session: Optional[AttackSession] = None,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_attack_pattern(name, mitre_id, session=session),
+            out=out,
+            node_id=generate_attack_pattern_id(name) if name else None,
+        )
+
+    def _emit_vulnerability(
+        self,
+        cve_id: str,
+        *,
+        out: list[dict],
+        description: Optional[str] = None,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_vulnerability(cve_id, description=description),
+            out=out,
+            node_id=generate_vulnerability_id(cve_id) if cve_id else None,
+        )
+
+    def _emit_file(
+        self, sha256: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_file(sha256, **kwargs),
+            out=out,
+            node_id=generate_file_id(sha256) if sha256 else None,
+        )
+
+    def _emit_file_indicator(
+        self, sha256: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_file_indicator(sha256, **kwargs),
+            out=out,
+            node_id=generate_file_indicator_id(sha256) if sha256 else None,
+        )
+
+    def _emit_url(
+        self,
+        url: str,
+        *,
+        out: list[dict],
+        session: Optional[AttackSession] = None,
+    ) -> Optional[str]:
+        # The id must come from the CANONICAL value: valid_url strips
+        # surrounding whitespace, so hashing the raw input would anchor on a
+        # different id than the SCO was published under.
+        canon = valid_url(url)
+        return self._emit_node(
+            self.build_url(url, session=session),
+            out=out,
+            node_id=generate_url_id(canon) if canon else None,
+        )
+
+    def _emit_domain(
+        self,
+        fqdn: str,
+        *,
+        out: list[dict],
+        session: Optional[AttackSession] = None,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_domain(fqdn, session=session),
+            out=out,
+            node_id=generate_domain_id(fqdn) if fqdn else None,
+        )
+
+    def _emit_referenced_ipv4(
+        self,
+        ip: str,
+        *,
+        out: list[dict],
+        session: Optional[AttackSession] = None,
+    ) -> Optional[str]:
+        return self._emit_node(
+            self.build_referenced_ipv4(ip, session=session),
+            out=out,
+            node_id=generate_ipv4_id(ip) if ip and _IPV4_RE.match(ip) else None,
+        )
+
+    def _emit_malware(
+        self, family: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        # The id seeds off the NORMALISED family: build_malware turns
+        # "Trojan.Mirai" into "mirai" before hashing, so anchoring on the raw
+        # vendor label would point at an id nothing was ever published under.
+        fam = normalize_malware_family(family)
+        return self._emit_node(
+            self.build_malware(family, **kwargs),
+            out=out,
+            node_id=generate_malware_id(fam) if fam else None,
+        )
+
+    def _emit_cryptographic_key(
+        self, value: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """HASSH / JA3 / SSH-client fingerprint SCO.
+
+        This one matters more than most. The whole POINT of a HASSH or JA3 node
+        is that MANY attackers share it -- that is what makes it a pivot -- so
+        the duplicate-in-bundle case is not an edge case here, it is the
+        intended use. Under `if ck:` the second and every later attacker
+        sharing a fingerprint lost their edge to it, which is precisely the
+        population the pivot exists to show.
+        """
+        return self._emit_node(
+            self.build_cryptographic_key(value, **kwargs),
+            out=out,
+            node_id=generate_cryptographic_key_id(value) if value else None,
+        )
+
+    def _emit_attacker_ssh_key(
+        self, key_info: dict, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Attacker SSH public key SCO (planted or authenticated).
+
+        Seeds off the FINGERPRINT, not the key blob -- build_attacker_ssh_key
+        hashes key_info["fingerprint"], and "planted" and "authenticated"
+        deliberately mint the same id for the same key material because that
+        shared id IS the pivot.
+
+        Same shape as _emit_cryptographic_key and the same reason for caring:
+        a planted key like the `mdrfckr` persistence key is shared by hundreds
+        of source IPs, so `if ck:` kept the first and dropped the rest.
+        """
+        fp = key_info.get("fingerprint") if isinstance(key_info, dict) else None
+        return self._emit_node(
+            self.build_attacker_ssh_key(key_info, **kwargs),
+            out=out,
+            node_id=generate_cryptographic_key_id(fp) if fp else None,
+        )
+
+    def _emit_ip_indicator(
+        self, ip: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Indicator for an attacker IP.
+
+        The id canonicalises the address first (attacker_ip_indicator_id ->
+        canonical_ip), matching build_ip_indicator, which reassigns
+        `ip = fam[1]` before hashing. Anchoring on the raw string would miss
+        for any non-canonical form.
+
+        One IP commonly produces several sessions in one bundle -- different
+        parsers see the same attacker -- and each session's Sighting carries
+        its own count, sensor and time window. Under `if ip_ind:` only the
+        first session's Sighting survived, so the observed counts were
+        understated by construction.
+        """
+        return self._emit_node(
+            self.build_ip_indicator(ip, **kwargs),
+            out=out,
+            node_id=attacker_ip_indicator_id(ip),
+        )
+
+    def _emit_country_location(
+        self, country_code: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Country Location node.
+
+        Geo nodes are the most-shared objects in the graph -- thousands of
+        attacker IPs resolve to a few hundred countries -- so under `if
+        country:` only the FIRST attacker per country per bundle kept its
+        `located-at` edge and everyone else silently had no country at all.
+
+        The id upper-cases the code, matching build_country_location's
+        `cc = country_code.upper()`.
+        """
+        return self._emit_node(
+            self.build_country_location(country_code, *args, **kwargs),
+            out=out,
+            node_id=(generate_country_location_id(country_code.upper())
+                     if country_code else None),
+        )
+
+    def _emit_city_location(
+        self, country_code: str, city: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """City Location node. Same sharing profile as country, same id
+        upper-casing of the country code; the city is used verbatim, as
+        build_city_location does."""
+        return self._emit_node(
+            self.build_city_location(country_code, city, *args, **kwargs),
+            out=out,
+            node_id=(generate_city_location_id(country_code.upper(), city)
+                     if country_code and city else None),
+        )
+
+    def _emit_autonomous_system(
+        self, asn, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """Autonomous-System node. Heavily shared -- one hosting AS fronts
+        thousands of attacker IPs, which is exactly the `belongs-to` fan-in an
+        analyst wants and exactly what the gate was deleting."""
+        return self._emit_node(
+            self.build_autonomous_system(asn, *args, **kwargs),
+            out=out,
+            node_id=generate_autonomous_system_id(asn) if asn is not None else None,
+        )
+
+    def _emit_ip_observable(
+        self, ip: str, *args, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """The attacker's own address (v4 or v6), for build_attacker_context.
+
+        Distinct from _emit_ipv4, which is for an address the attacker POINTED
+        AT. Same id helper as build_ip_observable: attacker_ip_observable_id,
+        which canonicalises and picks the family.
+        """
+        return self._emit_node(
+            self.build_ip_observable(ip, *args, **kwargs),
+            out=out,
+            node_id=attacker_ip_observable_id(ip),
+        )
+
+    def _emit_ipv4(
+        self, ip: str, *, out: list[dict], **kwargs,
+    ) -> Optional[str]:
+        """IPv4 observable, for edges pointing AT an address.
+
+        build_ipv4 does not call _dedup itself -- it delegates to
+        _build_ip_observable, which does. That indirection is why the first
+        completeness check missed this family entirely, and why the check now
+        follows return values through helpers instead of looking for a
+        literal _dedup call.
+
+        The id canonicalises via canonical_ip, matching build_ipv4's
+        `fam = canonical_ip(ip)` / `fam[1]`.
+        """
+        fam = canonical_ip(ip)
+        return self._emit_node(
+            self.build_ipv4(ip, **kwargs),
+            out=out,
+            node_id=generate_ipv4_id(fam[1]) if fam and fam[0] == "ipv4" else None,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
     # Foundation objects
     # ──────────────────────────────────────────────────────────────────
 
@@ -1066,17 +1371,13 @@ class STIXBuilder:
         # a busy catch-up window produced ~947k duplicate attack-pattern
         # dicts, ballooning memory and overflowing SQLite's bind-variable
         # limit in the publisher's pre-dedup state lookup (2026-07-19 →
-        # 08-04 ingestion outage). All five callers guard with `if ap:` /
-        # `if not ap: continue`.
+        # 08-04 ingestion outage).
         #
-        # That guard is NOT the correct contract, and this comment used to
-        # claim it was. None here is ambiguous: "no such technique" and
-        # "already emitted in this bundle" are different answers, and callers
-        # that need a per-session edge TO an already-emitted AttackPattern
-        # drop it. See _emit_process for the shape of the fix. Known open
-        # defect for attack-pattern, vulnerability, file, url and domain --
-        # tracked separately; not introduced here, and unchanged by this
-        # change (those ids were already content-addressed).
+        # None here is ambiguous — "no such technique" and "already emitted in
+        # this bundle" are different answers — so callers that need a
+        # per-session edge TO an AttackPattern must NOT gate it on this return
+        # value. Go through `_emit_attack_pattern`, which appends the node and
+        # separately reports the id to anchor on.
         return self._dedup(self._stamp(obj, add_confidence=False))
 
     def build_session_attack_patterns(self, session: AttackSession) -> list[dict]:
@@ -1103,12 +1404,17 @@ class STIXBuilder:
         out: list[dict] = []
         ip_ind_id = attacker_ip_indicator_id(session.src_ip)
         for mitre_id, name in techniques:
-            ap = self.build_attack_pattern(name, mitre_id=mitre_id, session=session)
-            if not ap:
+            # This method runs for EVERY session, so the ~30 distinct
+            # techniques are duplicates for all but the first session in a
+            # bundle. Gating the edge on the node dropped the indicates edge
+            # for every session after that first one — i.e. for essentially
+            # the whole bundle.
+            ap_id = self._emit_attack_pattern(
+                name, mitre_id, out=out, session=session)
+            if not ap_id:
                 continue
-            out.append(ap)
             if rel := self.build_relationship(
-                ip_ind_id, "indicates", ap["id"],
+                ip_ind_id, "indicates", ap_id,
                 description=(
                     f"{session.event_type} behaviour on sensor "
                     f"{session.sensor_hostname!r} maps to {name} ({mitre_id})"
@@ -2234,20 +2540,9 @@ class STIXBuilder:
             # build_url returns None for BOTH "already emitted in this bundle"
             # and "failed validation". Only the first is safe to anchor an
             # edge on — referencing a URL that was never built, and never will
-            # be, is a dangling ref. `_emitted_ids` tells the two apart; this
-            # mirrors the domain path in build_unattributed_payload_objects.
-            #
-            # The id must come from the CANONICAL value, not the raw input:
-            # valid_url strips surrounding whitespace, so hashing `url` would
-            # anchor on a different id than the SCO was published under.
-            canon = valid_url(url)
-            u = self.build_url(url, session=session)
-            if u:
-                out.append(u)
-            if canon is None:
-                continue
-            url_id = generate_url_id(canon)
-            if not (u or url_id in self._emitted_ids):
+            # be, is a dangling ref. `_emit_url` tells the two apart.
+            url_id = self._emit_url(url, out=out, session=session)
+            if not url_id:
                 continue
             # The File SDO stands on its own, so a rejected URL costs only
             # this edge — the hash is still published.
@@ -2280,22 +2575,21 @@ class STIXBuilder:
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
 
         # HASSH fingerprint → Cryptographic-Key
         if session.hassh:
-            ck = self.build_cryptographic_key(session.hassh, session=session)
-            if ck:
-                out.append(ck)
+            ck_id = self._emit_cryptographic_key(
+                session.hassh, out=out, session=session)
+            if ck_id:
                 if rel := self.build_relationship(
-                    ck["id"], "related-to", ipv4_id,
+                    ck_id, "related-to", ipv4_id,
                     description=f"HASSH fingerprint observed from {session.src_ip}",
                 ):
                     out.append(rel)
@@ -2317,13 +2611,12 @@ class STIXBuilder:
         for key_info in (session.auth_pubkeys or []):
             if not key_info.get("fingerprint"):
                 continue
-            ck = self.build_attacker_ssh_key(
-                key_info, session=session, context="authenticated")
-            if not ck:
+            ck_id = self._emit_attacker_ssh_key(
+                key_info, out=out, session=session, context="authenticated")
+            if not ck_id:
                 continue
-            out.append(ck)
             if rel := self.build_relationship(
-                ipv4_id, "related-to", ck["id"],
+                ipv4_id, "related-to", ck_id,
                 description=(
                     f"Authenticated to {session.event_type} by public key "
                     f"(type={key_info.get('type')}) — attacker "
@@ -2336,14 +2629,13 @@ class STIXBuilder:
             fp = key_info.get("fingerprint")
             if not fp:
                 continue
-            ck = self.build_attacker_ssh_key(key_info, session=session)
-            if not ck:
+            ck_id = self._emit_attacker_ssh_key(key_info, out=out, session=session)
+            if not ck_id:
                 continue
-            out.append(ck)
             # IP observable → key (so the key's "Related Entities" tab
             # shows every IP that planted it — the campaign view).
             if rel := self.build_relationship(
-                ipv4_id, "related-to", ck["id"],
+                ipv4_id, "related-to", ck_id,
                 description=(
                     f"Planted SSH key (type={key_info.get('type')}, "
                     f"comment={key_info.get('comment') or '∅'!r}) "
@@ -2353,9 +2645,9 @@ class STIXBuilder:
                 out.append(rel)
             # IP Indicator → key (so the indicator-side knowledge tab
             # also shows the campaign pivot).
-            if ip_ind:
+            if ip_ind_id:
                 if rel := self.build_relationship(
-                    ip_ind["id"], "related-to", ck["id"],
+                    ip_ind_id, "related-to", ck_id,
                     description=f"Indicator for IP that planted SSH key {fp[:12]}…",
                 ):
                     out.append(rel)
@@ -2371,46 +2663,45 @@ class STIXBuilder:
 
         # File downloads → StixFile + Indicator + URL/Domain
         for sha256 in session.malware_hashes:
-            f = self.build_file(sha256, session=session)
-            if f:
-                out.append(f)
+            # File → IPv4 is the per-attacker edge, and a widely-distributed
+            # sample is a duplicate File for every attacker after the first —
+            # so `if f:` dropped exactly the "who else dropped this" answer
+            # that makes the sample worth publishing.
+            file_id = self._emit_file(sha256, out=out, session=session)
+            if file_id:
                 if rel := self.build_relationship(
-                    f["id"], "related-to", ipv4_id,
+                    file_id, "related-to", ipv4_id,
                     description=f"File {sha256[:16]}… downloaded by {session.src_ip}",
                 ):
                     out.append(rel)
                 # File Indicator + based-on
-                f_ind = self.build_file_indicator(sha256, session=session)
-                if f_ind:
-                    out.append(f_ind)
+                f_ind_id = self._emit_file_indicator(sha256, out=out, session=session)
+                if f_ind_id:
                     if rel := self.build_relationship(
-                        f_ind["id"], "based-on", f["id"],
+                        f_ind_id, "based-on", file_id,
                         description=f"Honeypot-captured file {sha256[:16]}…",
                     ):
                         out.append(rel)
 
         # URLs (download sources + URLs in commands)
         for url in session.urls:
-            url_obj = self.build_url(url, session=session)
-            if url_obj:
-                out.append(url_obj)
+            url_id = self._emit_url(url, out=out, session=session)
+            if url_id:
                 if rel := self.build_relationship(
-                    url_obj["id"], "related-to", ipv4_id,
+                    url_id, "related-to", ipv4_id,
                     description=f"URL referenced by {session.src_ip}",
                 ):
                     out.append(rel)
 
         # Domains derived from URLs
         for fqdn in session.domains:
-            d = self.build_domain(fqdn, session=session)
-            if d:
-                out.append(d)
+            self._emit_domain(fqdn, out=out, session=session)
 
         # Dual sighting (Indicator + Observable) — see build_dual_sighting
         # docstring for the OpenCTI UX rationale.
-        if ip_ind:
+        if ip_ind_id:
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_cowrie_sighting_description(session),
             ))
@@ -2454,11 +2745,10 @@ class STIXBuilder:
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
         # IP Indicator + based-on → IPv4
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
@@ -2474,25 +2764,32 @@ class STIXBuilder:
                     f"{meta.get('signature')!r}; skipping AttackPattern emission"
                 )
                 continue
-            ap = self.build_attack_pattern(name=name, mitre_id=tid, session=session)
-            if ap:
-                out.append(ap)
-                attack_pattern_ids.append(ap["id"])
+            # Collect the id whether or not this session was the one to append
+            # the node: a signature's technique repeats across every alert, so
+            # from the second Suricata session onward the AttackPattern is a
+            # duplicate and `if ap:` left attack_pattern_ids empty — no
+            # indicates edge at all for those sessions.
+            if ap_id := self._emit_attack_pattern(
+                name, tid, out=out, session=session
+            ):
+                attack_pattern_ids.append(ap_id)
 
         # Fallback: if no recognized MITRE technique attached, emit a
         # generic "Network Attack" AttackPattern so we always have an
         # indicates-target per V1_SPEC §5.2.
-        if ip_ind and not attack_pattern_ids and self.config.cycle.emit_generic_attack_pattern:
-            generic = self.build_attack_pattern(name="Network Attack", session=session)
-            if generic:
-                out.append(generic)
-                attack_pattern_ids.append(generic["id"])
+        if ip_ind_id and not attack_pattern_ids and self.config.cycle.emit_generic_attack_pattern:
+            # "Network Attack" is one shared node for the whole bundle, so
+            # every session but the first hit the duplicate case here.
+            if generic_id := self._emit_attack_pattern(
+                "Network Attack", out=out, session=session
+            ):
+                attack_pattern_ids.append(generic_id)
 
         # Indicator → indicates → AttackPattern(s)
-        if ip_ind:
+        if ip_ind_id:
             for ap_id in attack_pattern_ids:
                 if rel := self.build_relationship(
-                    ip_ind["id"], "indicates", ap_id,
+                    ip_ind_id, "indicates", ap_id,
                     description=(
                         f"Suricata rule {meta.get('signature_id') or '?'}: "
                         f"{meta.get('signature') or 'alert'}"
@@ -2502,21 +2799,23 @@ class STIXBuilder:
 
         # ── Vulnerabilities (CVE refs from signature name) ────────────
         for cve in meta.get("cves") or []:
-            vuln = self.build_vulnerability(
-                cve,
+            # One Vulnerability node per CVE per bundle, but every attacker
+            # exploiting it is a separate `indicates` edge — that edge IS the
+            # "who tried this CVE" answer, and gating it on the node deleted
+            # all of them but the first.
+            vuln_id = self._emit_vulnerability(
+                cve, out=out,
                 description=f"Referenced by Suricata signature: {meta.get('signature')!r}",
             )
-            if vuln:
-                out.append(vuln)
-                if ip_ind:
-                    if rel := self.build_relationship(
-                        ip_ind["id"], "indicates", vuln["id"],
-                        description=(
-                            f"{session.src_ip} attempted exploit of {cve} "
-                            f"(Suricata SID {meta.get('signature_id') or '?'})"
-                        ),
-                    ):
-                        out.append(rel)
+            if vuln_id and ip_ind_id:
+                if rel := self.build_relationship(
+                    ip_ind_id, "indicates", vuln_id,
+                    description=(
+                        f"{session.src_ip} attempted exploit of {cve} "
+                        f"(Suricata SID {meta.get('signature_id') or '?'})"
+                    ),
+                ):
+                    out.append(rel)
 
         # ── Domain-Name (TLS SNI or HTTP host) ────────────────────────
         # Collect candidate domains, dedup, build Domain-Name observables.
@@ -2528,24 +2827,35 @@ class STIXBuilder:
                 domain_candidates.append(host)
 
         for fqdn in domain_candidates:
-            d = self.build_domain(fqdn, session=session)
-            if d:
-                out.append(d)
-                # Domain-Name → resolves-to → IPv4-Addr (dst_ip preferred,
-                # since the SNI/host refers to the destination the
-                # attacker is trying to reach; if no dst_ip, fall back to
-                # the alert's src_ip per V1_SPEC §5.2 phrasing).
-                # Build the target observable via build_ipv4 so it is (a)
-                # validated (malformed/IPv6 dst_ip → skipped, not a bad SCO)
-                # and (b) present IN this bundle — otherwise the resolves-to
-                # edge dangles into MISSING_REFERENCE.
-                target_ip = event.dst_ip or session.src_ip
+            # The SNI/host repeats across alerts while the destination it
+            # resolved to does not, so gating on the node dropped every
+            # resolves-to observation after the first.
+            domain_id = self._emit_domain(fqdn, out=out, session=session)
+            if domain_id:
+                # Domain-Name → resolves-to → IPv4-Addr. The SNI/Host names
+                # the DESTINATION the attacker is trying to reach, so only
+                # dst_ip can answer it.
+                #
+                # There used to be an `or session.src_ip` fallback here. It
+                # asserted that the requested name resolves to the ATTACKER's
+                # own address, which no observation establishes — the attacker
+                # sent us a name and we saw where the packet came from, which
+                # are unrelated facts. It was masked until now: build_ipv4
+                # returned None for an address attacker-context had already
+                # emitted this bundle, so the edge was skipped by accident.
+                # Content-anchoring the id removed the accident and exposed
+                # the assertion, which is the wrong half to keep.
+                #
+                # _emit_ipv4 keeps the observable validated (malformed / IPv6
+                # dst_ip is skipped rather than published as a bad SCO) and
+                # present IN this bundle, so the edge cannot dangle.
+                target_ip = event.dst_ip
                 if target_ip:
-                    target_ipv4 = self.build_ipv4(target_ip, session=session)
-                    if target_ipv4:
-                        out.append(target_ipv4)
+                    target_ipv4_id = self._emit_ipv4(
+                        target_ip, out=out, session=session)
+                    if target_ipv4_id:
                         if rel := self.build_relationship(
-                            d["id"], "resolves-to", target_ipv4["id"],
+                            domain_id, "resolves-to", target_ipv4_id,
                             description=f"{fqdn} resolved-to {target_ip} per honeypot observation",
                         ):
                             out.append(rel)
@@ -2553,19 +2863,21 @@ class STIXBuilder:
         # ── URL observable (if HTTP request URL captured) ─────────────
         if (url := meta.get("http_url")) and (host := meta.get("http_host")):
             full_url = url if url.startswith("http") else f"http://{host}{url}"
-            url_obj = self.build_url(full_url, session=session)
-            if url_obj:
-                out.append(url_obj)
+            # Scanners hit the same path on every sensor, so this URL is a
+            # duplicate for all but the first alert naming it — and the edge
+            # below is the per-attacker half.
+            req_url_id = self._emit_url(full_url, out=out, session=session)
+            if req_url_id:
                 if rel := self.build_relationship(
-                    url_obj["id"], "related-to", ipv4_id,
+                    req_url_id, "related-to", ipv4_id,
                     description=f"URL requested by {session.src_ip}",
                 ):
                     out.append(rel)
 
         # ── Dual sighting (Indicator + IPv4 observable) ───────────────
-        if ip_ind:
+        if ip_ind_id:
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=1,
             ))
 
@@ -2608,19 +2920,24 @@ class STIXBuilder:
         fp = port_intel.fingerprint_payload(printable, hex_str)
 
         # IP Indicator + based-on → IPv4 observable
+        # This one enriches the object IN PLACE before emitting, so it needs
+        # the dict, not just the id -- hence _emit_node directly rather than
+        # the _emit_ip_indicator wrapper. Same two-None contract either way.
         ip_ind = self.build_ip_indicator(session.src_ip, session=session)
         if ip_ind:
             self._enrich_honeytrap_indicator(ip_ind, session, scan_labels, scan_phrase, fp)
-            out.append(ip_ind)
+        ip_ind_id = self._emit_node(
+            ip_ind, out=out, node_id=attacker_ip_indicator_id(session.src_ip))
+        if ip_ind_id:
             if rel := self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             ):
                 out.append(rel)
 
             # Dual sighting (Indicator + IPv4 observable).
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
                 description=render_honeytrap_sighting_description(session, event),
             ))
@@ -2711,12 +3028,12 @@ class STIXBuilder:
                 ipv4_id = attacker_ip_observable_id(first.src_ip)
 
             # IP Indicator + based-on → IPv4
-            ip_ind = self.build_ip_indicator(first.src_ip, session=session)
-            if ip_ind:
-                out.append(ip_ind)
+            ip_ind_id = self._emit_ip_indicator(
+                first.src_ip, out=out, session=session)
+            if ip_ind_id:
                 if ipv4_id:
                     if rel := self.build_relationship(
-                        ip_ind["id"], "based-on", ipv4_id,
+                        ip_ind_id, "based-on", ipv4_id,
                         description=f"IP indicator for {first.src_ip}",
                     ):
                         out.append(rel)
@@ -2728,7 +3045,7 @@ class STIXBuilder:
                 # signal protocols. If a maintainer wants per-event
                 # forensics, the raw doc is preserved on T-Pot's ES.
                 out.extend(self.build_dual_sighting(
-                    ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                    ip_ind_id, ipv4_id, session.sensor_hostname, session,
                     count=session.event_count,
                     description=render_fallback_sighting_description(first, unknown_type),
                 ))
@@ -2769,46 +3086,59 @@ class STIXBuilder:
         enrichment + pivot menu external_references.
         """
         out: list[dict] = []
-        ip_obj = self.build_ip_observable(event.src_ip, session=session)
-        if not ip_obj:
+        # The attacker's own address. Emitted through the wrapper, so a repeat
+        # of this IP inside one bundle still yields an anchor id rather than
+        # aborting the whole context.
+        #
+        # This used to `return out` when build_ip_observable returned None.
+        # That conflated "not a usable address" with "already emitted this
+        # bundle", and the second meaning silently dropped the geo and ASN
+        # edges below. Harmless only while a repeated IP carries identical
+        # enrichment -- which is not guaranteed: GeoIP can resolve the same
+        # address to a different city or ASN on two events in one window, and
+        # then those edges are genuinely different and genuinely lost. That
+        # was the last excuse standing in the sweep's allowlist; it does not
+        # need excusing now.
+        ip_id = self._emit_ip_observable(event.src_ip, out=out, session=session)
+        if not ip_id:
             return out
-        out.append(ip_obj)
+        ip_obj = {"id": ip_id}
 
         # GeoIP (logstash-enriched)
         if event.src_country_code:
-            country = self.build_country_location(
-                event.src_country_code, event.src_country_name, session=session,
+            country_id = self._emit_country_location(
+                event.src_country_code, event.src_country_name,
+                out=out, session=session,
             )
-            if country:
-                out.append(country)
+            if country_id:
                 rel = self.build_relationship(
-                    ip_obj["id"], "located-at", country["id"],
+                    ip_obj["id"], "located-at", country_id,
                     description=f"{event.src_ip} geolocated to {event.src_country_code}",
                 )
                 if rel:
                     out.append(rel)
             if event.src_city:
-                city = self.build_city_location(
-                    event.src_country_code, event.src_city, session=session,
+                city_id = self._emit_city_location(
+                    event.src_country_code, event.src_city,
+                    out=out, session=session,
                 )
-                if city:
-                    out.append(city)
+                if city_id:
                     rel = self.build_relationship(
-                        ip_obj["id"], "located-at", city["id"],
+                        ip_obj["id"], "located-at", city_id,
                         description=f"{event.src_ip} geolocated to {event.src_city}",
                     )
                     if rel:
                         out.append(rel)
 
         if event.src_asn:
-            asn = self.build_autonomous_system(
-                event.src_asn, event.src_as_org, session=session,
+            asn_id = self._emit_autonomous_system(
+                event.src_asn, event.src_as_org,
+                out=out, session=session,
             )
-            if asn:
-                out.append(asn)
+            if asn_id:
                 # Use the canonical STIX "belongs-to" for IPv4 → AS
                 rel = self.build_relationship(
-                    ip_obj["id"], "belongs-to", asn["id"],
+                    ip_obj["id"], "belongs-to", asn_id,
                     description=f"{event.src_ip} belongs to AS{event.src_asn}",
                 )
                 if rel:
@@ -2841,20 +3171,19 @@ class STIXBuilder:
         out.extend(self.build_attacker_context(first, session=session))
 
         # IP Indicator + Sighting
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            out.append(ip_ind)
+        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        if ip_ind_id:
             # based-on → IPv4 observable (already emitted above)
             ipv4_id = attacker_ip_observable_id(session.src_ip)
             rel = self.build_relationship(
-                ip_ind["id"], "based-on", ipv4_id,
+                ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             )
             if rel:
                 out.append(rel)
             # Dual sighting (Indicator + IPv4 observable)
             out.extend(self.build_dual_sighting(
-                ip_ind["id"], ipv4_id, session.sensor_hostname, session,
+                ip_ind_id, ipv4_id, session.sensor_hostname, session,
                 count=session.event_count,
             ))
 
@@ -2892,12 +3221,14 @@ class STIXBuilder:
             if url in seen:
                 continue
             seen.add(url)
-            u = self.build_url(url, session=session)
-            if not u:
+            # Scanners request the same paths across the whole hive, so this
+            # URL is a duplicate for every web session but the first — and
+            # "who requested it" is the only thing this edge carries.
+            web_url_id = self._emit_url(url, out=out, session=session)
+            if not web_url_id:
                 continue
-            out.append(u)
             if rel := self.build_relationship(
-                ipv4_id, "related-to", u["id"],
+                ipv4_id, "related-to", web_url_id,
                 description=f"{session.src_ip} requested {url}",
             ):
                 out.append(rel)
@@ -2922,30 +3253,28 @@ class STIXBuilder:
         if not ap_names and (cves or mitre):
             ap_names = {"Web application exploit attempt"}
         for name in sorted(ap_names):
-            ap = self.build_attack_pattern(name, mitre_id, session=session)
-            if not ap:
-                continue
-            out.append(ap)
-            if ind_id and (rel := self.build_relationship(
-                ind_id, "indicates", ap["id"],
+            # Scanners spray the whole hive with the same technique, so this
+            # AttackPattern is a duplicate for every web session but the
+            # first — which is precisely when the per-attacker edge matters.
+            ap_id = self._emit_attack_pattern(
+                name, mitre_id, out=out, session=session)
+            if ap_id and ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", ap_id,
                 description=f"{session.event_type} technique from {session.src_ip}",
             )):
                 out.append(rel)
 
         # Vulnerability per matched CVE signature.
         for cve in sorted(cves):
-            v = self.build_vulnerability(
-                cve,
+            v_id = self._emit_vulnerability(
+                cve, out=out,
                 description=(
                     f"Exploit attempt observed via {session.event_type} "
                     f"from {session.src_ip}."
                 ),
             )
-            if not v:
-                continue
-            out.append(v)
-            if ind_id and (rel := self.build_relationship(
-                ind_id, "indicates", v["id"],
+            if v_id and ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", v_id,
                 description=f"{session.src_ip} attempted to exploit {cve}",
             )):
                 out.append(rel)
@@ -3103,13 +3432,10 @@ class STIXBuilder:
                 # build_domain returns None for BOTH "already emitted"
                 # and "malformed". Only the first is safe to reference —
                 # an edge to a malformed domain that was never built (and
-                # never will be) is a dangling ref. _emitted_ids tells the
+                # never will be) is a dangling ref. _emit_domain tells the
                 # two cases apart.
-                d = self.build_domain(host, session=session)
-                domain_id = generate_domain_id(host)
-                if d:
-                    out.append(d)
-                if (d or domain_id in self._emitted_ids) and (
+                domain_id = self._emit_domain(host, out=out, session=session)
+                if domain_id and (
                     rel := self.build_relationship(
                         url_id, "resolves-to", domain_id,
                         description=f"C2 endpoint {url[:120]} resolves to {host}",
@@ -3118,8 +3444,8 @@ class STIXBuilder:
                     out.append(rel)
 
             if cve := first.meta.get("matched_cve"):
-                if v := self.build_vulnerability(
-                    cve,
+                vuln_id = self._emit_vulnerability(
+                    cve, out=out,
                     description=(
                         f"Exploitation attempt observed via "
                         f"{first.event_type} on sensor "
@@ -3128,24 +3454,22 @@ class STIXBuilder:
                         f"attacker-controlled X-Forwarded-For header as "
                         f"the client address."
                     ),
-                ):
-                    out.append(v)
-                if rel := self.build_relationship(
-                    url_id, "related-to", generate_vulnerability_id(cve),
+                )
+                if vuln_id and (rel := self.build_relationship(
+                    url_id, "related-to", vuln_id,
                     description=f"C2 endpoint delivered in a {cve} payload",
-                ):
+                )):
                     out.append(rel)
 
             if attack_type := first.meta.get("attack_type"):
-                if ap := self.build_attack_pattern(
+                ap_id = self._emit_attack_pattern(
                     attack_type, first.meta.get("mitre_technique"),
-                    session=session,
-                ):
-                    out.append(ap)
-                if rel := self.build_relationship(
-                    url_id, "related-to", generate_attack_pattern_id(attack_type),
+                    out=out, session=session,
+                )
+                if ap_id and (rel := self.build_relationship(
+                    url_id, "related-to", ap_id,
                     description=f"C2 endpoint used by {attack_type}",
-                ):
+                )):
                     out.append(rel)
 
             if sighting := self.build_sighting(
@@ -3278,40 +3602,40 @@ class STIXBuilder:
                 out.append(rel)
 
 
+        # Every edge below is per-ATTACKER while its node is content-addressed
+        # and therefore shared: the second and later attackers dropping a known
+        # sample, or referencing a known URL/domain, got None from the builder
+        # and lost their edge. Anchor on the id instead of the object.
         for sha256 in session.malware_hashes:
-            f = self.build_file(sha256, session=session)
-            if not f:
+            file_id = self._emit_file(sha256, out=out, session=session)
+            if not file_id:
                 continue
-            out.append(f)
             if rel := self.build_relationship(
-                f["id"], "related-to", ipv4_id,
+                file_id, "related-to", ipv4_id,
                 description=f"File dropped by {session.src_ip}",
             ):
                 out.append(rel)
-            f_ind = self.build_file_indicator(sha256, session=session)
-            if f_ind:
-                out.append(f_ind)
+            f_ind_id = self._emit_file_indicator(sha256, out=out, session=session)
+            if f_ind_id:
                 if rel := self.build_relationship(
-                    f_ind["id"], "based-on", f["id"],
+                    f_ind_id, "based-on", file_id,
                     description=f"Indicator for file {sha256[:16]}…",
                 ):
                     out.append(rel)
 
         for url in session.urls:
-            u = self.build_url(url, session=session)
-            if u:
-                out.append(u)
+            url_id = self._emit_url(url, out=out, session=session)
+            if url_id:
                 if rel := self.build_relationship(
-                    u["id"], "related-to", ipv4_id,
+                    url_id, "related-to", ipv4_id,
                     description=f"Download URL from {session.src_ip}",
                 ):
                     out.append(rel)
         for dom in session.domains:
-            d = self.build_domain(dom, session=session)
-            if d:
-                out.append(d)
+            dom_id = self._emit_domain(dom, out=out, session=session)
+            if dom_id:
                 if rel := self.build_relationship(
-                    d["id"], "related-to", ipv4_id,
+                    dom_id, "related-to", ipv4_id,
                     description=f"Domain referenced by {session.src_ip}",
                 ):
                     out.append(rel)
@@ -3343,11 +3667,10 @@ class STIXBuilder:
         for fp in (session.hassh, session.ja3):
             if not fp:
                 continue
-            ck = self.build_cryptographic_key(fp, session=session)
-            if ck:
-                out.append(ck)
+            ck_id = self._emit_cryptographic_key(fp, out=out, session=session)
+            if ck_id:
                 if rel := self.build_relationship(
-                    ck["id"], "related-to", ipv4_id,
+                    ck_id, "related-to", ipv4_id,
                     description=f"Client fingerprint observed from {session.src_ip}",
                 ):
                     out.append(rel)
@@ -3401,14 +3724,14 @@ class STIXBuilder:
             or session.event_count > 2
         )
         if interacted:
-            ap = self.build_attack_pattern(ap_name, session=session)
-            if ap:
-                out.append(ap)
-                if ind_id and (rel := self.build_relationship(
-                    ind_id, "indicates", ap["id"],
-                    description=f"{session.event_type} activity from {session.src_ip}",
-                )):
-                    out.append(rel)
+            # ap_name is fixed per protocol family, so it is a duplicate for
+            # every session after the first of that family in the bundle.
+            ap_id = self._emit_attack_pattern(ap_name, out=out, session=session)
+            if ap_id and ind_id and (rel := self.build_relationship(
+                ind_id, "indicates", ap_id,
+                description=f"{session.event_type} activity from {session.src_ip}",
+            )):
+                out.append(rel)
         _pid = self._emit_process(session, out)
         if _pid:
             if rel := self.build_relationship(
@@ -3427,27 +3750,28 @@ class STIXBuilder:
                 if _url in _seen_urls:
                     continue
                 _seen_urls.add(_url)
-                _url_obj = self.build_url(_url, session=session)
-                if not _url_obj:
+                # A dropper URL recurs across attackers verbatim; anchoring on
+                # the object dropped both edges below for every attacker after
+                # the first to name it.
+                _url_id = self._emit_url(_url, out=out, session=session)
+                if not _url_id:
                     continue
-                out.append(_url_obj)
                 if rel := self.build_relationship(
-                    _url_obj["id"], "related-to", ipv4_id,
+                    _url_id, "related-to", ipv4_id,
                     description=f"Payload URL fetched via {session.event_type} by {session.src_ip}",
                 ):
                     out.append(rel)
                 _host = urlparse(_url).hostname
                 if not _host:
                     continue
-                _host_obj = (
-                    self.build_referenced_ipv4(_host, session=session)
+                _host_id = (
+                    self._emit_referenced_ipv4(_host, out=out, session=session)
                     if _IPV4_RE.match(_host)
-                    else self.build_domain(_host, session=session)
+                    else self._emit_domain(_host, out=out, session=session)
                 )
-                if _host_obj:
-                    out.append(_host_obj)
+                if _host_id:
                     if rel := self.build_relationship(
-                        _url_obj["id"], "related-to", _host_obj["id"],
+                        _url_id, "related-to", _host_id,
                         description="Payload URL hosted on this endpoint",
                     ):
                         out.append(rel)

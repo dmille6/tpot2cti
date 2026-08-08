@@ -552,7 +552,10 @@ Sighting. Multiple alerts on the same flow each appear independently.
 
 **Relationships:**
 - `Indicator` → `indicates` → `AttackPattern` (from metadata, or generic "network-attack" if none)
-- `Domain-Name` → `resolves-to` → `IPv4-Addr` (if SNI matches IP)
+- `Domain-Name` → `resolves-to` → `IPv4-Addr` — the captured DESTINATION
+  address only. NEVER the attacker's source address: they sent us a name, and
+  separately we saw where the packet came from, and nothing ties the two
+  together. If no destination address was captured, emit no edge.
 - `IPv4-Addr` → `located-at` → `Location`
 
 ### 5.3 Dionaea (`type:"Dionaea"`)
