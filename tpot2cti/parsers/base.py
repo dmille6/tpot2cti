@@ -274,19 +274,54 @@ class BaseParser:
 
     @staticmethod
     def _parse_timestamp(doc: dict) -> Optional[datetime]:
-        """Parse T-Pot's `@timestamp` field.  Returns timezone-aware UTC
-        or None if missing/unparseable."""
+        """Parse T-Pot's `@timestamp` field into an AWARE UTC datetime.
+
+        THE CONTRACT: an aware datetime whose tzinfo is `timezone.utc`, or
+        None if the field is missing/unparseable.  Never naive, never
+        carrying some other offset.  Every `ParsedEvent.timestamp`, and
+        therefore every `AttackSession.first_seen`/`last_seen`, is that.
+
+        A tz-less input is READ AS UTC — what the rest of the pipeline has
+        always assumed, and what T-Pot's own logstash pipelines emit.
+
+        This used to just hand back whatever `fromisoformat` produced, which
+        broke the promise in two directions and cost more than a wrong
+        docstring:
+
+          * A tz-less input stayed NAIVE.  Python raises TypeError comparing
+            a naive to an aware datetime, so `correlator.correlate_by_window`
+            (which sorts events and subtracts their timestamps) and
+            `builder._as_dt`'s callers crashed mid-cycle the moment one
+            sensor's docs carried an offset and another's did not.
+          * An input with a non-UTC offset KEPT that offset.  Downstream
+            comparisons are frequently made on the ISO string — `state.py`'s
+            attacker_activity first_seen/last_seen merge, its
+            `last_seen >= ? AND first_seen <= ?` window query, campaigns'
+            min()/max() over rows — and lexicographic order only equals
+            chronological order when every value carries the SAME offset.
+            "…T10:30+02:00" sorts after "…T09:00+00:00" while being half an
+            hour EARLIER.
+
+        Normalising here rather than at each consumer is deliberate: there is
+        one producer of these values and a long tail of readers, and the
+        readers that get it wrong do so silently.  `builder._as_dt` stays as
+        defence in depth because `build_relationship` accepts an
+        AttackSession from any caller, not only from a parser.
+        """
         ts = doc.get("@timestamp")
         if not ts:
             return None
         if isinstance(ts, datetime):
-            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-        try:
-            # ES typically writes ISO 8601 with `Z` suffix
-            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        except (TypeError, ValueError) as e:
-            logger.debug(f"unparseable @timestamp {ts!r}: {e}")
-            return None
+            dt = ts
+        else:
+            try:
+                # ES typically writes ISO 8601 with `Z` suffix
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except (TypeError, ValueError) as e:
+                logger.debug(f"unparseable @timestamp {ts!r}: {e}")
+                return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+            else dt.astimezone(timezone.utc)
 
     @staticmethod
     def _populate_geoip(doc: dict, event: ParsedEvent) -> None:

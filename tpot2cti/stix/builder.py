@@ -880,17 +880,22 @@ class STIXBuilder:
         """Parse a STIX timestamp for COMPARISON.
 
         Not string comparison. Lexicographic order equals chronological order
-        only if every value carries the same UTC offset, and _parse_timestamp
-        does not normalise: an input with +02:00 stays +02:00, so "…T09:00+02:00"
-        sorts before "…T08:30+00:00" while being LATER.
+        only if every value carries the same UTC offset: "…T09:00+02:00" sorts
+        before "…T08:30+00:00" while being LATER, and a naive "…T09:00" sorts
+        before the same instant written "…T09:00+00:00".
 
         ALWAYS returns an aware UTC datetime or None -- never a naive one.
-        _parse_timestamp's docstring claims it returns aware UTC, but a
-        tz-less input stays naive, and Python raises TypeError when a naive
-        and an aware datetime are compared. Two observations of one edge
-        differing only in whether their source carried an offset would then
-        crash the build mid-bundle. A naive value is read as UTC, which is
-        what the rest of the pipeline already assumes.
+        Python raises TypeError when a naive and an aware datetime are
+        compared, so two observations of one edge differing only in whether
+        their source carried an offset would crash the build mid-bundle.
+        A naive value is read as UTC, matching BaseParser._parse_timestamp.
+
+        DEFENCE IN DEPTH, not the primary fix. `_parse_timestamp` now
+        normalises at the source, so everything arriving via a parser is
+        already aware UTC. This stays because `build_relationship` and
+        `_widen_relationship_window` accept an AttackSession from ANY caller
+        -- tests and future producers construct them by hand -- and a
+        hand-built naive `first_seen` must not be able to abort a bundle.
         """
         if not value:
             return None
