@@ -58,7 +58,7 @@ from tpot2cti.publisher import Publisher
 from tpot2cti.state import CycleState
 from tpot2cti.stix.builder import STIXBuilder
 from tpot2cti.stix.builder import normalize_malware_family
-from tpot2cti.stix_ids import attacker_ip_observable_id, generate_malware_id
+from tpot2cti.stix_ids import attacker_ip_observable_id
 
 logger = logging.getLogger(__name__)
 
@@ -273,21 +273,22 @@ def build_objects(builder: STIXBuilder, raw_ip: str,
         fam = normalize_malware_family(family)
         if not fam:
             continue
-        mal = builder.build_malware(
-            family, source="feodo",
+        # build_malware returns None when it already emitted this family THIS
+        # cycle. The edge must still be built — a second address sharing a
+        # family would otherwise silently lose its relationship, the same shape
+        # as the first-matching-label bug, and invisible in the counters. This
+        # site already got that right by hand; it goes through the shared
+        # helper so there is ONE implementation of the distinction rather than
+        # several that have to be kept correct independently.
+        malware_id = builder._emit_malware(
+            family, out=out, source="feodo",
             description=(f"Malware family {fam!r} attributed from abuse.ch Feodo "
                          f"Tracker's online C2 list. NOT from a captured sample: "
                          f"this address was matched against a downloaded "
                          f"blocklist."),
         )
-        # `mal` is None when the builder already emitted this family THIS cycle.
-        # The edge must still be built — a second address sharing a family would
-        # otherwise silently lose its relationship, the same shape as the
-        # first-matching-label bug, and invisible in the counters.
-        if mal:
-            out.append(mal)
         rel = builder.build_relationship(
-            obs_id, "related-to", generate_malware_id(fam),
+            obs_id, "related-to", malware_id,
             description=(f"Address listed as an online {family} C2 by abuse.ch "
                          f"Feodo Tracker at match time."),
         )

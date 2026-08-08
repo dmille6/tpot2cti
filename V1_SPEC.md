@@ -331,7 +331,7 @@ Docker compose healthcheck uses this.
 | `stixfile` | One per unique `sha256` of captured malware | hash only — no bytes in core |
 | `url` | URLs extracted from Cowrie commands, HTTP req/res, etc. | full URL |
 | `domain-name` | Domains in SNI, HTTP host, URL hostnames | apex + subdomain |
-| `process` | One per session that ran commands | `command_line` = joined commands |
+| `process` | One per distinct command TRANSCRIPT, shared across the sessions that ran it | `command_line` = canonical joined commands |
 | `cryptographic-key` | Per HASSH, JA3, JA3S, HTTP-header-hash | fingerprint value |
 | `indicator` | Per high-confidence pattern (file hash, URL, IP) | STIX pattern syntax |
 | `note` | Session summary + daily aggregates | markdown body |
@@ -359,7 +359,7 @@ Seed examples:
 | `stixfile` | `stixfile:sha256:<sha256>` |
 | `url` | `url:<full-url>` |
 | `domain-name` | `domain-name:<fqdn>` |
-| `process` | `process:<sensor>:<session_id>` |
+| `process` | `process:<canonical command_line>` (content-addressed) |
 | `cryptographic-key` | `cryptographic-key:<value>` |
 | `location` (country) | `location:country:<iso2>` |
 | `location` (city) | `location:city:<iso2>:<city>` |
@@ -552,7 +552,10 @@ Sighting. Multiple alerts on the same flow each appear independently.
 
 **Relationships:**
 - `Indicator` → `indicates` → `AttackPattern` (from metadata, or generic "network-attack" if none)
-- `Domain-Name` → `resolves-to` → `IPv4-Addr` (if SNI matches IP)
+- `Domain-Name` → `resolves-to` → `IPv4-Addr` — the captured DESTINATION
+  address only. NEVER the attacker's source address: they sent us a name, and
+  separately we saw where the packet came from, and nothing ties the two
+  together. If no destination address was captured, emit no edge.
 - `IPv4-Addr` → `located-at` → `Location`
 
 ### 5.3 Dionaea (`type:"Dionaea"`)
