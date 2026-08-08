@@ -315,8 +315,15 @@ class BaseParser:
             dt = ts
         else:
             try:
-                # ES typically writes ISO 8601 with `Z` suffix
-                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                # ES typically writes ISO 8601 with a `Z` suffix. RFC 3339
+                # says that designator is case-INSENSITIVE, and a lowercase
+                # `z` is not something `fromisoformat` accepts, so matching
+                # only the uppercase form dropped those docs entirely — a
+                # silent skip logged at DEBUG, not an error.
+                raw = str(ts)
+                if raw.endswith(("Z", "z")):
+                    raw = raw[:-1] + "+00:00"
+                dt = datetime.fromisoformat(raw)
             except (TypeError, ValueError) as e:
                 logger.debug(f"unparseable @timestamp {ts!r}: {e}")
                 return None

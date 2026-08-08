@@ -2466,9 +2466,15 @@ class STIXBuilder:
             # abort the build mid-bundle.
             f_dt = self._as_dt(first.isoformat())
             l_dt = self._as_dt(last.isoformat()) if last is not None else None
-            obj["start_time"] = first.isoformat()
+            # EMIT the normalised value, not the raw one. Guarding only the
+            # comparison and then publishing `first.isoformat()` would let a
+            # hand-built naive session put "2026-08-07T09:00:00" -- no
+            # timezone designator, not a legal STIX 2.1 timestamp -- on the
+            # edge, and would put a +02:00 spelling next to a Z spelling for
+            # consumers that order these as strings.
+            obj["start_time"] = (f_dt or first).isoformat()
             if f_dt is not None and l_dt is not None and l_dt >= f_dt:
-                obj["stop_time"] = last.isoformat()
+                obj["stop_time"] = l_dt.isoformat()
         else:
             # Counted, never silent. A rising number here means a producer is
             # emitting edges outside any session context and the graph is
