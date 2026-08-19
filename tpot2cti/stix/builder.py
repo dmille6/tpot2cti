@@ -65,6 +65,7 @@ from tpot2cti.stix_ids import (
     generate_sensor_id,
     generate_session_note_id,
     generate_sighting_id,
+    sighting_day_bucket,
     generate_url_id,
     generate_vulnerability_id,
     sensor_infra_name,
@@ -903,6 +904,20 @@ class STIXBuilder:
         # count is a tally of observations, so it ADDS. Widening it like a
         # window would silently pick max() and lose every other session.
         kept["count"] = (kept.get("count") or 0) + (dup.get("count") or 0)
+        # The description is a per-session summary ("12 probes on port 445",
+        # an unattributed-payload blurb, a Honeytrap payload snippet). Keeping
+        # the FIRST one and quietly attaching it to an aggregate of several
+        # sessions states something about the whole that was only true of one
+        # part. When they disagree, say what the object actually is instead.
+        k_desc, d_desc = kept.get("description"), dup.get("description")
+        if d_desc and k_desc and d_desc != k_desc:
+            kept["description"] = (
+                f"Aggregate of multiple sessions sighting this entity at this "
+                f"sensor on {str(kept.get('first_seen'))[:10]}; per-session "
+                f"detail is on the session Notes."
+            )
+        elif d_desc and not k_desc:
+            kept["description"] = d_desc
         first = self._as_dt(dup.get("first_seen"))
         last = self._as_dt(dup.get("last_seen"))
         k_first = self._as_dt(kept.get("first_seen"))
@@ -2534,7 +2549,6 @@ class STIXBuilder:
         *,
         count: int = 1,
         description: Optional[str] = None,
-        id_discriminator: str = "",
     ) -> Optional[dict]:
         """Sighting SDO — per V1_SPEC §4 'sighting target=Indicator,
         where=sensor Identity'.
@@ -2545,9 +2559,10 @@ class STIXBuilder:
         We exploit that to emit *two* Sightings per session (see
         :meth:`build_dual_sighting`): one on the IP Indicator and one
         directly on the IPv4-Addr observable, so OpenCTI's "Sightings"
-        tab populates on both pages.  The optional ``id_discriminator``
-        threads through to :func:`generate_sighting_id` so the two
-        Sightings get distinct deterministic IDs.
+        tab populates on both pages.  Those two get distinct ids for free:
+        the id is derived from ``target_ref`` among other things, and the two
+        targets differ.  (An ``id_discriminator`` argument used to exist for
+        this, because the old seed omitted the target and the pair collided.)
 
         Per LESSONS §7.1: putting per-session activity summaries
         in the Sighting `description` is the preferred place for
@@ -2560,18 +2575,19 @@ class STIXBuilder:
         if not (target_ref and sensor_hostname):
             return None
         sensor_id = generate_sensor_id(sensor_hostname)
+        bucket_first, bucket_last = sighting_day_bucket(session.first_seen)
         obj = {
             "type": "sighting",
-            # Seeded from WHAT was sighted and WHERE -- not the session. A
-            # Sighting is a rolling aggregate (count / first_seen / last_seen)
-            # of one entity at one sensor; minting a new id per session made
-            # OpenCTI file each as an alias until the object reached 1.7 MB.
-            # Duplicates within a bundle are merged in _dedup, not dropped.
-            "id": generate_sighting_id(target_ref, sensor_id, id_discriminator),
+            # A DAILY AGGREGATE of one entity at one sensor, not one object per
+            # session. The window is the UTC day, and the id comes from pycti
+            # so it EQUALS the id OpenCTI derives from that same window --
+            # which is what stops alias arrays growing at all. Duplicates in a
+            # bundle are merged in _dedup, not dropped.
+            "id": generate_sighting_id(target_ref, sensor_id, bucket_first, bucket_last),
             "sighting_of_ref": target_ref,
             "where_sighted_refs": [sensor_id],
-            "first_seen": session.first_seen.isoformat(),
-            "last_seen": session.last_seen.isoformat(),
+            "first_seen": bucket_first,
+            "last_seen": bucket_last,
             "count": count,
         }
         if description:
@@ -2622,7 +2638,6 @@ class STIXBuilder:
             obs_sighting = self.build_sighting(
                 ipv4_id, sensor_hostname, session,
                 count=count, description=description,
-                id_discriminator="ipv4",
             )
             if obs_sighting:
                 out.append(obs_sighting)
@@ -3679,7 +3694,6 @@ class STIXBuilder:
                         f"endpoint, observed by {first.event_type}. No source "
                         f"address: see the attached Note."
                     ),
-                    id_discriminator="unattributed",
                 ):
                     out.append(sighting)
 

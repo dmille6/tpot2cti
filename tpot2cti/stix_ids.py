@@ -43,6 +43,7 @@ Why this exists (read this before changing anything!)
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import ipaddress
 import re
@@ -363,40 +364,66 @@ def generate_campaign_id(artifact_key: str) -> str:
     return sdo_id("campaign", "campaign", artifact_key)
 
 
-def generate_sighting_id(
-    target_ref: str, sensor_id: str, discriminator: str = "",
-) -> str:
-    """Sighting SRO id. Seed: ``sighting:<target_ref>:<sensor_id>[:<disc>]``.
+def sighting_day_bucket(when: "datetime.datetime") -> tuple[str, str]:
+    """The UTC-day aggregation window a Sighting is filed under.
 
-    CONTENT-ADDRESSED on what the Sighting actually asserts: *this entity was
-    seen at this sensor*. That is also what OpenCTI derives its own
-    ``standard_id`` from, so our id and its id agree and stop multiplying.
+    Returns (first_seen, last_seen) as ISO strings spanning the whole day.
 
-    The old signature was ``(sensor, session_id)`` — a fresh id for every
-    session, for a fact that is not per-session. OpenCTI filed each one as an
-    alias on the same underlying Sighting, so ``stix_ids`` grew without bound.
-    Measured on the live platform 2026-08-19: a single Sighting event in the
-    Redis stream weighed **1,736,299 bytes**, nearly all of it that alias
-    array. Because every subsequent update republishes the whole object, the
-    stream reached 53 GB at only 100,000 entries, filled a 490 GB disk, and
-    tripped Elasticsearch's flood-stage watermark — three days of dead
-    ingestion on 2026-08-08, and again on 2026-08-19.
+    This is an AGGREGATION BUCKET, not an observation interval. We saw the
+    entity at some instant inside the day; the Sighting says "on this day",
+    and `count` carries how many times. The bucket is deliberately a true
+    superset of what was observed rather than a precise instant we would be
+    inventing.
 
-    This is the same defect, and the same fix, as ``generate_process_id``
-    (PR #43). It is gone rather than deprecated: a session-scoped Sighting id
-    is never the right call.
-
-    ``discriminator`` still distinguishes the dual-sighting pair (one Sighting
-    on the Indicator, one on the observable) — those are two genuinely
-    different assertions about two different targets.
-
-    ID-FAMILY BREAK: existing Sighting ids are not re-derived. The OBJECTS
-    survive, because OpenCTI had already merged them by content; only the
-    stale alias arrays are orphaned.
+    It has to be a fixed window, not the real one, because OpenCTI derives a
+    Sighting's identity FROM first_seen/last_seen (see generate_sighting_id).
+    A window that moves with each observation moves the identity with it,
+    which is the whole defect being fixed.
     """
-    if discriminator:
-        return sdo_id("sighting", "sighting", target_ref, sensor_id, discriminator)
-    return sdo_id("sighting", "sighting", target_ref, sensor_id)
+    day = when.astimezone(datetime.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    end = day + datetime.timedelta(days=1) - datetime.timedelta(microseconds=1)
+    return day.isoformat(), end.isoformat()
+
+
+def generate_sighting_id(
+    target_ref: str, sensor_id: str, first_seen: str, last_seen: str,
+) -> str:
+    """Sighting SRO id — delegated to pycti so it EQUALS OpenCTI's own.
+
+    Not computed here, on purpose, and the only helper in this module that
+    does not use `sdo_id`. OpenCTI derives a Sighting's `standard_id` from
+    (sighting_of_ref, where_sighted_refs, first_seen, last_seen). Any id we
+    invent that disagrees gets filed as an ALIAS on the object OpenCTI
+    computes, and those aliases never expire.
+
+    The old seed was (sensor, session_id). Where many low-volume sessions
+    shared a window — `first_seen == last_seen` on the same second — OpenCTI
+    computed ONE id while we minted one per session, so every one of ours
+    became an alias on that single object. Measured live 2026-08-19: one
+    Sighting event in the Redis stream weighed 1,736,299 bytes, almost all of
+    it that array. Because every update republishes the whole object, the
+    stream hit 53 GB at 100,000 entries, filled a 490 GB disk and tripped
+    Elasticsearch's flood-stage watermark — three days of dead ingestion on
+    08-08, and again on 08-19.
+
+    Content-addressing on (target, sensor) was tried first and is WRONG: it
+    inverts the failure, leaving our id stable while OpenCTI's still moves
+    with the window, so one alias ends up claimed by many objects. Callers
+    must pass a BUCKETED window (see sighting_day_bucket) so both ids are
+    stable; matching pycti then makes the alias count zero rather than small.
+
+    There is no `discriminator` any more. It existed because the old seed
+    omitted the target, so the dual-sighting pair collided; the target is in
+    the seed now and tells them apart on its own.
+
+    ID-FAMILY BREAK: existing Sighting ids are not re-derived.
+    """
+    from pycti import StixSightingRelationship
+    return StixSightingRelationship.generate_id(
+        target_ref, [sensor_id], first_seen, last_seen,
+    )
 
 
 def generate_relationship_id(src_id: str, dst_id: str, rel_type: str) -> str:
