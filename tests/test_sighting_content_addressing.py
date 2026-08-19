@@ -115,11 +115,42 @@ def test_the_window_is_the_utc_day_not_the_session(cfg):
     assert o["last_seen"].startswith("2026-08-19T23:59:59"), o["last_seen"]
 
 
-def test_the_bucket_is_a_superset_of_what_was_observed(cfg):
-    """A bucket that did not contain the observation would be a false claim."""
+def test_the_bucket_contains_the_observation_it_is_filed_under(cfg):
+    """A bucket not containing its own observation would be a false claim."""
     obs = DAY.replace(hour=14, minute=3, second=27)
     first, last = sighting_day_bucket(obs)
     assert datetime.fromisoformat(first) <= obs <= datetime.fromisoformat(last)
+
+
+def test_a_session_spanning_midnight_is_credited_to_the_day_it_started(cfg):
+    """Pinned deliberately, because it is a real limitation, not an accident.
+
+    A session running 23:59Z to 00:01Z is filed entirely under its START day.
+    The Sighting still says something TRUE — this entity was seen at this
+    sensor on that day — but the minute after midnight is credited to the
+    wrong bucket, so a day boundary can under-count by at most one session.
+
+    The alternative, splitting one session across two Sightings, has to divide
+    a count that is not divisible: we know the session produced N events, not
+    which side of midnight each fell on. Inventing a split would assert
+    something we did not observe, which is the defect this whole change is
+    about. An honest small undercount beats a fabricated apportionment.
+
+    Found by codex on review; the earlier 'superset' test only checked a
+    single instant and would not have caught it.
+    """
+    from tpot2cti.stix.builder import STIXBuilder
+    from tpot2cti.config import load_config
+    spanning = _sess(
+        at=datetime(2026, 8, 19, 23, 59, tzinfo=timezone.utc),
+        last=datetime(2026, 8, 20, 0, 1, tzinfo=timezone.utc),
+    )
+    o = STIXBuilder(cfg).build_sighting(TARGET, "sensor01", spanning)
+    assert o["first_seen"].startswith("2026-08-19T00:00:00")
+    assert o["last_seen"].startswith("2026-08-19T23:59:59"), (
+        "the window must stay inside the start day — extending it to cover "
+        "the session would make the id depend on session content again"
+    )
 
 
 def test_a_non_utc_timestamp_buckets_to_its_utc_day(cfg):
