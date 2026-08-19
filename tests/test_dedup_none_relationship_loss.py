@@ -504,21 +504,34 @@ def test_a_second_attacker_planting_the_same_ssh_key_keeps_its_edge(builder):
     )
 
 
-def test_a_second_session_from_one_ip_keeps_its_sighting(builder):
+def test_a_second_session_from_one_ip_is_counted_in_its_sighting(builder):
     """One attacker, two sessions in a bundle (different parsers see them).
 
-    Each Sighting carries its own count, sensor and window, so dropping the
-    second understates observed volume by construction.
+    This test asserted, until 2026-08-19, that the second session emitted its
+    OWN Sighting object. That was the right INTENT with the wrong mechanism,
+    and the mechanism was itself the bug: Sighting ids were session-scoped, so
+    OpenCTI merged them all into one object and kept every discarded id in an
+    alias array that reached 1.7 MB. Sighting ids are content-addressed now,
+    so the second session correctly produces no new object.
+
+    What must not change is the intent: the second observation has to SHOW UP.
+    A Sighting is an aggregate, so it shows up as count, not as another node.
     """
     a = builder.build_cowrie_session(_session("Cowrie", ip=IP_A))
     b = builder.build_cowrie_session(_session("Cowrie", ip=IP_A, session_id="s2"))
     ind_id = attacker_ip_indicator_id(IP_A)
-    sightings = [o for o in b if o.get("type") == "sighting"
-                 and o.get("sighting_of_ref") == ind_id]
-    assert [o for o in a if o.get("type") == "sighting"], "guard: first has one"
-    assert sightings, (
-        "second session from the same IP produced no Sighting on its "
-        "Indicator — observed counts are understated"
+
+    kept = [o for o in a if o.get("type") == "sighting"
+            and o.get("sighting_of_ref") == ind_id]
+    assert kept, "guard: the first session must emit the Sighting"
+    assert not [o for o in b if o.get("type") == "sighting"
+                and o.get("sighting_of_ref") == ind_id], (
+        "the second session emitted a SECOND Sighting object for the same "
+        "(entity, sensor) — that is the alias-array defect"
+    )
+    assert kept[0]["count"] >= 2, (
+        f"count is {kept[0]['count']}: the second session's observation was "
+        "dropped rather than merged — observed volume is understated"
     )
 
 

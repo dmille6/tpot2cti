@@ -39,7 +39,7 @@ CASES = [
     ("generate_attack_pattern_id",            ("T1110",)),
     ("generate_file_indicator_id",            ("a" * 64,)),
     ("generate_ip_indicator_id",              ("1.2.3.4",)),
-    ("generate_sighting_id",                  ("node1", "sess001")),
+    ("generate_sighting_id",                  ("indicator--abc", "identity--def")),
     ("generate_infrastructure_id",            ("node1",)),
     ("generate_malware_id",                   ("mirai",)),
     ("generate_vulnerability_id",             ("CVE-2021-44228",)),
@@ -78,8 +78,8 @@ def test_sighting_discriminator_yields_distinct_id():
 
     Guards the dual-sight Sightings pattern from commit 8887bdb.
     """
-    a = S.generate_sighting_id("node1", "sess001")
-    b = S.generate_sighting_id("node1", "sess001", "ipv4")
+    a = S.generate_sighting_id("indicator--abc", "identity--def")
+    b = S.generate_sighting_id("indicator--abc", "identity--def", "ipv4")
     assert a != b
 
 

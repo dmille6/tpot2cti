@@ -363,21 +363,40 @@ def generate_campaign_id(artifact_key: str) -> str:
     return sdo_id("campaign", "campaign", artifact_key)
 
 
-def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") -> str:
-    """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>[:<discriminator>]``.
+def generate_sighting_id(
+    target_ref: str, sensor_id: str, discriminator: str = "",
+) -> str:
+    """Sighting SRO id. Seed: ``sighting:<target_ref>:<sensor_id>[:<disc>]``.
 
-    The optional ``discriminator`` lets callers mint a second distinct
-    Sighting ID for the same (sensor, session) pair — used by the dual-
-    sighting pattern where one Sighting targets the IP Indicator (SDO)
-    and a second targets the IPv4-Addr observable (SCO) so OpenCTI's
-    "Sightings" tab populates on BOTH the Indicator page and the
-    Observable page.  Empty discriminator (the default) preserves the
-    pre-existing Indicator-side ID family so cross-cycle re-emission
-    updates the same Sighting count, not orphan a new one.
+    CONTENT-ADDRESSED on what the Sighting actually asserts: *this entity was
+    seen at this sensor*. That is also what OpenCTI derives its own
+    ``standard_id`` from, so our id and its id agree and stop multiplying.
+
+    The old signature was ``(sensor, session_id)`` — a fresh id for every
+    session, for a fact that is not per-session. OpenCTI filed each one as an
+    alias on the same underlying Sighting, so ``stix_ids`` grew without bound.
+    Measured on the live platform 2026-08-19: a single Sighting event in the
+    Redis stream weighed **1,736,299 bytes**, nearly all of it that alias
+    array. Because every subsequent update republishes the whole object, the
+    stream reached 53 GB at only 100,000 entries, filled a 490 GB disk, and
+    tripped Elasticsearch's flood-stage watermark — three days of dead
+    ingestion on 2026-08-08, and again on 2026-08-19.
+
+    This is the same defect, and the same fix, as ``generate_process_id``
+    (PR #43). It is gone rather than deprecated: a session-scoped Sighting id
+    is never the right call.
+
+    ``discriminator`` still distinguishes the dual-sighting pair (one Sighting
+    on the Indicator, one on the observable) — those are two genuinely
+    different assertions about two different targets.
+
+    ID-FAMILY BREAK: existing Sighting ids are not re-derived. The OBJECTS
+    survive, because OpenCTI had already merged them by content; only the
+    stale alias arrays are orphaned.
     """
     if discriminator:
-        return sdo_id("sighting", "sighting", sensor, session_id, discriminator)
-    return sdo_id("sighting", "sighting", sensor, session_id)
+        return sdo_id("sighting", "sighting", target_ref, sensor_id, discriminator)
+    return sdo_id("sighting", "sighting", target_ref, sensor_id)
 
 
 def generate_relationship_id(src_id: str, dst_id: str, rel_type: str) -> str:

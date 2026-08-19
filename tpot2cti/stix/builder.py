@@ -836,6 +836,10 @@ class STIXBuilder:
         #: later observation of the same edge can widen its window rather
         #: than be dropped. See _widen_relationship_window.
         self._timed_relationships: dict[str, dict] = {}
+        #: id -> the Sighting dict kept in this bundle, so a later sighting of
+        #: the same entity at the same sensor adds its count and widens the
+        #: window instead of being dropped. See _merge_sighting.
+        self._emitted_sightings: dict[str, dict] = {}
 
     # ──────────────────────────────────────────────────────────────────
     # Object stamping (created_by_ref + markings + confidence + timestamps)
@@ -866,14 +870,47 @@ class STIXBuilder:
         oid = obj.get("id")
         if not oid:
             return obj  # let the publisher's validator complain later
+        otype = obj.get("type")
         if oid in self._emitted_ids:
-            if obj.get("type") == "relationship":
+            if otype == "relationship":
                 self._widen_relationship_window(oid, obj)
+            elif otype == "sighting":
+                self._merge_sighting(oid, obj)
             return None
         self._emitted_ids.add(oid)
-        if obj.get("type") == "relationship" and "start_time" in obj:
+        if otype == "relationship" and "start_time" in obj:
             self._timed_relationships[oid] = obj
+        elif otype == "sighting":
+            self._emitted_sightings[oid] = obj
         return obj
+
+    def _merge_sighting(self, oid: str, dup: dict) -> None:
+        """Fold a duplicate Sighting into the one we kept.
+
+        Content-addressing the Sighting id makes this the COMMON path, not a
+        corner: several sessions in one bundle routinely sight the same entity
+        at the same sensor, and that is precisely what a Sighting aggregates.
+        Dropping the duplicate outright -- which is what `return None` alone
+        does -- would throw away its count and its half of the window, so the
+        platform would UNDER-report exactly the volume it exists to report.
+
+        Same trap as the relationship windows, and the third time this repo
+        has hit "_dedup returned None" being read as "nothing to do here".
+        """
+        kept = self._emitted_sightings.get(oid)
+        if kept is None:
+            return
+        # count is a tally of observations, so it ADDS. Widening it like a
+        # window would silently pick max() and lose every other session.
+        kept["count"] = (kept.get("count") or 0) + (dup.get("count") or 0)
+        first = self._as_dt(dup.get("first_seen"))
+        last = self._as_dt(dup.get("last_seen"))
+        k_first = self._as_dt(kept.get("first_seen"))
+        k_last = self._as_dt(kept.get("last_seen"))
+        if first is not None and (k_first is None or first < k_first):
+            kept["first_seen"] = first.isoformat()
+        if last is not None and (k_last is None or last > k_last):
+            kept["last_seen"] = last.isoformat()
 
     @staticmethod
     def _as_dt(value: Optional[str]):
@@ -2525,9 +2562,12 @@ class STIXBuilder:
         sensor_id = generate_sensor_id(sensor_hostname)
         obj = {
             "type": "sighting",
-            "id": generate_sighting_id(
-                sensor_hostname, session.session_id, id_discriminator,
-            ),
+            # Seeded from WHAT was sighted and WHERE -- not the session. A
+            # Sighting is a rolling aggregate (count / first_seen / last_seen)
+            # of one entity at one sensor; minting a new id per session made
+            # OpenCTI file each as an alias until the object reached 1.7 MB.
+            # Duplicates within a bundle are merged in _dedup, not dropped.
+            "id": generate_sighting_id(target_ref, sensor_id, id_discriminator),
             "sighting_of_ref": target_ref,
             "where_sighted_refs": [sensor_id],
             "first_seen": session.first_seen.isoformat(),
