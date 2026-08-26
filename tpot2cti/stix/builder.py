@@ -518,6 +518,7 @@ _PARSER_LABEL_VOCAB: dict[str, tuple[str, str]] = {
     "invalidJSONResponse":    ("galah", "web-llm"),
     "successfulResponse":     ("galah", "web-llm"),
     "cacheHit":               ("galah", "web-llm"),
+    "RDPHoneypot":   ("rdphoneypot",  "remote-desktop"),
     "__fallback__":  ("fallback",      "unknown-type"),
 }
 
@@ -576,6 +577,7 @@ _INDICATOR_NAME_TEMPLATES: dict[str, str] = {
     "invalidJSONResponse":    "Galah LLM Web Probe - {ip} ({n} probe{s})",
     "successfulResponse":     "Galah LLM Web Probe - {ip} ({n} probe{s})",
     "cacheHit":               "Galah LLM Web Probe - {ip} ({n} probe{s})",
+    "RDPHoneypot":   "RDP NTLM Credential Capture - {ip} ({n} session{s})",
     "__fallback__":  "Honeypot Activity (unknown type) - {ip} ({n} event{s})",
 }
 
@@ -3962,6 +3964,19 @@ class STIXBuilder:
 
     def build_heralding_session(self, session: AttackSession) -> list[dict]:
         return self._build_protocol_session(session, "Credential brute-force attempt")
+
+    def build_rdphoneypot_session(self, session: AttackSession) -> list[dict]:
+        """RDP/3389 NLA session — NetNTLMv2 challenge-response capture.
+
+        Same protocol-session shape as Heralding: the substance is the
+        credential attempt. The NTLM material itself stays in
+        session.meta["ntlm_captures"] and is deliberately NOT rendered
+        into the description — ~20% of those blobs carry our own sensor
+        address in their SPN (AV pair 9), in UTF-16LE inside hex, where
+        no redaction pass would find it. See parsers/rdphoneypot.py.
+        """
+        return self._build_protocol_session(
+            session, "RDP NLA credential capture (NetNTLMv2)")
 
     def build_mailoney_session(self, session: AttackSession) -> list[dict]:
         return self._build_protocol_session(session, "SMTP abuse / relay probe")

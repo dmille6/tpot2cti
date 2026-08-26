@@ -120,6 +120,7 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Medpot":       "build_medpot_session",
     "Router":       "build_router_session",
     "Heralding":    "build_heralding_session",
+    "RDPHoneypot":  "build_rdphoneypot_session",
     "Mailoney":     "build_mailoney_session",
     "Beelzebub":    "build_beelzebub_session",
     "__fallback__": "build_fallback_event",
