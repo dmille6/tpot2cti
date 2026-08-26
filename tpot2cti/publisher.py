@@ -42,6 +42,7 @@ is better than no publish — next cycle re-emits.
 
 from __future__ import annotations
 
+import threading
 import logging
 import time
 import uuid
@@ -371,6 +372,33 @@ class Publisher:
                 "id": bundle_id,
                 "objects": objs,
             }
+            # Announce BEFORE sending. A pass that logs only on completion is
+            # indistinguishable from a hang for its entire duration — which is
+            # how a 7-day stall and a 3.4-hour slow pass both read as dead.
+            logger.info(
+                f"[{cycle_id}] Pass '{name}' starting: {len(objs)} object(s) "
+                f"— import_bundle_from_json makes sequential per-object calls, "
+                f"so this can legitimately run for a long time"
+            )
+            _hb_stop = threading.Event()
+            
+            def _heartbeat(_name=name, _cid=cycle_id, _n=len(objs)):
+                waited = 0
+                while not _hb_stop.wait(30):
+                    waited += 30
+                    logger.info(
+                        f"[{_cid}] Pass '{_name}' still sending "
+                        f"({_n} object(s), {waited}s elapsed)"
+                    )
+                    if self.state is not None:
+                        try:
+                            self.state.heartbeat()
+                        except Exception:  # noqa: BLE001
+                            pass
+            
+            _hb = threading.Thread(target=_heartbeat, daemon=True,
+                                   name=f"pass-hb-{name}")
+            _hb.start()
             try:
                 stats = self.client.send_bundle(envelope)
                 logger.info(
@@ -387,6 +415,8 @@ class Publisher:
                 )
                 logger.warning(f"[{cycle_id}] {msg}")
                 errors.append(msg)
+            finally:
+                _hb_stop.set()
 
             # Liveness heartbeat — each pass can take minutes at hive
             # scale; bump after every one (success OR partial failure) so
