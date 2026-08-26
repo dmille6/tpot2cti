@@ -39,7 +39,7 @@ CASES = [
     ("generate_attack_pattern_id",            ("T1110",)),
     ("generate_file_indicator_id",            ("a" * 64,)),
     ("generate_ip_indicator_id",              ("1.2.3.4",)),
-    ("generate_sighting_id",                  ("node1", "sess001")),
+    ("generate_sighting_id",                  ("indicator--abc", "identity--def", "2026-08-19T00:00:00+00:00", "2026-08-19T23:59:59.999999+00:00")),
     ("generate_infrastructure_id",            ("node1",)),
     ("generate_malware_id",                   ("mirai",)),
     ("generate_vulnerability_id",             ("CVE-2021-44228",)),
@@ -73,15 +73,14 @@ def test_marking_definition_rejects_unknown_tlp():
         S.generate_marking_definition_id("pink")
 
 
-def test_sighting_discriminator_yields_distinct_id():
-    """Same (sensor, session) + a discriminator → a distinct Sighting id.
-
-    Guards the dual-sight Sightings pattern from commit 8887bdb.
-    """
-    a = S.generate_sighting_id("node1", "sess001")
-    b = S.generate_sighting_id("node1", "sess001", "ipv4")
+def test_sighting_id_is_distinguished_by_target_not_a_discriminator(cfg=None):
+    """The dual-sighting pair used to need an explicit discriminator because
+    the old seed omitted the target. The target is in the seed now, so the
+    Indicator-side and observable-side Sightings differ on their own."""
+    f, l = "2026-08-19T00:00:00+00:00", "2026-08-19T23:59:59.999999+00:00"
+    a = S.generate_sighting_id("indicator--abc", "identity--def", f, l)
+    b = S.generate_sighting_id("ipv4-addr--abc", "identity--def", f, l)
     assert a != b
-
 
 def test_sensor_infra_name_prefers_name_over_alias():
     """The LESSONS §3 invariant: every parser hashes the SAME string."""

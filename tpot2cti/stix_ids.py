@@ -43,6 +43,7 @@ Why this exists (read this before changing anything!)
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import ipaddress
 import re
@@ -363,21 +364,66 @@ def generate_campaign_id(artifact_key: str) -> str:
     return sdo_id("campaign", "campaign", artifact_key)
 
 
-def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") -> str:
-    """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>[:<discriminator>]``.
+def sighting_day_bucket(when: "datetime.datetime") -> tuple[str, str]:
+    """The UTC-day aggregation window a Sighting is filed under.
 
-    The optional ``discriminator`` lets callers mint a second distinct
-    Sighting ID for the same (sensor, session) pair — used by the dual-
-    sighting pattern where one Sighting targets the IP Indicator (SDO)
-    and a second targets the IPv4-Addr observable (SCO) so OpenCTI's
-    "Sightings" tab populates on BOTH the Indicator page and the
-    Observable page.  Empty discriminator (the default) preserves the
-    pre-existing Indicator-side ID family so cross-cycle re-emission
-    updates the same Sighting count, not orphan a new one.
+    Returns (first_seen, last_seen) as ISO strings spanning the whole day.
+
+    This is an AGGREGATION BUCKET, not an observation interval. We saw the
+    entity at some instant inside the day; the Sighting says "on this day",
+    and `count` carries how many times. The bucket is deliberately a true
+    superset of what was observed rather than a precise instant we would be
+    inventing.
+
+    It has to be a fixed window, not the real one, because OpenCTI derives a
+    Sighting's identity FROM first_seen/last_seen (see generate_sighting_id).
+    A window that moves with each observation moves the identity with it,
+    which is the whole defect being fixed.
     """
-    if discriminator:
-        return sdo_id("sighting", "sighting", sensor, session_id, discriminator)
-    return sdo_id("sighting", "sighting", sensor, session_id)
+    day = when.astimezone(datetime.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    end = day + datetime.timedelta(days=1) - datetime.timedelta(microseconds=1)
+    return day.isoformat(), end.isoformat()
+
+
+def generate_sighting_id(
+    target_ref: str, sensor_id: str, first_seen: str, last_seen: str,
+) -> str:
+    """Sighting SRO id — delegated to pycti so it EQUALS OpenCTI's own.
+
+    Not computed here, on purpose, and the only helper in this module that
+    does not use `sdo_id`. OpenCTI derives a Sighting's `standard_id` from
+    (sighting_of_ref, where_sighted_refs, first_seen, last_seen). Any id we
+    invent that disagrees gets filed as an ALIAS on the object OpenCTI
+    computes, and those aliases never expire.
+
+    The old seed was (sensor, session_id). Where many low-volume sessions
+    shared a window — `first_seen == last_seen` on the same second — OpenCTI
+    computed ONE id while we minted one per session, so every one of ours
+    became an alias on that single object. Measured live 2026-08-19: one
+    Sighting event in the Redis stream weighed 1,736,299 bytes, almost all of
+    it that array. Because every update republishes the whole object, the
+    stream hit 53 GB at 100,000 entries, filled a 490 GB disk and tripped
+    Elasticsearch's flood-stage watermark — three days of dead ingestion on
+    08-08, and again on 08-19.
+
+    Content-addressing on (target, sensor) was tried first and is WRONG: it
+    inverts the failure, leaving our id stable while OpenCTI's still moves
+    with the window, so one alias ends up claimed by many objects. Callers
+    must pass a BUCKETED window (see sighting_day_bucket) so both ids are
+    stable; matching pycti then makes the alias count zero rather than small.
+
+    There is no `discriminator` any more. It existed because the old seed
+    omitted the target, so the dual-sighting pair collided; the target is in
+    the seed now and tells them apart on its own.
+
+    ID-FAMILY BREAK: existing Sighting ids are not re-derived.
+    """
+    from pycti import StixSightingRelationship
+    return StixSightingRelationship.generate_id(
+        target_ref, [sensor_id], first_seen, last_seen,
+    )
 
 
 def generate_relationship_id(src_id: str, dst_id: str, rel_type: str) -> str:
