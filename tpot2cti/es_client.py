@@ -467,22 +467,6 @@ class TpotESClient:
 
 
 # ---------------------------------------------------------------------- #
-# smoke test
-# ---------------------------------------------------------------------- #
-
-if __name__ == "__main__":
-    # Minimal smoke test: build a client with defaults, ping, print.
-    # Real usage is from the cycle loop; this is just enough to verify
-    # the module imports cleanly and the tunnel is up.
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    client = TpotESClient()
-    reachable = client.ping()
-    print(f"T-Pot ES reachable: {reachable}")
-    client.close()
-
 
     def daily_event_counts(self, day_start, upper, index_pattern="logstash-*",
                            ignore_types=None, page=2000, max_pages=40):
@@ -549,3 +533,18 @@ if __name__ == "__main__":
                 "collected; the remainder fall back to per-cycle counts",
                 max_pages, len(out))
         return out
+# smoke test
+# ---------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    # Minimal smoke test: build a client with defaults, ping, print.
+    # Real usage is from the cycle loop; this is just enough to verify
+    # the module imports cleanly and the tunnel is up.
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    client = TpotESClient()
+    reachable = client.ping()
+    print(f"T-Pot ES reachable: {reachable}")
+    client.close()

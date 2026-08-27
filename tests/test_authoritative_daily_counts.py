@@ -95,3 +95,33 @@ def test_the_upper_bound_is_the_window_not_the_clock():
         "clock would count events this cycle never read"
     )
     assert "now" not in call.split(")")[0]
+
+
+def test_the_es_method_is_actually_a_method_on_the_client():
+    """The producer, not just the consumer.
+
+    Every other test in this file sets `builder.daily_event_counts` by hand,
+    so they all passed while the ES method that POPULATES it was not a method
+    at all: it had been appended to the end of es_client.py and landed inside
+    `if __name__ == "__main__":` as a nested function. Valid syntax, imported
+    cleanly, and silently absent from the class.
+
+    Production degraded rather than broke -- the call is wrapped and logged
+    "daily count aggregation failed (TpotESClient object has no attribute
+    daily_event_counts)", then fell back to per-cycle counts. Which is the
+    designed behaviour, and also exactly why nothing failed loudly enough to
+    notice. A test that only exercises the consumer cannot see this.
+    """
+    from tpot2cti.es_client import TpotESClient
+
+    assert hasattr(TpotESClient, "daily_event_counts"), (
+        "daily_event_counts is not a method on TpotESClient — check it did "
+        "not land inside the __main__ smoke-test block"
+    )
+    assert callable(TpotESClient.daily_event_counts)
+
+    import inspect
+    params = inspect.signature(TpotESClient.daily_event_counts).parameters
+    assert "self" in params, "must be an instance method, not a bare function"
+    for expected in ("day_start", "upper", "ignore_types"):
+        assert expected in params, f"missing parameter {expected}"
