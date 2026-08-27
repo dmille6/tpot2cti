@@ -118,6 +118,26 @@ if _assigned != KNOWN_STIX_TYPES:
         "Fix FOUNDATION_TYPES / ENTITY_TYPES / RELATIONSHIP_TYPES or "
         "KNOWN_STIX_TYPES so they agree."
     )
+def _sighting_dt(value):
+    """Parse a STIX timestamp to an aware UTC datetime, or None.
+
+    Mirrors stix/builder._as_dt. Sighting windows are merged by comparing
+    these, not the raw strings -- lexicographic order equals chronological
+    order only when every value carries the same UTC offset, which nothing
+    guarantees once an aggregate has been merged from several sources.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +572,32 @@ class Publisher:
                     xref_merged.append(xref)
             if xref_merged:
                 base["external_references"] = xref_merged
+
+            # --- sighting aggregation ------------------------------------
+            # Sightings are day-bucketed and aggregated in the BUILDER
+            # (stix/builder._merge_or_emit_sighting), which sums count over
+            # distinct sessions. This is the second line of defence, for
+            # duplicates arriving from separate builder instances (e.g. the
+            # several attacker_profile builds) in one publish.
+            #
+            # count takes MAX, deliberately NOT sum: the builder already
+            # summed, so two copies of one aggregate are the SAME
+            # observations counted twice, and summing them would invent
+            # activity. Max keeps the fuller aggregate without inflating.
+            if base.get("type") == "sighting":
+                counts = [v.get("count") for v in variants
+                          if isinstance(v.get("count"), int)]
+                if counts:
+                    base["count"] = max(counts)
+                # Compared as datetimes, never as strings: an offset-bearing
+                # timestamp sorts wrong lexicographically ("09:00+02:00" is
+                # EARLIER than "08:30+00:00" but sorts after it).
+                for key, pick in (("first_seen", min), ("last_seen", max)):
+                    stamps = [v.get(key) for v in variants if v.get(key)]
+                    parsed = [(_sighting_dt(s), s) for s in stamps]
+                    parsed = [p for p in parsed if p[0] is not None]
+                    if parsed:
+                        base[key] = pick(parsed, key=lambda p: p[0])[1]
 
             # --- confidence: max across variants -------------------------
             confidences = [

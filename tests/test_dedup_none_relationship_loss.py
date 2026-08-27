@@ -504,21 +504,35 @@ def test_a_second_attacker_planting_the_same_ssh_key_keeps_its_edge(builder):
     )
 
 
-def test_a_second_session_from_one_ip_keeps_its_sighting(builder):
+def test_a_second_session_from_one_ip_keeps_its_observed_volume(builder):
     """One attacker, two sessions in a bundle (different parsers see them).
 
-    Each Sighting carries its own count, sensor and window, so dropping the
-    second understates observed volume by construction.
+    The guarantee here is that the second session's observed volume is not
+    lost. It used to be spelled "the second session emits its own Sighting",
+    because ids were seeded on session_id.
+
+    Sightings are now day-bucketed (see tests/test_sighting_aggregation.py):
+    the second session deliberately emits NO new object and instead folds
+    into the first, which is the whole point — one address on one sensor on
+    one day produced 21,628 objects per window under the old scheme. So the
+    assertion moved from "a second Sighting exists" to "the surviving
+    Sighting counts both sessions". Dropping the second outright would still
+    understate volume, and that is still what this test fails on.
     """
     a = builder.build_cowrie_session(_session("Cowrie", ip=IP_A))
     b = builder.build_cowrie_session(_session("Cowrie", ip=IP_A, session_id="s2"))
     ind_id = attacker_ip_indicator_id(IP_A)
-    sightings = [o for o in b if o.get("type") == "sighting"
-                 and o.get("sighting_of_ref") == ind_id]
-    assert [o for o in a if o.get("type") == "sighting"], "guard: first has one"
-    assert sightings, (
-        "second session from the same IP produced no Sighting on its "
-        "Indicator — observed counts are understated"
+
+    kept = [o for o in a if o.get("type") == "sighting"
+            and o.get("sighting_of_ref") == ind_id]
+    assert kept, "guard: the first session must actually emit a Sighting"
+    assert not [o for o in b if o.get("type") == "sighting"
+                and o.get("sighting_of_ref") == ind_id], (
+        "same IP, same sensor, same day must NOT mint a second Sighting"
+    )
+    assert kept[0]["count"] >= 2, (
+        f"the folded session's volume vanished — count is {kept[0]['count']}, "
+        "so the second session was dropped rather than aggregated"
     )
 
 

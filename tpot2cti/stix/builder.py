@@ -839,6 +839,18 @@ class STIXBuilder:
         #: than be dropped. See _widen_relationship_window.
         self._timed_relationships: dict[str, dict] = {}
 
+        #: id -> the sighting dict actually kept in this bundle. Sighting
+        #: ids are day-bucketed (see build_sighting), so many sessions
+        #: collide by design and the later ones must FOLD IN rather than
+        #: be dropped -- same reasoning as _timed_relationships above.
+        self._sightings: dict[str, dict] = {}
+        #: id -> session ids already counted, so count sums DISTINCT
+        #: sessions. Without this a builder that emits the same sighting
+        #: twice for one session would double its count.
+        self._sighting_sessions: dict[str, set] = {}
+        #: id -> distinct per-session description lines, bounded.
+        self._sighting_descriptions: dict[str, list] = {}
+
     # ──────────────────────────────────────────────────────────────────
     # Object stamping (created_by_ref + markings + confidence + timestamps)
     # ──────────────────────────────────────────────────────────────────
@@ -902,6 +914,77 @@ class STIXBuilder:
             return None
         return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
             else dt.astimezone(timezone.utc)
+
+    #: How many per-session description lines one aggregated Sighting
+    #: carries before it stops listing them individually.
+    _SIGHTING_DESC_MAX = 5
+
+    def _merge_or_emit_sighting(self, obj: dict, session) -> Optional[dict]:
+        """Emit a Sighting, or fold it into the same-day one already kept.
+
+        Sighting ids are day-bucketed, so every session from one address on
+        one sensor on one day lands on the SAME id. Left to _dedup that is a
+        silent data-loss bug rather than an aggregation: _dedup returns None
+        for a repeat id and only widens relationships, so the second and
+        every later session of the day would vanish -- count, window and
+        description with it. The published Sighting would then claim one
+        session's activity was the whole day's.
+
+        That is the same unearned-bound defect _widen_relationship_window
+        exists to prevent, so this is the same remedy: the kept object grows
+        to cover every observation.
+
+          * ``count``      sums across DISTINCT sessions
+          * ``first_seen`` earliest, ``last_seen`` latest -- compared as
+            datetimes via _as_dt, never as strings (see its docstring: an
+            offset-bearing timestamp sorts wrong lexicographically)
+          * ``description`` keeps up to _SIGHTING_DESC_MAX distinct
+            per-session lines, then a count of the remainder
+        """
+        oid = obj.get("id")
+        kept = self._sightings.get(oid) if oid else None
+
+        if kept is None:
+            stamped = self._dedup(self._stamp(obj))
+            if stamped is None or not oid:
+                return stamped
+            self._sightings[oid] = stamped
+            self._sighting_sessions[oid] = {getattr(session, "session_id", None)}
+            if stamped.get("description"):
+                self._sighting_descriptions[oid] = [stamped["description"]]
+            return stamped
+
+        # --- duplicate: fold this observation into the kept object ------
+        sid = getattr(session, "session_id", None)
+        seen = self._sighting_sessions.setdefault(oid, set())
+        if sid not in seen:
+            seen.add(sid)
+            if isinstance(kept.get("count"), int) and isinstance(obj.get("count"), int):
+                kept["count"] = kept["count"] + obj["count"]
+
+        # The window widens even for a re-emission of a session already
+        # counted -- a second call can carry a later last_seen, and the
+        # window describes observation, not sessions.
+        new_first, kept_first = self._as_dt(obj.get("first_seen")), self._as_dt(kept.get("first_seen"))
+        if new_first and (kept_first is None or new_first < kept_first):
+            kept["first_seen"] = obj["first_seen"]
+        new_last, kept_last = self._as_dt(obj.get("last_seen")), self._as_dt(kept.get("last_seen"))
+        if new_last and (kept_last is None or new_last > kept_last):
+            kept["last_seen"] = obj["last_seen"]
+
+        desc = obj.get("description")
+        if desc:
+            bucket = self._sighting_descriptions.setdefault(oid, [])
+            if desc not in bucket:
+                bucket.append(desc)
+            shown = bucket[: self._SIGHTING_DESC_MAX]
+            extra = len(bucket) - len(shown)
+            text = "\n".join(shown)
+            if extra:
+                text += f"\n(+{extra} further session(s) this day)"
+            kept["description"] = text
+
+        return None
 
     def _widen_relationship_window(self, oid: str, dup: dict) -> None:
         """Union the duplicate's observation window into the one we kept.
@@ -2527,8 +2610,22 @@ class STIXBuilder:
         sensor_id = generate_sensor_id(sensor_hostname)
         obj = {
             "type": "sighting",
+            # AGGREGATED per (sensor, target, UTC day) — NOT per session.
+            # Seeding on session_id minted one sighting per session (two, with
+            # the dual pattern): measured 21,628 sightings from 613 IPs in ONE
+            # 15-minute window — 80% of every object emitted, and why the
+            # relationships pass ran 13.7h without completing. Day-bucketing
+            # makes every session from one address on one sensor on one day
+            # collapse to a single id, which the publisher's existing id-dedup
+            # then merges (count summed, first/last seen spanned).
+            #
+            # v1 learned this the expensive way: a microsecond-resolution
+            # first_seen in its sighting seed caused an alias explosion and
+            # 758 GB of history. It day-buckets now; so do we.
             "id": generate_sighting_id(
-                sensor_hostname, session.session_id, id_discriminator,
+                sensor_hostname,
+                f"{target_ref}:{session.first_seen.strftime('%Y-%m-%d')}",
+                id_discriminator,
             ),
             "sighting_of_ref": target_ref,
             "where_sighted_refs": [sensor_id],
@@ -2538,7 +2635,7 @@ class STIXBuilder:
         }
         if description:
             obj["description"] = description
-        return self._dedup(self._stamp(obj))
+        return self._merge_or_emit_sighting(obj, session)
 
     def build_dual_sighting(
         self,
@@ -2563,10 +2660,10 @@ class STIXBuilder:
         we emit BOTH:
 
           1. Indicator-side Sighting — preserved ID family
-             (``sighting:<sensor>:<session>``).  This is the canonical
+             (``sighting:<sensor>:<target>:<day>``).  This is the canonical
              Sighting and is what cross-cycle preservation keys off.
           2. Observable-side Sighting — distinct ID family
-             (``sighting:<sensor>:<session>:ipv4``).  Same first/last
+             (``sighting:<sensor>:<target>:<day>:ipv4``).  Same first/last
              seen, same count, same description, same sensor identity.
 
         Callers pass the already-resolved ``indicator_id`` and
