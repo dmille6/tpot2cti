@@ -488,6 +488,60 @@ def run_cycle(
         # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
         benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
 
+    # --- fetch/parse progress heartbeat ---------------------------------
+    # This phase used to print nothing at all: one cycle was silent from
+    # 12:12 to 13:05 while RSS climbed 1.4 -> 13 GiB. A stall there looked
+    # exactly like normal work.
+    #
+    # It reports FORWARD PROGRESS, not elapsed time, and that distinction is
+    # the whole point. This project's recurring injury is a reassuring signal
+    # decoupled from real work -- a green timer that never ran a successful
+    # job, an ES zero read as "fine", every component self-reporting healthy
+    # while ~9,000 attackers fell between them. "still working, 1800s
+    # elapsed" is that same lie with a new coat of paint: it is emitted just
+    # as faithfully by a wedged socket as by a busy one.
+    #
+    # So each tick prints the DELTA since the previous tick, and a delta of
+    # zero is logged at WARNING, escalating to ERROR. A reader can tell
+    # "slow" from "stopped" without attaching a debugger.
+    _hb_progress = {"read": 0, "parsed": 0}
+    _hb_stop = threading.Event()
+
+    def _fetch_parse_heartbeat():
+        prev, stalled, waited = 0, 0, 0
+        while not _hb_stop.wait(30):
+            waited += 30
+            cur = _hb_progress["read"]
+            delta = cur - prev
+            prev = cur
+            if delta == 0:
+                stalled += 1
+                # 30s of nothing can be one slow ES page; 3 minutes of
+                # nothing is a different claim, so the level escalates
+                # rather than crying wolf on the first tick.
+                log = logger.error if stalled >= 6 else logger.warning
+                log(
+                    "[%s] fetch/parse NO PROGRESS for %ds "
+                    "(read=%d parsed=%d) -- slow ES page or a stall",
+                    cycle_id, stalled * 30, cur, _hb_progress["parsed"],
+                )
+            else:
+                stalled = 0
+                logger.info(
+                    "[%s] fetch/parse: read=%d parsed=%d (+%d in 30s, %.0f/s, "
+                    "%ds elapsed)",
+                    cycle_id, cur, _hb_progress["parsed"], delta, delta / 30.0,
+                    waited,
+                )
+            if state is not None:
+                try:
+                    state.heartbeat()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    _hb = threading.Thread(target=_fetch_parse_heartbeat, daemon=True,
+                           name="fetch-parse-hb")
+    _hb.start()
     try:
         for doc in es.stream_events(
             window_start, window_end,
@@ -497,6 +551,12 @@ def run_cycle(
             suricata_alert_only=suricata_alert_only,
         ):
             events_read += 1
+            if events_read % 1000 == 0:
+                # Sampled rather than per-doc: 2.2M dict writes per cycle
+                # would cost more than the signal is worth, and 1000 docs is
+                # far finer than the 30s tick.
+                _hb_progress["read"] = events_read
+                _hb_progress["parsed"] = events_parsed
             try:
                 event = dispatch(doc)
             except Exception as e:
@@ -597,6 +657,37 @@ def run_cycle(
             duration_seconds=time.monotonic() - started_monotonic,
         )
         raise
+    finally:
+        # Stop the progress heartbeat on EVERY exit path. A daemon
+        # thread left running would keep printing fetch/parse progress
+        # while the cycle is actually in its publish phase -- a
+        # liveness signal describing work that already finished is the
+        # precise failure this heartbeat was added to prevent.
+        _hb_stop.set()
+    # --- semantic invariant: was the progress on the RIGHT data? --------
+    # A forward-progress heartbeat proves the machine is moving. It cannot
+    # prove it is moving the right data, and that is exactly the failure
+    # this codebase keeps hitting: an ES query with a wrong field name
+    # returns a clean, fast, entirely wrong result set, and every counter
+    # above it climbs honestly the whole way.
+    #
+    # So the cycle asserts a RATIO it has no excuse to violate: reading
+    # hundreds of thousands of events and parsing almost none of them means
+    # the query matched a population the parsers do not recognise. Bounded
+    # loosely on purpose -- this is a tripwire for "the shape changed
+    # underneath us", not a quality metric, and a tight band here would
+    # just become the next thing everyone learns to ignore.
+    if events_read >= 10_000:
+        parsed_ratio = events_parsed / float(events_read)
+        if parsed_ratio < 0.01:
+            logger.error(
+                "[%s] SEMANTIC STALL: read %d events but parsed only %d "
+                "(%.3f%%). Throughput was fine, so nothing above this line "
+                "looked wrong -- suspect the query matched the wrong "
+                "population (field renamed, mapping changed, ignore_types "
+                "drifted) rather than a parser bug.",
+                cycle_id, events_read, events_parsed, parsed_ratio * 100.0,
+            )
 
     # Consolidated drop breakdown — every event read is accounted for as
     # exactly one of: parsed, unparsed, dispatch-error, self/internal, benign.
