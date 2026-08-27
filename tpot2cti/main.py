@@ -267,6 +267,24 @@ class _Shutdown:
 # Cycle window computation
 # ---------------------------------------------------------------------------
 
+def _doc_timestamp(doc):
+    """Parse a hive doc's `@timestamp` into an aware UTC datetime, or None.
+
+    Used only to decide where a volume-capped window STOPS, so a
+    unparseable value must return None rather than a guess: the caller
+    keeps reading instead of advancing the cursor somewhere it cannot
+    justify. Advancing on a guess is how 80M documents went unread.
+    """
+    raw = doc.get("@timestamp")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
 def _compute_window(
     state: CycleState, cfg: Config, now: datetime
 ) -> tuple[datetime, datetime]:
@@ -488,6 +506,29 @@ def run_cycle(
         # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
         benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
 
+    # --- volume cap ------------------------------------------------------
+    # The 24h time cap above does NOT bound memory, because density is not
+    # constant. A 16.3h window -- comfortably UNDER the cap -- was 2.24M
+    # events and 13 GiB RSS, because the whole window is materialised:
+    # parsed events, then sessions, then STIX objects, all live at once.
+    # The predecessor system hit this same wall and exhausted a 4 GB limit.
+    #
+    # Capping by EVENT COUNT bounds the thing that actually causes the
+    # memory. When the cap trips we stop and hand the cursor the timestamp
+    # of the event that tripped it. The ES range is half-open [start, end)
+    # so that timestamp is EXCLUDED from this window, and the next cycle
+    # re-covers it from `gte`. Nothing is skipped -- which matters more than
+    # it sounds: this cursor used to jump to the present instead of walking
+    # forward, and that left 80,260,536 documents permanently unread in the
+    # 2026-07-19 outage. Re-covering is free (ids are deterministic UUID5
+    # and the publisher keeps max(score) with label union, so replay
+    # converges); skipping is not recoverable.
+    #
+    # Never split a timestamp equivalence class by ADVANCING past it -- both
+    # frontier models, asked independently, named that as the one rule. We
+    # satisfy it by excluding the boundary rather than by draining it.
+    _max_events = cfg.cycle.max_events_per_cycle
+    _capped_end = None
     # --- fetch/parse progress heartbeat ---------------------------------
     # This phase used to print nothing at all: one cycle was silent from
     # 12:12 to 13:05 while RSS climbed 1.4 -> 13 GiB. A stall there looked
@@ -557,6 +598,37 @@ def run_cycle(
                 # far finer than the 30s tick.
                 _hb_progress["read"] = events_read
                 _hb_progress["parsed"] = events_parsed
+            if _max_events and events_read >= _max_events:
+                _ts = _doc_timestamp(doc)
+                if _ts is None:
+                    # No usable timestamp means no safe place to stop: advancing
+                    # the cursor on a guess is the failure mode this whole block
+                    # exists to avoid. Keep reading.
+                    pass
+                elif _ts <= window_start:
+                    # Degenerate: the cap tripped inside the FIRST instant of the
+                    # window, so stopping here would produce a zero-width window
+                    # and the cycle would make no progress for ever. Keep reading
+                    # until the clock moves; overshooting the cap is survivable,
+                    # a stalled cursor is not.
+                    logger.error(
+                        "[%s] volume cap tripped at %d events but still inside the "
+                        "window's first instant (%s) -- reading past the cap to "
+                        "guarantee forward progress. A single timestamp holding "
+                        ">%d events is a flood; expect high memory this cycle.",
+                        cycle_id, events_read, window_start.isoformat(), _max_events,
+                    )
+                else:
+                    _capped_end = _ts
+                    logger.warning(
+                        "[%s] volume cap: stopping at %d events; window truncated "
+                        "to [%s, %s). Remaining events are NOT skipped -- the "
+                        "cursor stops here and the next cycle resumes from this "
+                        "boundary.",
+                        cycle_id, events_read, window_start.isoformat(),
+                        _capped_end.isoformat(),
+                    )
+                    break
             try:
                 event = dispatch(doc)
             except Exception as e:
@@ -664,6 +736,13 @@ def run_cycle(
         # liveness signal describing work that already finished is the
         # precise failure this heartbeat was added to prevent.
         _hb_stop.set()
+    # A tripped volume cap truncates the window. Reassigning here means the
+    # cursor (state.set_last_run), the cycle summary and the query-excluded
+    # accounting all describe what was ACTUALLY read, rather than what was
+    # requested -- a cursor that advances past unread data is the one
+    # failure this pipeline cannot recover from.
+    if _capped_end is not None:
+        window_end = _capped_end
     # --- semantic invariant: was the progress on the RIGHT data? --------
     # A forward-progress heartbeat proves the machine is moving. It cannot
     # prove it is moving the right data, and that is exactly the failure
