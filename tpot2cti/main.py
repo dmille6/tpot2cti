@@ -867,6 +867,38 @@ def run_cycle(
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
     builder = builder_factory()
+    # Authoritative per-day counts for the Sightings this cycle will emit.
+    # OpenCTI REPLACES a sighting's count on upsert rather than summing it
+    # (measured: one went 22,119 -> 3,484 when a later, narrower cycle
+    # re-covered part of the same day), so writing this cycle's slice would
+    # overwrite a fuller number with a smaller one. The day's own total is
+    # idempotent under replace and only grows as the day fills.
+    #
+    # Upper bound is window_end, not the clock, so the count never claims
+    # events this connector has not yet imported.
+    #
+    # Best-effort: on failure the builder falls back to per-cycle counts,
+    # which is the pre-existing behaviour. A cycle that publishes real
+    # intel with imperfect counts beats a cycle that publishes nothing.
+    try:
+        _day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        builder.daily_event_counts = es.daily_event_counts(
+            _day_start, window_end,
+            index_pattern=cfg.es.index_pattern,
+            ignore_types=effective_ignore_types,
+        )
+        logger.info(
+            "[%s] authoritative daily counts: %d (src_ip, sensor, day) pair(s) "
+            "over [%s, %s)",
+            cycle_id, len(builder.daily_event_counts),
+            _day_start.isoformat(), window_end.isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[%s] daily count aggregation failed (%s); sighting counts fall "
+            "back to this cycle's slice and may be overwritten by a later, "
+            "narrower cycle", cycle_id, exc,
+        )
     all_objects: list[dict] = []
     sessions_by_type: dict[str, int] = {}
     # Per-cycle set of attacker IPs that contributed at least one session

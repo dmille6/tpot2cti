@@ -851,6 +851,23 @@ class STIXBuilder:
         #: id -> distinct per-session description lines, bounded.
         self._sighting_descriptions: dict[str, list] = {}
 
+        #: (src_ip, sensor, YYYY-MM-DD) -> authoritative event count for that
+        #: whole day as known to ES, populated per-cycle by main.run_cycle.
+        #: Empty means the feature is off and per-cycle counts are used.
+        #:
+        #: Needed because OpenCTI REPLACES a sighting's count on upsert rather
+        #: than summing it -- measured, not assumed: one day-bucketed sighting
+        #: went 22,119 -> 3,484 when a later, NARROWER cycle re-covered part of
+        #: the same day. A per-cycle count is therefore not just incomplete, it
+        #: actively overwrites a fuller one with a smaller one. Writing the
+        #: day's total instead is idempotent under replace and converges as the
+        #: day fills.
+        self.daily_event_counts: dict = {}
+        #: sighting ids whose count came from that map, so the merge below
+        #: takes MAX rather than SUM -- every session in a day carries the same
+        #: day total, and summing them would multiply it by the session count.
+        self._authoritative_sightings: set = set()
+
     # ──────────────────────────────────────────────────────────────────
     # Object stamping (created_by_ref + markings + confidence + timestamps)
     # ──────────────────────────────────────────────────────────────────
@@ -919,7 +936,8 @@ class STIXBuilder:
     #: carries before it stops listing them individually.
     _SIGHTING_DESC_MAX = 5
 
-    def _merge_or_emit_sighting(self, obj: dict, session) -> Optional[dict]:
+    def _merge_or_emit_sighting(self, obj: dict, session,
+                                authoritative: bool = False) -> Optional[dict]:
         """Emit a Sighting, or fold it into the same-day one already kept.
 
         Sighting ids are day-bucketed, so every session from one address on
@@ -949,6 +967,8 @@ class STIXBuilder:
             if stamped is None or not oid:
                 return stamped
             self._sightings[oid] = stamped
+            if authoritative:
+                self._authoritative_sightings.add(oid)
             self._sighting_sessions[oid] = {getattr(session, "session_id", None)}
             if stamped.get("description"):
                 self._sighting_descriptions[oid] = [stamped["description"]]
@@ -960,7 +980,12 @@ class STIXBuilder:
         if sid not in seen:
             seen.add(sid)
             if isinstance(kept.get("count"), int) and isinstance(obj.get("count"), int):
-                kept["count"] = kept["count"] + obj["count"]
+                if oid in self._authoritative_sightings:
+                    # Every session of the day carries the SAME day total,
+                    # so summing would multiply it by the session count.
+                    kept["count"] = max(kept["count"], obj["count"])
+                else:
+                    kept["count"] = kept["count"] + obj["count"]
 
         # The window widens even for a re-emission of a session already
         # counted -- a second call can carry a later last_seen, and the
@@ -2608,6 +2633,14 @@ class STIXBuilder:
         if not (target_ref and sensor_hostname):
             return None
         sensor_id = generate_sensor_id(sensor_hostname)
+        # Prefer the day's authoritative total over this cycle's slice.
+        # See daily_event_counts: OpenCTI replaces rather than sums, so a
+        # partial count does not merely under-report, it clobbers.
+        _day = session.first_seen.strftime('%Y-%m-%d')
+        _auth = self.daily_event_counts.get(
+            (session.src_ip, sensor_hostname, _day))
+        if _auth is not None:
+            count = _auth
         obj = {
             "type": "sighting",
             # AGGREGATED per (sensor, target, UTC day) — NOT per session.
@@ -2635,7 +2668,8 @@ class STIXBuilder:
         }
         if description:
             obj["description"] = description
-        return self._merge_or_emit_sighting(obj, session)
+        return self._merge_or_emit_sighting(obj, session,
+                                            authoritative=_auth is not None)
 
     def build_dual_sighting(
         self,

@@ -482,3 +482,70 @@ if __name__ == "__main__":
     reachable = client.ping()
     print(f"T-Pot ES reachable: {reachable}")
     client.close()
+
+
+    def daily_event_counts(self, day_start, upper, index_pattern="logstash-*",
+                           ignore_types=None, page=2000, max_pages=40):
+        """(src_ip, sensor, YYYY-MM-DD) -> event count for [day_start, upper).
+
+        Exists because OpenCTI REPLACES a Sighting's `count` on upsert rather
+        than summing it. That was measured, not assumed: a day-bucketed
+        sighting went 22,119 -> 3,484 when a later but NARROWER cycle
+        re-covered part of the same day. So a per-cycle count does not merely
+        under-report the day, it overwrites a fuller number with a smaller
+        one -- and the volume cap makes that MORE frequent, because it
+        deliberately produces more, smaller windows per day.
+
+        Writing the day's own total instead is idempotent under replace: it
+        only grows as the day fills, so whichever cycle writes last is also
+        the one with the most complete number. ES is the source of truth for
+        "how many times did we see this address today"; OpenCTI is a
+        projection of it.
+
+        `upper` is the cycle's window_end, NOT the wall clock, so the count
+        never claims events this connector has not actually imported yet.
+
+        One composite aggregation, paged. Measured at ~0.8s per 2,000
+        buckets, so a few seconds per cycle. `max_pages` bounds it: a
+        partial map degrades to per-cycle counts for the addresses it did
+        not reach, which is the pre-existing behaviour, rather than
+        stalling the cycle.
+        """
+        out: dict = {}
+        after = None
+        must = [{"range": {"@timestamp": {"gte": _iso_utc(day_start),
+                                          "lt": _iso_utc(upper)}}}]
+        if ignore_types:
+            must.append({"bool": {"must_not": [
+                {"terms": {"type.keyword": list(ignore_types)}}]}})
+        for _ in range(max_pages):
+            comp = {"size": page, "sources": [
+                {"ip": {"terms": {"field": "src_ip.keyword"}}},
+                {"host": {"terms": {"field": "t-pot_hostname.keyword"}}},
+                {"day": {"date_histogram": {"field": "@timestamp",
+                                            "calendar_interval": "day",
+                                            "format": "yyyy-MM-dd"}}},
+            ]}
+            if after:
+                comp["after"] = after
+            resp = self._search_with_retry({
+                "index": index_pattern,
+                "size": 0,
+                "track_total_hits": False,
+                "query": {"bool": {"must": must}},
+                "aggs": {"pairs": {"composite": comp}},
+            })
+            agg = resp.get("aggregations", {}).get("pairs", {})
+            buckets = agg.get("buckets") or []
+            for b in buckets:
+                k = b["key"]
+                out[(k["ip"], k["host"], k["day"])] = b["doc_count"]
+            after = agg.get("after_key")
+            if not after or not buckets:
+                break
+        else:
+            logger.warning(
+                "daily_event_counts: hit the %d-page cap with %d pair(s) "
+                "collected; the remainder fall back to per-cycle counts",
+                max_pages, len(out))
+        return out
