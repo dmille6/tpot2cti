@@ -19,9 +19,11 @@ The schema is intentionally tiny — one key/value table for cycle state,
 one rolling-log table for cycle audit (used by the lightweight audit
 jsonl per V1_SPEC §7 if we want a SQL view as well).
 
-This module does NOT cover the cycles.jsonl rotating file — that's
-its own module so audit can be appended without holding a DB write
-lock.
+There is no cycles.jsonl. Two docstrings described one for months and
+nothing ever wrote it; the cycle audit lives entirely in the `cycle_log`
+table here. Documentation pointing at an observability artefact that does
+not exist is worse than none — it sends the next reader looking for a
+file instead of at the data.
 """
 
 from __future__ import annotations
@@ -75,6 +77,88 @@ CREATE INDEX IF NOT EXISTS idx_cycle_log_started_at
 --
 -- One row per STIX id. Same UUID5 = same row → idempotent across
 -- cycles. The labels_json column is a JSON-encoded sorted list.
+-- ---------------------------------------------------------------------
+-- Publish ledger: publish_plan + publish_chunk
+--
+-- The unit of risk when publishing through a queue is the CHUNK, not the
+-- cycle. A cycle-level "errors_count = 0" cannot tell you that only 8 of
+-- 12 chunks ever ran.
+--
+-- The plan is SEALED BEFORE ANYTHING IS ENQUEUED, and that ordering is the
+-- whole point. Writing a chunk row after enqueueing leaves a window where
+-- the chunk exists in the broker but not in the ledger: crash there and the
+-- next read sees a short, entirely self-consistent ledger and concludes the
+-- cycle finished cleanly. That is the 2026-07-19 failure wearing a
+-- different hat -- 80,260,536 documents went unread because a cursor
+-- advanced over data nothing recorded as missing.
+--
+-- Sealing first makes an incomplete cycle detectable in two independent
+-- ways: a chunk stuck at 'planned', and a row count that disagrees with
+-- expected_chunks.
+--
+-- Replay is safe (deterministic UUID5 ids; the publisher keeps max(score)
+-- with label union), so re-covering a planned-but-unconfirmed chunk costs
+-- nothing. Skipping one cannot be detected afterwards at all.
+-- Per-pass performance, persisted rather than only logged. Comparing the
+-- serial and chunked publish paths meant grepping container logs for
+-- "Pass 'entities' sent: 5748 object(s) in 1497.90s", and those rotate --
+-- so the evidence for a performance claim expired faster than the claim
+-- did. A/B should be a query.
+CREATE TABLE IF NOT EXISTS publish_pass (
+    cycle_id    INTEGER NOT NULL,
+    pass_name   TEXT    NOT NULL,
+    objects     INTEGER NOT NULL,
+    chunks      INTEGER NOT NULL DEFAULT 1,
+    duration_s  REAL    NOT NULL,
+    transport   TEXT    NOT NULL,     -- 'serial' | 'queue'
+    errors      INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT    NOT NULL,
+    PRIMARY KEY (cycle_id, pass_name)
+);
+
+CREATE TABLE IF NOT EXISTS publish_plan (
+    cycle_id         INTEGER NOT NULL,
+    pass_name        TEXT    NOT NULL,
+    expected_chunks  INTEGER NOT NULL,
+    expected_objects INTEGER NOT NULL,
+    plan_hash        TEXT    NOT NULL,
+    sealed_at        TEXT    NOT NULL,
+    PRIMARY KEY (cycle_id, pass_name)
+);
+
+-- work_status lifecycle:
+--   planned     row sealed, nothing sent yet
+--   enqueued    handed to the broker, outcome unknown
+--   complete    work reached a terminal state (NOT the same as "succeeded")
+--   timeout     never reached terminal within the wait budget
+--   unknown     could not be established -- treated exactly like timeout
+--   send_failed the enqueue itself raised
+--   quarantined terminal, has errors, and an operator/policy accepted them
+--               as permanently unfixable so the cursor may move past them
+CREATE TABLE IF NOT EXISTS publish_chunk (
+    cycle_id         INTEGER NOT NULL,
+    pass_name        TEXT    NOT NULL,
+    chunk_index      INTEGER NOT NULL,
+    expected_objects INTEGER NOT NULL,
+    id_hash          TEXT    NOT NULL,
+    work_id          TEXT,
+    work_status      TEXT    NOT NULL DEFAULT 'planned',
+    enqueued_at      TEXT,
+    terminal_at      TEXT,
+    -- Diagnostic ONLY, never a gate: the contract test returned
+    -- import_expected_number = import_processed_number = 4 for a 4-object
+    -- bundle containing 2 rejects, so these count SUBMITTED, not ACCEPTED.
+    -- Equality is guaranteed by construction and proves liveness at best.
+    import_expected  INTEGER,
+    import_processed INTEGER,
+    -- THE acceptance signal. The work record reports per-object failures
+    -- here even when status is "complete".
+    error_count      INTEGER NOT NULL DEFAULT 0,
+    error_summary    TEXT,
+    retries          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (cycle_id, pass_name, chunk_index)
+);
+
 CREATE TABLE IF NOT EXISTS object_max_state (
     stix_id       TEXT PRIMARY KEY,
     max_score     INTEGER,
@@ -288,6 +372,181 @@ class CycleState:
         needed; the value is an ISO-8601 UTC timestamp.
         """
         self.set("last_heartbeat_ts", datetime.now(timezone.utc).isoformat())
+
+    # ------------------------------------------------------------------
+    # Publish ledger
+    # ------------------------------------------------------------------
+
+    def record_publish_pass(self, cycle_id, pass_name, *, objects,
+                           duration_s, transport, chunks=1, errors=0) -> None:
+        """Persist one pass's throughput so path comparisons are queryable.
+
+        `transport` records WHICH path produced the number. Without it a
+        table of durations cannot answer the only question it exists for.
+        """
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO publish_pass (cycle_id, pass_name,"
+                " objects, chunks, duration_s, transport, errors, recorded_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (cycle_id, pass_name, objects, chunks, duration_s, transport,
+                 errors, datetime.now(timezone.utc).isoformat()))
+
+    def seal_publish_plan(self, cycle_id, pass_name, chunks) -> str:
+        """Record the FULL chunk plan for one pass before anything is sent.
+
+        `chunks` is a list of lists of STIX object ids. Every chunk row is
+        written as 'planned' in ONE transaction, together with the pass's
+        expected counts, and only then may the caller enqueue.
+
+        The ordering is the safety property. Writing rows after enqueueing
+        leaves a window where a chunk exists in the broker but not in the
+        ledger, and a crash there produces a SHORT ledger that is entirely
+        self-consistent -- every row present is clean, so the gate passes and
+        the cursor advances over whatever was never recorded. That is exactly
+        how 80,260,536 documents went unread here.
+
+        Returns the plan hash, which also seals the chunking decision: if the
+        chunker is changed mid-flight, a resumed cycle will not silently match
+        a stale plan.
+        """
+        import hashlib
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        hasher = hashlib.sha256()
+        for idx, ids in enumerate(chunks):
+            ordered = sorted(str(x) for x in ids)
+            h = hashlib.sha256("\n".join(ordered).encode()).hexdigest()
+            hasher.update(h.encode())
+            rows.append((cycle_id, pass_name, idx, len(ordered), h))
+        plan_hash = hasher.hexdigest()
+        total_objects = sum(len(c) for c in chunks)
+
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO publish_plan"
+                " (cycle_id, pass_name, expected_chunks, expected_objects,"
+                "  plan_hash, sealed_at) VALUES (?,?,?,?,?,?)",
+                (cycle_id, pass_name, len(chunks), total_objects, plan_hash, now))
+            c.executemany(
+                "INSERT OR REPLACE INTO publish_chunk"
+                " (cycle_id, pass_name, chunk_index, expected_objects, id_hash,"
+                "  work_status) VALUES (?,?,?,?,?, 'planned')", rows)
+        return plan_hash
+
+    def mark_chunk_enqueued(self, cycle_id, pass_name, chunk_index, work_id) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE publish_chunk SET work_status='enqueued', work_id=?,"
+                " enqueued_at=? WHERE cycle_id=? AND pass_name=? AND chunk_index=?",
+                (work_id, now, cycle_id, pass_name, chunk_index))
+
+    def mark_chunk_terminal(self, cycle_id, pass_name, chunk_index, *, status,
+                            error_count=0, error_summary=None,
+                            import_expected=None, import_processed=None) -> None:
+        """Record a chunk's outcome. `status` is NOT assumed to mean success."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE publish_chunk SET work_status=?, terminal_at=?,"
+                " error_count=?, error_summary=?, import_expected=?,"
+                " import_processed=? WHERE cycle_id=? AND pass_name=?"
+                " AND chunk_index=?",
+                (status, now, error_count, error_summary, import_expected,
+                 import_processed, cycle_id, pass_name, chunk_index))
+
+    def quarantine_chunk(self, cycle_id, pass_name, chunk_index, reason) -> None:
+        """Accept a chunk's errors as permanently unfixable and stop blocking.
+
+        Without this the gate has a failure mode of its own: an object OpenCTI
+        will NEVER accept -- a malformed observable, a reference to something
+        that no longer exists -- keeps error_count above zero for ever, the
+        cycle never passes the gate, and the cursor wedges permanently. That is
+        the 2026-07-19 data-loss incident inverted: instead of skipping data
+        silently, the pipeline stops consuming data silently.
+
+        Quarantining is therefore deliberate, recorded, and loud. It moves the
+        cursor past a known-bad chunk while leaving the evidence in the ledger.
+        """
+        with self._conn() as c:
+            c.execute(
+                "UPDATE publish_chunk SET work_status='quarantined',"
+                " error_summary=COALESCE(error_summary,'') || ?"
+                " WHERE cycle_id=? AND pass_name=? AND chunk_index=?",
+                (f" | QUARANTINED: {reason}", cycle_id, pass_name, chunk_index))
+
+    def publish_is_clean(self, cycle_id):
+        """May the cursor advance for this cycle? Returns (bool, reason).
+
+        Fails CLOSED. Anything unestablished is a refusal, because re-reading a
+        window is free here and skipping one is undetectable afterwards.
+        """
+        with self._conn() as c:
+            plans = list(c.execute(
+                "SELECT pass_name, expected_chunks, expected_objects"
+                " FROM publish_plan WHERE cycle_id=?", (cycle_id,)))
+            chunks = list(c.execute(
+                "SELECT pass_name, chunk_index, expected_objects, work_status,"
+                " error_count, terminal_at FROM publish_chunk WHERE cycle_id=?",
+                (cycle_id,)))
+
+        if not plans:
+            return False, "no publish plan sealed for this cycle"
+
+        by_pass = {}
+        for p, idx, objs, status, errs, term in chunks:
+            by_pass.setdefault(p, []).append((idx, objs, status, errs, term))
+
+        for pass_name, expected_chunks, expected_objects in plans:
+            rows = by_pass.get(pass_name, [])
+            # The condition every "all rows are good" gate is missing: that the
+            # RIGHT NUMBER of rows exists. Quantifying only over rows that
+            # happen to be present cannot detect the ones that never were.
+            if len(rows) != expected_chunks:
+                return False, (f"pass {pass_name}: {len(rows)} chunk row(s) but "
+                               f"plan sealed {expected_chunks}")
+            if {r[0] for r in rows} != set(range(expected_chunks)):
+                return False, f"pass {pass_name}: chunk_index set is not contiguous"
+            # NOTE: this compares PLANNED counts against the PLAN total, so it is
+            # a plan-integrity check, NOT an acceptance check. It catches a
+            # vanished or rewritten row; it says nothing about whether OpenCTI
+            # kept the objects. Acceptance is error_count and only error_count --
+            # the work tracking counters count SUBMITTED, so nothing else in this
+            # query reflects acceptance at all.
+            if sum(r[1] for r in rows) != expected_objects:
+                return False, (f"pass {pass_name}: chunk objects sum to "
+                               f"{sum(r[1] for r in rows)}, plan sealed "
+                               f"{expected_objects}")
+            for idx, _objs, status, errs, term in rows:
+                if status not in ("complete", "quarantined"):
+                    return False, (f"pass {pass_name} chunk {idx}: status "
+                                   f"{status!r} is not terminal")
+                if term is None:
+                    return False, f"pass {pass_name} chunk {idx}: no terminal_at"
+                # An unrecorded error count is UNESTABLISHED, not zero. The column
+                # is NOT NULL today so this cannot fire -- it is written against the
+                # schema being relaxed later, because `and errs` would then treat
+                # NULL as clean and the gate would silently begin failing OPEN. Both
+                # reviewers flagged that pattern independently; the constraint that
+                # saves it lives in a different file from the check relying on it.
+                if errs is None:
+                    return False, (f"pass {pass_name} chunk {idx}: error_count is "
+                                   f"NULL (unestablished, not clean)")
+                if status == "complete" and errs != 0:
+                    # "complete" does NOT mean "succeeded" -- the contract test saw
+                    # status=complete alongside two rejected objects.
+                    return False, (f"pass {pass_name} chunk {idx}: complete with "
+                                   f"{errs} import error(s)")
+                if status == "quarantined" and errs == 0:
+                    # Quarantine excuses errors that will never clear. A quarantined
+                    # chunk with NO errors is a contradiction, and the dangerous kind:
+                    # it waves through a chunk nobody had a reason to excuse, hiding
+                    # whatever actually went wrong. Quarantine must be justified by
+                    # the thing it exists to excuse.
+                    return False, (f"pass {pass_name} chunk {idx}: quarantined but "
+                                   f"error_count is 0 - nothing to excuse")
+        return True, "all sealed chunks terminal and clean"
 
     def record_cycle(
         self,

@@ -150,7 +150,7 @@ class PublishResult:
 
     Recorded into :class:`tpot2cti.state.CycleState` by the caller (via
     a generic key/value row keyed by ``cycle_id``) and surfaced in the
-    cycle summary log line + the ``data/cycles.jsonl`` audit doc.
+    cycle summary log line and the ``cycle_log`` table in state.db.
     """
 
     cycle_id: str
@@ -426,6 +426,25 @@ class Publisher:
                     f"{stats.get('sent', len(objs))} object(s) in "
                     f"{stats.get('duration_s', 0.0):.2f}s"
                 )
+
+                # Persist the pass, tagged with the transport that produced it.
+                # Recording this on the CURRENT (serial) path first is the point: it
+                # establishes a baseline before anything is flipped, so a later
+                # throughput claim is a query against two labelled populations rather
+                # than a memory of a log line that has since rotated away.
+                if self.state is not None:
+                    try:
+                        self.state.record_publish_pass(
+                            cycle_id, name,
+                            objects=len(objs),
+                            duration_s=stats.get("duration_s", 0.0),
+                            transport="serial",
+                            chunks=1,
+                            errors=0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Telemetry must never fail a publish.
+                        pass
             except Exception as exc:  # noqa: BLE001
                 # Partial publish > no publish. Continue to next pass.
                 msg = (
