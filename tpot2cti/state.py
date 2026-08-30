@@ -874,7 +874,10 @@ class CycleState:
         import json
         if not updates:
             return
-        from datetime import datetime, timezone
+        # datetime/timezone come from the module-level import (line 34). A
+        # local re-import would make both names function-local for the WHOLE
+        # function, so any earlier use becomes an unbound local -- the exact
+        # shape that crash-looped the connector for 5 hours on 2026-08-30.
         now = datetime.now(timezone.utc).isoformat()
         rows = [
             (stix_id, max_score, json.dumps(sorted(set(labels))), name, description, now)

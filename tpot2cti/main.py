@@ -1409,7 +1409,11 @@ def main() -> int:
                 "OPENCTI_TOKEN", os.environ.get("OPENCTI_ADMIN_TOKEN", ""))
             from pycti import OpenCTIConnectorHelper
             _pub_helper = OpenCTIConnectorHelper({})
-            from tpot2cti.log import restore_logging
+            # restore_logging is imported at module scope (line 60). Importing
+            # it again HERE made the name function-local for the whole of main(),
+            # so the pre-existing call ~20 lines earlier hit an unbound local and
+            # the connector crash-looped -- and only when the flag was OFF, because
+            # then this block never runs and the name is never bound.
             restore_logging()
             logger.warning("CHUNKED PUBLISH ENABLED — queue transport in use")
         except Exception as exc:  # noqa: BLE001
