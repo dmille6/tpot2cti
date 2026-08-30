@@ -377,6 +377,25 @@ class CycleState:
     # Publish ledger
     # ------------------------------------------------------------------
 
+    def publish_chunk_count(self, cycle_id, pass_name) -> int:
+        """How many chunks were actually sealed for this pass.
+
+        Exists because `record_publish_pass` used to hardcode ``chunks=1``,
+        so the telemetry said "1 chunk" for passes that had demonstrably
+        been split into six. A reader checking whether chunking was live
+        would have concluded it was not. Reads the ledger rather than
+        trusting the caller.
+        """
+        try:
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT COUNT(*) FROM publish_chunk "
+                    "WHERE cycle_id = ? AND pass_name = ?",
+                    (str(cycle_id), pass_name)).fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
     def record_publish_pass(self, cycle_id, pass_name, *, objects,
                            duration_s, transport, chunks=1, errors=0) -> None:
         """Persist one pass's throughput so path comparisons are queryable.

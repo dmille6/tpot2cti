@@ -472,7 +472,8 @@ class Publisher:
                             objects=len(objs),
                             duration_s=stats.get("duration_s", 0.0),
                             transport="chunked" if self.helper is not None else "serial",
-                            chunks=1,
+                            chunks=(self.state.publish_chunk_count(
+                                cycle_id, name) or 1),
                             errors=0,
                         )
                     except Exception:  # noqa: BLE001

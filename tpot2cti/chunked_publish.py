@@ -69,7 +69,7 @@ def split(objects: list, chunks: int = DEFAULT_CHUNKS) -> list[list]:
 
 def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
                          work_id, wait_for_work, chunks=DEFAULT_CHUNKS,
-                         timeout_s=900.0):
+                         timeout_s=7200.0, stall_s=420.0):
     """Enqueue one pass as chunks and wait for every one to finish.
 
     Returns (ok, detail). `ok` is False if ANY chunk failed to enqueue or
@@ -126,7 +126,11 @@ def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
                        "below will time out rather than hang for ever",
                        cycle_id, pass_name, exc)
 
-    outcome = wait_for_work(helper.api.work, work_id, timeout_s=timeout_s)
+    # stall_s is the limit that matters; timeout_s is only a backstop.
+    # See work_wait.wait_for_work -- a 900s wall-clock deadline killed a
+    # perfectly healthy relationships pass at 6,896/11,760 with 0 errors.
+    outcome = wait_for_work(helper.api.work, work_id,
+                            timeout_s=timeout_s, stall_s=stall_s)
     for idx in range(len(parts)):
         state.mark_chunk_terminal(
             cycle_id, pass_name, idx,

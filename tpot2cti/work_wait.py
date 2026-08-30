@@ -48,6 +48,10 @@ class WorkOutcome:
     import_expected: Optional[int] = None
     import_processed: Optional[int] = None
     waited_s: float = 0.0
+    #: Why we stopped waiting: complete | stalled | ceiling. Appended
+    #: LAST on purpose -- inserting it mid-dataclass re-bound every
+    #: positional argument after it and broke three callers at once.
+    reason: str = ""
 
     @property
     def error_count(self) -> int:
@@ -82,9 +86,27 @@ class WorkOutcome:
         return json.dumps(self.errors, default=str)[:limit]
 
 
-def wait_for_work(api_work, work_id: str, *, timeout_s: float = 900.0,
-                  poll_s: float = 2.0) -> WorkOutcome:
+def wait_for_work(api_work, work_id: str, *, timeout_s: float = 7200.0,
+                  stall_s: float = 420.0, poll_s: float = 2.0) -> WorkOutcome:
     """Poll a work to a terminal state and report what it did.
+
+    Two independent limits, because "slow" and "stuck" are different failures
+    and only one of them is worth giving up on:
+
+    * ``stall_s`` -- give up when ``import_processed`` STOPS ADVANCING. This
+      is the real signal: a wedged work stops counting immediately, a slow
+      one keeps counting.
+    * ``timeout_s`` -- a hard ceiling, so a work that somehow trickles for
+      ever still cannot pin a cycle open.
+
+    A fixed wall-clock deadline alone was measurably wrong. On cycle 205 the
+    relationships pass was killed at 900s having imported 6,896 of 11,760
+    objects WITH ZERO ERRORS, and went on to import the rest perfectly well
+    after we stopped watching. That marked a healthy cycle as failed, and a
+    failed cycle holds the cursor -- so the connector would have re-read the
+    same window for ever and never advanced. Timing out on elapsed time
+    punishes volume; timing out on a stall punishes being stuck, which is
+    what we actually mean.
 
     `api_work` is `helper.api.work`. Never raises for a work-level problem --
     a transport exception during polling is itself reported as `unknown`,
@@ -94,11 +116,40 @@ def wait_for_work(api_work, work_id: str, *, timeout_s: float = 900.0,
     started = time.monotonic()
     deadline = started + timeout_s
     last_state: dict[str, Any] = {}
+    best_processed = -1
+    last_progress = started
 
-    while time.monotonic() < deadline:
+    def _tracking(key):
+        return ((last_state.get("tracking") or {}) if last_state else {}).get(key)
+
+    def _outcome(status: str, reason: str) -> WorkOutcome:
+        return WorkOutcome(
+            work_id=work_id,
+            status=status,
+            reason=reason,
+            errors=list(last_state.get("errors") or []),
+            import_expected=_tracking("import_expected_number"),
+            import_processed=_tracking("import_processed_number"),
+            waited_s=time.monotonic() - started,
+        )
+
+    while True:
+        if time.monotonic() >= deadline:
+            logger.error(
+                "work %s hit the %.0fs HARD CEILING (last status=%r, %s/%s "
+                "imported). Treating as NOT clean: an unknown outcome must "
+                "never advance a cursor.",
+                work_id, timeout_s, last_state.get("status"),
+                _tracking("import_processed_number"),
+                _tracking("import_expected_number"))
+            return _outcome(STATUS_TIMEOUT, "ceiling")
+
         try:
             state = api_work.get_work(work_id=work_id) or {}
         except Exception as exc:  # noqa: BLE001
+            # Deliberately NOT counted towards the stall. Losing the ability
+            # to ask is not evidence the work stopped moving, and the hard
+            # ceiling above still bounds the loop.
             logger.warning("work %s: get_work raised %s: %s",
                            work_id, type(exc).__name__, exc)
             time.sleep(poll_s)
@@ -110,24 +161,25 @@ def wait_for_work(api_work, work_id: str, *, timeout_s: float = 900.0,
             return WorkOutcome(
                 work_id=work_id,
                 status=STATUS_COMPLETE,
+                reason="complete",
                 errors=list(state.get("errors") or []),
                 import_expected=tracking.get("import_expected_number"),
                 import_processed=tracking.get("import_processed_number"),
                 waited_s=time.monotonic() - started,
             )
-        time.sleep(poll_s)
 
-    tracking = (last_state.get("tracking") or {}) if last_state else {}
-    logger.error(
-        "work %s did not reach a terminal state within %.0fs (last status=%r). "
-        "Treating as NOT clean: an unknown outcome must never advance a cursor.",
-        work_id, timeout_s, last_state.get("status"),
-    )
-    return WorkOutcome(
-        work_id=work_id,
-        status=STATUS_TIMEOUT,
-        errors=list(last_state.get("errors") or []),
-        import_expected=tracking.get("import_expected_number"),
-        import_processed=tracking.get("import_processed_number"),
-        waited_s=time.monotonic() - started,
-    )
+        processed = (state.get("tracking") or {}).get("import_processed_number")
+        if isinstance(processed, int) and processed > best_processed:
+            best_processed = processed
+            last_progress = time.monotonic()
+
+        if time.monotonic() - last_progress > stall_s:
+            logger.error(
+                "work %s STALLED: no import progress for %.0fs (stuck at %s/%s, "
+                "status=%r). Treating as NOT clean.",
+                work_id, stall_s,
+                best_processed if best_processed >= 0 else None,
+                _tracking("import_expected_number"), state.get("status"))
+            return _outcome(STATUS_TIMEOUT, "stalled")
+
+        time.sleep(poll_s)
