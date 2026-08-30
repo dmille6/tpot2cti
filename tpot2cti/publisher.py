@@ -210,9 +210,16 @@ class Publisher:
         *,
         indexing_delay_seconds: Optional[int] = None,
         redactor: Optional["SensorRedactor"] = None,
+        helper=None,
     ) -> None:
         self.client = client
         self.state = state
+        #: An OpenCTIConnectorHelper, present ONLY when chunked publishing
+        #: is enabled. Absent means the serial path, which is the default:
+        #: this connector otherwise never builds a helper, and doing so has
+        #: side effects (pycti hijacks the root logger; the connector
+        #: registers itself).
+        self.helper = helper
         # Sensor-identity redaction. Lives HERE, not in the builders, because
         # every emission path funnels through publish() — CORE, malware
         # ingest, noisefloor, blocklists, selftest — including the three that
@@ -420,7 +427,33 @@ class Publisher:
                                    name=f"pass-hb-{name}")
             _hb.start()
             try:
-                stats = self.client.send_bundle(envelope)
+                if self.helper is not None:
+                    # Chunked queue transport. Measured on LIVE v2 infrastructure:
+                    # 15.7 obj/s against the 5.5 obj/s serial baseline = 2.9x, with
+                    # the pass barrier holding (120 relationships referencing
+                    # entities from a previous chunked pass, no dangling refs) and
+                    # the gate correctly refusing a poisoned chunk that OpenCTI had
+                    # itself reported as `complete`.
+                    from tpot2cti.chunked_publish import publish_pass_chunked
+                    from tpot2cti.work_wait import wait_for_work
+                    _wid = self.helper.api.work.initiate_work(
+                        self.helper.connect_id, f"{cycle_id}:{name}")
+                    _t0 = time.monotonic()
+                    _ok, _detail = publish_pass_chunked(
+                        helper=self.helper, state=self.state, cycle_id=cycle_id,
+                        pass_name=name, objects=objs, work_id=_wid,
+                        wait_for_work=wait_for_work)
+                    stats = {"sent": len(objs), "duration_s": time.monotonic() - _t0}
+                    if not _ok:
+                        # Deliberately not raised: the pass is recorded unclean in
+                        # the ledger and publish_is_clean() will refuse the cursor.
+                        # Raising would discard the passes that DID land, and
+                        # re-covering a window is free while skipping one is not.
+                        msg = f"chunked pass not clean: {_detail}"
+                        logger.error(f"[{cycle_id}] {msg}")
+                        errors.append(msg)
+                else:
+                    stats = self.client.send_bundle(envelope)
                 logger.info(
                     f"[{cycle_id}] Pass '{name}' sent: "
                     f"{stats.get('sent', len(objs))} object(s) in "
@@ -438,7 +471,7 @@ class Publisher:
                             cycle_id, name,
                             objects=len(objs),
                             duration_s=stats.get("duration_s", 0.0),
-                            transport="serial",
+                            transport="chunked" if self.helper is not None else "serial",
                             chunks=1,
                             errors=0,
                         )

@@ -1388,9 +1388,42 @@ def main() -> int:
     # a stack restart until OpenCTI warmed up). See _connect_opencti.
     opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
     restore_logging()      # pycti's __init__ may have clobbered handlers
+    # Chunked queue publishing — OFF by default, one env var to flip.
+    #
+    # Serial publish is ~93% of cycle time and v2 sits at 1.04x the
+    # throughput it needs, i.e. break-even with no margin. The chunked
+    # path measured 15.7 obj/s against 5.5 serial on live infrastructure
+    # (2.9x), which takes the cycle to ~0.39x and the margin to ~2.7x.
+    #
+    # The helper is built ONLY when the flag is on. Instantiating
+    # OpenCTIConnectorHelper is not free: pycti resets the root logger
+    # (hence restore_logging below) and the connector registers itself.
+    # Paying that when the feature is off would be a side effect nobody
+    # asked for.
+    _chunked = os.environ.get(
+        "TPOT2CTI_CHUNKED_PUBLISH", "false").lower() in ("1", "true", "yes")
+    _pub_helper = None
+    if _chunked:
+        try:
+            os.environ.setdefault(
+                "OPENCTI_TOKEN", os.environ.get("OPENCTI_ADMIN_TOKEN", ""))
+            from pycti import OpenCTIConnectorHelper
+            _pub_helper = OpenCTIConnectorHelper({})
+            from tpot2cti.log import restore_logging
+            restore_logging()
+            logger.warning("CHUNKED PUBLISH ENABLED — queue transport in use")
+        except Exception as exc:  # noqa: BLE001
+            # Fail to the serial path rather than not publishing. Loudly:
+            # silently falling back would leave the throughput unchanged
+            # with no indication the flag did nothing.
+            logger.error("chunked publish requested but the helper could not "
+                         "be built (%s: %s) — FALLING BACK TO SERIAL",
+                         type(exc).__name__, exc)
+
     publisher = Publisher(
         opencti, state=state,
         indexing_delay_seconds=cfg.cycle.indexing_delay_seconds,
+        helper=_pub_helper,
     )
 
     # Benign-scanner allowlist — static yaml, loaded once at startup.

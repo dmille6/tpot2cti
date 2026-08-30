@@ -110,6 +110,22 @@ def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
     if enqueued == 0:
         return False, f"pass {pass_name}: nothing enqueued"
 
+    # Tell OpenCTI no more bundles are coming BEFORE waiting for the work to
+    # finish. A work only reaches `complete` once the connector has signalled
+    # to_processed AND its expectations are met, so waiting first is a
+    # deadlock: the wait blocks the very call that would let it finish.
+    #
+    # Found by the pre-flight rather than by review -- the module hung until
+    # its 900s timeout, which from the outside looked exactly like a slow
+    # OpenCTI. Worth stating plainly: the failure mode of getting this wrong
+    # is indistinguishable from the system being slow.
+    try:
+        helper.api.work.to_processed(work_id, f"{pass_name}: {enqueued} chunk(s) sent")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[%s] pass %r: to_processed failed (%s) — the wait "
+                       "below will time out rather than hang for ever",
+                       cycle_id, pass_name, exc)
+
     outcome = wait_for_work(helper.api.work, work_id, timeout_s=timeout_s)
     for idx in range(len(parts)):
         state.mark_chunk_terminal(
