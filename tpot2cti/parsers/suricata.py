@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime
 from typing import Optional
 
 from tpot2cti.parsers import register
@@ -72,7 +73,7 @@ class SuricataParser(BaseParser):
                 or "unknown"
             ),
             event_type="Suricata",
-            session_id=self._session_id_for(doc),
+            session_id=self._session_id_for(doc, ts),
             src_port=self._safe_int(doc.get("src_port")),
             dst_port=self._safe_int(doc.get("dest_port") or doc.get("dst_port")),
             dst_ip=doc.get("dest_ip") or doc.get("dst_ip"),
@@ -212,19 +213,29 @@ class SuricataParser(BaseParser):
     # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _session_id_for(doc: dict) -> str:
+    def _session_id_for(doc: dict, ts: Optional[datetime] = None) -> str:
         """Construct a deterministic synthetic session id for one alert.
 
         Suricata has no session concept across alerts; we still want a
         stable id so AttackSession.from_event() can build a unique
         session_id.  flow_id + signature_id + timestamp is deterministic
         and unique enough to avoid collisions between alerts.
+
+        `ts` is the NORMALISED timestamp (aware UTC, from
+        `_parse_timestamp`). It used to read `doc["@timestamp"]` raw, which
+        made the id a function of how the sensor SPELLED the instant rather
+        than of the instant: the same alert written "…T09:00:00Z" and
+        "…T11:00:00+02:00" produced two different session ids, and the
+        Sighting id downstream is derived from that. Falls back to the raw
+        value only when the caller passes nothing.
         """
         flow = doc.get("flow_id") or "noflow"
         alert = doc.get("alert") or {}
         sid = alert.get("signature_id") or "nosid"
-        ts = doc.get("@timestamp") or "nots"
-        return f"suricata:{flow}:{sid}:{ts}"
+        stamp = ts.isoformat() if ts is not None else (
+            doc.get("@timestamp") or "nots"
+        )
+        return f"suricata:{flow}:{sid}:{stamp}"
 
     @staticmethod
     def _derive_protocol(doc: dict) -> Optional[str]:
