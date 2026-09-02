@@ -38,7 +38,9 @@ the live API, not assumed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import logging
 import uuid
 
@@ -67,9 +69,42 @@ def split(objects: list, chunks: int = DEFAULT_CHUNKS) -> list[list]:
     return [objects[i:i + size] for i in range(0, n, size)]
 
 
+
+#: Consecutive cycles that must fail with the IDENTICAL error signature before
+#: a chunk is quarantined. Three is ~1.5h at current cycle times: long enough
+#: that a transient platform problem has had several chances to clear, short
+#: enough that a genuine deadlock does not run for five hours as it did on
+#: 2026-09-02.
+POISON_QUARANTINE_AFTER = 3
+
+
+def _error_signature(errors):
+    """A stable fingerprint for a set of import errors, plus a human sample.
+
+    TIMESTAMPS ARE EXCLUDED. Each error carries the moment it occurred, and
+    including that would make the same rejection look like a brand-new failure
+    every cycle -- the streak would never reach two and quarantine could never
+    fire. The whole mechanism turns on recognising the same failure again.
+
+    Keyed on the offending object's STIX id plus the error text, so a
+    DIFFERENT bad object produces a different signature and correctly resets
+    the streak rather than inheriting one.
+    """
+    parts = []
+    for e in errors or []:
+        msg = str(e.get("message") or "")
+        src = str(e.get("source") or "")
+        m = re.search(r'"id":\s*"([a-z0-9-]+--[0-9a-fA-F-]+)"', src)
+        parts.append(f"{m.group(1) if m else ''}|{msg}")
+    parts.sort()
+    sig = hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:32]
+    return sig, "; ".join(parts[:3])[:800]
+
+
 def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
                          work_id, wait_for_work, chunks=DEFAULT_CHUNKS,
-                         timeout_s=7200.0, stall_s=420.0):
+                         timeout_s=7200.0, stall_s=420.0,
+                         quarantine_after=POISON_QUARANTINE_AFTER):
     """Enqueue one pass as chunks and wait for every one to finish.
 
     Returns (ok, detail). `ok` is False if ANY chunk failed to enqueue or
@@ -142,9 +177,38 @@ def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
             import_processed=outcome.import_processed)
 
     if not outcome.is_clean:
-        logger.error("[%s] pass %r NOT clean: status=%s errors=%d — the "
-                     "cursor must not advance on this cycle",
-                     cycle_id, pass_name, outcome.status, outcome.error_count)
+        sig, sample = _error_signature(outcome.errors)
+        streak = state.note_publish_failure(pass_name, sig, sample)
+
+        # Quarantine ONLY a proven-permanent rejection. `complete with errors`
+        # means OpenCTI finished and refused specific objects -- retrying that
+        # produces the identical refusal for ever. A timeout or a stall is the
+        # opposite: the work never finished, so the data may well land next
+        # time, and abandoning it would be real loss dressed up as recovery.
+        permanent = (outcome.status == "complete" and outcome.error_count > 0)
+
+        if permanent and streak >= quarantine_after:
+            for idx in range(len(parts)):
+                state.quarantine_chunk(
+                    cycle_id, pass_name, idx,
+                    reason=(f"identical import error on {streak} consecutive "
+                            f"cycles (sig {sig}); objects abandoned: {sample}"))
+            logger.error(
+                "[%s] pass %r QUARANTINED after %d consecutive identical "
+                "failures (sig %s). The cursor will advance and these objects "
+                "are ABANDONED, not retried: %s",
+                cycle_id, pass_name, streak, sig, sample)
+            return True, (f"pass {pass_name}: QUARANTINED after {streak} identical "
+                          f"failures — objects abandoned")
+
+        logger.error("[%s] pass %r NOT clean: status=%s errors=%d (identical "
+                     "failure %d/%d — quarantine at %d) — the cursor must not "
+                     "advance on this cycle",
+                     cycle_id, pass_name, outcome.status, outcome.error_count,
+                     streak, quarantine_after, quarantine_after)
         return False, f"pass {pass_name}: {outcome.status}, {outcome.error_count} error(s)"
 
+    # A clean pass clears the streak: whatever was wrong is gone, and an
+    # unrelated failure later must start counting from one.
+    state.clear_publish_failure(pass_name)
     return True, f"pass {pass_name}: {enqueued} chunk(s) clean"

@@ -256,6 +256,11 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
 """
 
 
+def _utcnow_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
 class CycleState:
     """SQLite-backed state for the importer cycle loop."""
 
@@ -494,6 +499,90 @@ class CycleState:
                 " error_summary=COALESCE(error_summary,'') || ?"
                 " WHERE cycle_id=? AND pass_name=? AND chunk_index=?",
                 (f" | QUARANTINED: {reason}", cycle_id, pass_name, chunk_index))
+
+    # ── poison tracking ────────────────────────────────────────────────
+    #
+    # Holding the cursor on a failed publish is correct and it is what stops
+    # us silently skipping data. It assumes, though, that failures are
+    # TRANSIENT -- a blip, a busy platform -- so that retrying eventually
+    # clears them.
+    #
+    # On 2026-09-02 a single relationship that OpenCTI's schema forbids
+    # (Url --resolves-to--> Domain-Name) proved that assumption wrong. The
+    # object failed deterministically, the pass never reached zero errors, the
+    # cycle never succeeded, and the cursor never moved. Ten cycles, five
+    # hours, the same 400,000 events re-read and re-failed, every component
+    # reporting healthy. The safety mechanism became the outage.
+    #
+    # So a failure that has PROVEN itself permanent gets an escape hatch. The
+    # bar is deliberately high and the evidence is kept:
+    #   * the SAME error signature must recur on N consecutive cycles. A
+    #     changing signature means something transient is happening and we
+    #     keep retrying, which is the behaviour that protects data.
+    #   * the abandoned object ids are recorded, not just counted.
+    #   * quarantining is logged at ERROR and surfaced in status output.
+    # Quarantine buys progress at the cost of specific, named objects. That
+    # trade must always be visible, or it becomes silent data loss -- which is
+    # a worse failure than the deadlock it cures.
+
+    def _ensure_poison_table(self, c) -> None:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS poison_tracker (
+                pass_name    TEXT PRIMARY KEY,
+                signature    TEXT NOT NULL,
+                consecutive  INTEGER NOT NULL,
+                first_seen   TEXT NOT NULL,
+                last_seen    TEXT NOT NULL,
+                sample       TEXT
+            )""")
+
+    def note_publish_failure(self, pass_name, signature, sample=""):
+        """Record a failed publish and return how many CONSECUTIVE cycles have
+        now failed with this exact signature.
+
+        A different signature resets the counter to 1: two different problems
+        in a row are not one permanent problem, and treating them as one would
+        quarantine data that a retry would have delivered.
+        """
+        now = _utcnow_iso()
+        with self._conn() as c:
+            self._ensure_poison_table(c)
+            row = c.execute("SELECT signature, consecutive FROM poison_tracker "
+                            "WHERE pass_name = ?", (pass_name,)).fetchone()
+            if row and row[0] == signature:
+                n = int(row[1]) + 1
+                c.execute("UPDATE poison_tracker SET consecutive=?, last_seen=?, "
+                          "sample=? WHERE pass_name=?", (n, now, sample[:2000], pass_name))
+            else:
+                n = 1
+                c.execute("INSERT OR REPLACE INTO poison_tracker"
+                          "(pass_name,signature,consecutive,first_seen,last_seen,sample)"
+                          " VALUES (?,?,?,?,?,?)",
+                          (pass_name, signature, 1, now, now, sample[:2000]))
+        return n
+
+    def clear_publish_failure(self, pass_name) -> None:
+        """A clean pass means whatever was wrong is gone. Reset, so an
+        unrelated failure weeks later does not inherit an old streak and get
+        quarantined on its first occurrence."""
+        with self._conn() as c:
+            self._ensure_poison_table(c)
+            c.execute("DELETE FROM poison_tracker WHERE pass_name = ?", (pass_name,))
+
+    def poison_status(self):
+        """Current poison streaks, for status reporting. A streak below the
+        quarantine threshold is still worth seeing: it is a publish that is
+        failing right now."""
+        try:
+            with self._conn() as c:
+                self._ensure_poison_table(c)
+                return [dict(zip(("pass_name", "signature", "consecutive",
+                                  "first_seen", "last_seen", "sample"), r))
+                        for r in c.execute(
+                            "SELECT pass_name,signature,consecutive,first_seen,"
+                            "last_seen,sample FROM poison_tracker")]
+        except Exception:  # noqa: BLE001
+            return []
 
     def publish_is_clean(self, cycle_id):
         """May the cursor advance for this cycle? Returns (bool, reason).
