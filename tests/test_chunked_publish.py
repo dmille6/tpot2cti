@@ -272,3 +272,56 @@ def test_a_clean_pass_clears_the_streak():
     ok, _ = _run(st, o, 4)                       # streak restarts at 1
     assert ok is False, "a cleared streak must not inherit the old count"
     assert st.quarantined == []
+
+
+# ---------------------------------------------------------------------------
+# The stall window has to be defensible against the ledger, not chosen by
+# feel. cycle_log records healthy serial-era passes at 3,627s and 3,550s with
+# zero errors, and a work in a deep queue waits minutes before its first
+# message is consumed. 420s was below both and was the proximate cause of a
+# five-day cursor hold.
+# ---------------------------------------------------------------------------
+
+
+def test_the_stall_window_is_not_the_old_420s():
+    from tpot2cti.chunked_publish import DEFAULT_STALL_S
+    assert DEFAULT_STALL_S >= 1800, (
+        "420s was shorter than measured healthy passes (3,627s observed). A "
+        "stall window below real pass timings guarantees false positives."
+    )
+
+
+def test_defaults_are_passed_through_to_the_waiter():
+    """A None must resolve to the module default, not to wait_for_work's."""
+    from tpot2cti.chunked_publish import (DEFAULT_CEILING_S, DEFAULT_STALL_S,
+                                          publish_pass_chunked)
+    seen = {}
+
+    def _spy(api_work, work_id, **kw):
+        seen.update(kw)
+        return WorkOutcome("w", "complete", [])
+
+    publish_pass_chunked(
+        helper=_Helper(), state=_State(), cycle_id="c", pass_name="p",
+        objects=_objs(3), work_id="w", wait_for_work=_spy)
+    assert seen.get("stall_s") == DEFAULT_STALL_S
+    assert seen.get("timeout_s") == DEFAULT_CEILING_S
+
+
+def test_the_stall_window_is_env_tunable():
+    """Operators must be able to retune this without a rebuild."""
+    import importlib
+    import os
+
+    import tpot2cti.chunked_publish as cp
+    old = os.environ.get("TPOT2CTI_PUBLISH_STALL_S")
+    os.environ["TPOT2CTI_PUBLISH_STALL_S"] = "2400"
+    try:
+        importlib.reload(cp)
+        assert cp.DEFAULT_STALL_S == 2400.0
+    finally:
+        if old is None:
+            os.environ.pop("TPOT2CTI_PUBLISH_STALL_S", None)
+        else:
+            os.environ["TPOT2CTI_PUBLISH_STALL_S"] = old
+        importlib.reload(cp)

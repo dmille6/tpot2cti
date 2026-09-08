@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import logging
 import uuid
@@ -101,9 +102,28 @@ def _error_signature(errors):
     return sig, "; ".join(parts[:3])[:800]
 
 
+#: How long a pass may make NO measurable progress before we call it stuck.
+#:
+#: This was 420s, which was never plausible on this platform. The cycle
+#: ledger records healthy passes from the serial era taking 3,627s and
+#: 3,550s with zero errors, and a work sitting in a deep queue can wait
+#: minutes before its FIRST message is consumed -- during which there is no
+#: progress to observe and nothing is wrong. 420s only avoided firing
+#: because a short queue meant works were served immediately.
+#:
+#: 1800s is deliberately generous: this measures the GAP BETWEEN progress
+#: increments, not total pass duration, so on a healthy platform it is never
+#: approached. Its job is to catch a genuine wedge, not to bound runtime --
+#: that is what the ceiling is for.
+DEFAULT_STALL_S = float(os.environ.get("TPOT2CTI_PUBLISH_STALL_S") or 1800.0)
+
+#: Hard backstop. Bounds a pass that trickles for ever without ever stalling.
+DEFAULT_CEILING_S = float(os.environ.get("TPOT2CTI_PUBLISH_CEILING_S") or 7200.0)
+
+
 def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
                          work_id, wait_for_work, chunks=DEFAULT_CHUNKS,
-                         timeout_s=7200.0, stall_s=420.0,
+                         timeout_s=None, stall_s=None,
                          quarantine_after=POISON_QUARANTINE_AFTER):
     """Enqueue one pass as chunks and wait for every one to finish.
 
@@ -164,8 +184,10 @@ def publish_pass_chunked(*, helper, state, cycle_id, pass_name, objects,
     # stall_s is the limit that matters; timeout_s is only a backstop.
     # See work_wait.wait_for_work -- a 900s wall-clock deadline killed a
     # perfectly healthy relationships pass at 6,896/11,760 with 0 errors.
-    outcome = wait_for_work(helper.api.work, work_id,
-                            timeout_s=timeout_s, stall_s=stall_s)
+    outcome = wait_for_work(
+        helper.api.work, work_id,
+        timeout_s=DEFAULT_CEILING_S if timeout_s is None else timeout_s,
+        stall_s=DEFAULT_STALL_S if stall_s is None else stall_s)
     for idx in range(len(parts)):
         state.mark_chunk_terminal(
             cycle_id, pass_name, idx,

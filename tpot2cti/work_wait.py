@@ -92,7 +92,7 @@ class WorkOutcome:
 
 
 def wait_for_work(api_work, work_id: str, *, timeout_s: float = 7200.0,
-                  stall_s: float = 420.0, poll_s: float = 2.0) -> WorkOutcome:
+                  stall_s: float = 1800.0, poll_s: float = 2.0) -> WorkOutcome:
     """Poll a work to a terminal state and report what it did.
 
     Two independent limits, because "slow" and "stuck" are different failures
