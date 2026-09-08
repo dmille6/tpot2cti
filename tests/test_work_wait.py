@@ -196,3 +196,105 @@ def test_a_polling_exception_does_not_count_as_a_stall():
                         poll_s=0.02)
     assert out.status == "complete"
     assert out.is_clean is True
+
+
+# ---------------------------------------------------------------------------
+# The platform we actually run against.
+#
+# Every test above hands the waiter an integer `import_processed_number`, so
+# the suite modelled a platform that reports progress. Ours does not: measured
+# across 15 consecutive works, `import_expected_number` was populated every
+# time and `import_processed_number` was null every time. The stall detector
+# read that null as "no progress", declared a stall at exactly `stall_s` on
+# every pass, and held the ingest cursor for five days across 219 identical
+# false failures.
+#
+# These tests fail against the pre-fix implementation, which is the only
+# reason to believe they are worth having.
+# ---------------------------------------------------------------------------
+
+
+class _NullProcessed:
+    """Expected is reported, processed never is. Completes eventually."""
+
+    def __init__(self, polls_before_complete):
+        self.n = 0
+        self.limit = polls_before_complete
+
+    def get_work(self, work_id=None):
+        self.n += 1
+        status = "complete" if self.n >= self.limit else "progress"
+        return {"status": status, "errors": [],
+                "tracking": {"import_expected_number": 10936,
+                             "import_processed_number": None}}
+
+
+class _NullProcessedForever:
+    """Never completes and never reports a count."""
+
+    def get_work(self, work_id=None):
+        return {"status": "progress", "errors": [],
+                "tracking": {"import_expected_number": 10936,
+                             "import_processed_number": None}}
+
+
+class _NullThenWedged:
+    """Reports null for a while, starts counting, then wedges."""
+
+    def __init__(self):
+        self.n = 0
+
+    def get_work(self, work_id=None):
+        self.n += 1
+        proc = None if self.n < 5 else 6896
+        return {"status": "progress", "errors": [],
+                "tracking": {"import_expected_number": 11760,
+                             "import_processed_number": proc}}
+
+
+def test_an_unreadable_count_is_not_a_stall():
+    """The production failure, exactly.
+
+    Elapsed deliberately exceeds stall_s many times over. The pre-fix code
+    returned timeout/stalled here, which is what held the cursor.
+    """
+    w = _NullProcessed(polls_before_complete=80)
+    out = wait_for_work(w, "nullproc", timeout_s=30, stall_s=0.05, poll_s=0.005)
+    assert out.status == STATUS_COMPLETE, (
+        "a null progress count is an unreadable signal, not a reading of "
+        "zero -- it must never be reported as a stall"
+    )
+    assert out.reason == "complete"
+    assert out.is_clean is True
+    assert out.progress_measurable is False
+    assert out.waited_s > 0.05, "it really did outlive the stall window"
+
+
+def test_an_unreadable_count_still_hits_the_ceiling():
+    """Suspending the stall rule must not remove every bound."""
+    out = wait_for_work(_NullProcessedForever(), "nullforever",
+                        timeout_s=0.15, stall_s=0.01, poll_s=0.005)
+    assert out.status == STATUS_TIMEOUT
+    assert out.reason == "ceiling", "bounded by the ceiling, not by a fake stall"
+    assert out.is_clean is False
+    assert out.progress_measurable is False
+
+
+def test_the_stall_rule_resumes_once_the_count_becomes_readable():
+    """Suspension is per-work and conditional, not a blanket disable."""
+    out = wait_for_work(_NullThenWedged(), "nullthenstuck",
+                        timeout_s=30, stall_s=0.05, poll_s=0.005)
+    assert out.status == STATUS_TIMEOUT
+    assert out.reason == "stalled", (
+        "once the platform starts counting, a wedged counter is a real stall "
+        "again -- the fix must not disable stall detection outright"
+    )
+    assert out.import_processed == 6896
+    assert out.progress_measurable is True
+    assert out.waited_s < 5, "gave up on the stall, not the ceiling"
+
+
+def test_is_clean_tolerates_an_unreadable_processed_count():
+    """A null count must not be compared against expected."""
+    out = WorkOutcome("w", STATUS_COMPLETE, [], 10936, None)
+    assert out.is_clean is True
