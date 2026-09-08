@@ -168,6 +168,23 @@ CREATE TABLE IF NOT EXISTS object_max_state (
     updated_at    TEXT NOT NULL
 );
 
+-- Immutable edges we have already published successfully.
+--
+-- `object_max_state` MERGES cross-cycle state; it does not SUPPRESS
+-- re-emission. So an edge like `IP belongs-to AS197015` -- which can never
+-- change, because a different AS would produce a different STIX id -- was
+-- republished in every cycle that IP recurred, for ever, as a no-op upsert.
+-- Measured on cycle 649: 35,836 objects published, 6,201 actually created.
+--
+-- Keyed on the exact STIX id, which is what makes this safe: if an address
+-- genuinely moves to another AS or country, the new edge has a DIFFERENT
+-- deterministic id and is not suppressed. We only ever skip a byte-identical
+-- restatement of something OpenCTI already accepted.
+CREATE TABLE IF NOT EXISTS immutable_emitted (
+    stix_id          TEXT PRIMARY KEY,
+    first_emitted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
 
@@ -922,6 +939,62 @@ class CycleState:
     # across cycles; need connector-side memory of the highest-signal
     # emission to preserve it through low-signal re-emissions).
     # ----------------------------------------------------------------------
+
+    def immutable_already_emitted(self, stix_ids: list[str]) -> set[str]:
+        """Which of these ids have we already published successfully?
+
+        Chunked for the same reason get_max_state_bulk is: an unchunked
+        ``IN (...)`` over a large bundle raises "too many SQL variables"
+        and stalls ingestion.
+        """
+        if not stix_ids:
+            return set()
+        found: set[str] = set()
+        with self._conn() as c:
+            for i in range(0, len(stix_ids), self._SQL_VAR_CHUNK):
+                part = stix_ids[i:i + self._SQL_VAR_CHUNK]
+                q = ("SELECT stix_id FROM immutable_emitted WHERE stix_id IN "
+                     "(" + ",".join("?" * len(part)) + ")")
+                found.update(r[0] for r in c.execute(q, part))
+        return found
+
+    def mark_immutable_emitted(self, stix_ids: list[str]) -> int:
+        """Record ids as published. ONLY call this for a fully-clean cycle.
+
+        Recording an id we did not actually land would suppress it for ever
+        -- the edge would exist in our ledger and nowhere else. That is why
+        the caller gates this on an error-free publish rather than on
+        "we tried".
+        """
+        if not stix_ids:
+            return 0
+        now = _utcnow_iso()
+        n = 0
+        with self._conn() as c:
+            for i in range(0, len(stix_ids), self._SQL_VAR_CHUNK):
+                part = stix_ids[i:i + self._SQL_VAR_CHUNK]
+                c.executemany(
+                    "INSERT OR IGNORE INTO immutable_emitted"
+                    "(stix_id, first_emitted_at) VALUES (?, ?)",
+                    [(sid, now) for sid in part])
+                n += len(part)
+        return n
+
+    def immutable_emitted_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
+
+    def clear_immutable_emitted(self) -> int:
+        """Escape hatch: forget everything, so the next cycle re-emits it all.
+
+        Needed if OpenCTI ever loses these edges (a restore from an older
+        snapshot, a retention pass, a manual delete). Without this the
+        ledger would keep asserting they exist.
+        """
+        with self._conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
+            c.execute("DELETE FROM immutable_emitted")
+            return n
 
     def get_max_state_bulk(
         self,
