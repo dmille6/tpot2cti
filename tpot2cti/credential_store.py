@@ -130,8 +130,10 @@ class CredentialStore:
         simply the wrong ones.
         """
         # The shared migration drives its own transaction (BEGIN IMMEDIATE),
-        # so it needs the raw connection rather than the committing
-        # contextmanager, which would nest transactions.
+        # so it takes the raw connection. What matters is that any PRECEDING
+        # transaction has completed — schema setup exits its `with self._conn()`
+        # block first. (An earlier version of this comment said the
+        # contextmanager itself issues BEGIN. It does not.)
         return normalise_timestamp_columns(
             self._conn_obj, self._TIMESTAMP_COLUMNS, self._SCHEMA_VERSION,
             label="credentials",

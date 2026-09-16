@@ -132,14 +132,26 @@ def normalise_timestamp_columns(
             if c.in_transaction:
                 c.execute("ROLLBACK")
             return 0
+        incomplete = False
         for table, cols in tables.items():
             try:
                 rows = c.execute(
                     f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
-            except sqlite3.OperationalError:
-                # Only "no such table" is an expected miss. Treating any
-                # sqlite error as an absent table would let an operational
-                # failure count as a successful migration.
+            except sqlite3.OperationalError as e:
+                # "no such table" is an expected miss — a schema version that
+                # simply lacks it. ANY OTHER operational failure means this
+                # table was not migrated, and stamping the version anyway
+                # would mark an incomplete migration permanently complete:
+                # the rows stay wrong and nothing ever retries them. Skip the
+                # table, remember, and leave the version alone so the next
+                # open tries again.
+                if "no such table" not in str(e).lower():
+                    logger.warning(
+                        f"{label}: could not read {table} during timestamp "
+                        f"normalisation ({e}); leaving schema version "
+                        f"unstamped so this retries on next open"
+                    )
+                    incomplete = True
                 continue
             for row in rows:
                 rowid, values = row[0], row[1:]
@@ -155,7 +167,8 @@ def normalise_timestamp_columns(
                         (*fixed, rowid),
                     )
                     changed += 1
-        c.execute(f"PRAGMA user_version = {schema_version}")
+        if not incomplete:
+            c.execute(f"PRAGMA user_version = {schema_version}")
         c.execute("COMMIT")
     except Exception:
         # SQLite may already have rolled back on the error; an unconditional
