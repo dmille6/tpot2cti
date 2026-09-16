@@ -859,3 +859,35 @@ def test_a_concurrent_write_is_not_clobbered_by_the_migration(tmp_path):
         ver = c.execute("PRAGMA user_version").fetchone()[0]
     assert still == "2026-09-16T10:30:00+02:00", "row changed despite the lock"
     assert ver == 0, "version was bumped without the migration committing"
+
+
+def test_one_unconvertible_row_does_not_brick_startup(tmp_path):
+    """The failure mode this nearly shipped: a stored timestamp that raises
+    OverflowError during UTC conversion escaped the migration and out of
+    CycleState.__init__, so the connector could never start again — on every
+    retry, forever, with no way out but hand-editing SQLite.
+
+    Found by codex on the fourth review round.
+    """
+    from tpot2cti.state import CycleState, _as_instant
+    assert _as_instant("0001-01-01T00:00:00+01:00") is None, \
+        "conversion overflow must yield None, not raise"
+
+    db = tmp_path / "state.db"
+    st = CycleState(db_path=db)
+    with st._conn() as c:
+        c.execute("INSERT INTO attacker_activity "
+                  "(src_ip, parser, sensor, first_seen, last_seen) "
+                  "VALUES ('203.0.113.7','Cowrie','s1',?,?)",
+                  ("0001-01-01T00:00:00+01:00", "2026-09-16T09:00:00+00:00"))
+        c.execute("PRAGMA user_version = 0")
+
+    reopened = CycleState(db_path=db)          # must not raise
+    with reopened._conn() as c:
+        first, last = c.execute(
+            "SELECT first_seen, last_seen FROM attacker_activity "
+            "WHERE src_ip='203.0.113.7'").fetchone()
+        ver = c.execute("PRAGMA user_version").fetchone()[0]
+    assert first == "0001-01-01T00:00:00+01:00", "the bad value was destroyed"
+    assert last == "2026-09-16T09:00:00+00:00", "the good value was not normalised"
+    assert ver == CycleState._SCHEMA_VERSION, "migration did not complete"

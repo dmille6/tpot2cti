@@ -268,9 +268,17 @@ def _as_instant(value):
         return None
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00").replace("z", "+00:00"))
-    except (TypeError, ValueError):
+        # astimezone() is part of the parse, not a safe tail call: a stored
+        # "0001-01-01T00:00:00+01:00" converts to a year-zero instant and
+        # raises OverflowError. Uncaught, that escaped _normalise_stored_
+        # timestamps and out of CycleState.__init__ — one unconvertible row
+        # in the database and the connector could never start again, on every
+        # retry, forever. Same guard _parse_timestamp already has; this is
+        # where it was missing.
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+            else dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 def _earlier(a, b):
@@ -400,7 +408,15 @@ class CycleState:
             c.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
             c.execute("COMMIT")
         except Exception:
-            c.execute("ROLLBACK")
+            # SQLite may already have rolled back on the error, and an
+            # unconditional ROLLBACK then raises "cannot rollback - no
+            # transaction is active", REPLACING the real failure as the
+            # exception that propagates.
+            if c.in_transaction:
+                try:
+                    c.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
             raise
         if changed:
             logger.info(
