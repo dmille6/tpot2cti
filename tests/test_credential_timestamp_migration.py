@@ -287,3 +287,27 @@ def test_the_filter_never_under_selects(tmp_path):
             f"{original!r} was left as {stored!r} — the filter under-selected"
         )
     c.close()
+
+
+def test_negative_rowids_are_migrated(tmp_path):
+    """SQLite rowids can be negative, and a -1 paging sentinel skipped them
+    while the migration stamped itself complete — so nothing ever revisited
+    them. Found by codex on the third review of #47."""
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns
+
+    db = tmp_path / "neg.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, first_seen TEXT, last_seen TEXT)")
+    for rid in (-500, -1, 0, 7):
+        c.execute("INSERT INTO t (id, first_seen, last_seen) VALUES (?, ?, ?)",
+                  (rid, "2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+
+    changed = normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+    assert changed == 4, f"only {changed} of 4 rows migrated — negative rowids skipped"
+
+    left = c.execute(
+        "SELECT COUNT(*) FROM t WHERE first_seen NOT LIKE '%+00:00'").fetchone()[0]
+    assert left == 0, f"{left} row(s) still legacy after a 'complete' migration"
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+    c.close()

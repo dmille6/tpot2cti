@@ -182,13 +182,22 @@ def normalise_timestamp_columns(
                 # rowid is stable under UPDATE, so paging and updating cannot
                 # interfere — which iterating one open cursor while updating
                 # its own table would.
-                last_rowid = -1
+                # last_rowid starts as None, not -1: SQLite rowids may be
+                # NEGATIVE (they can be assigned explicitly), and a -1
+                # sentinel silently skips every such row while the migration
+                # goes on to stamp itself complete — so nothing ever revisits
+                # them. The first page is therefore unbounded.
+                last_rowid = None
+                select = f"SELECT rowid, {', '.join(cols)} FROM {table} "
                 while True:
-                    batch = c.execute(
-                        f"SELECT rowid, {', '.join(cols)} FROM {table} "
-                        f"WHERE rowid > ? ORDER BY rowid LIMIT {_BATCH}",
-                        (last_rowid,),
-                    ).fetchall()
+                    if last_rowid is None:
+                        batch = c.execute(
+                            select + f"ORDER BY rowid LIMIT {_BATCH}").fetchall()
+                    else:
+                        batch = c.execute(
+                            select + f"WHERE rowid > ? ORDER BY rowid LIMIT {_BATCH}",
+                            (last_rowid,),
+                        ).fetchall()
                     if not batch:
                         break
                     last_rowid = batch[-1][0]
