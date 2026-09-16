@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from tpot2cti.timestamps import normalise_timestamp_columns
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +105,37 @@ class CredentialStore:
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_ip ON credential_usage(attacker_ip)"
             )
+        self._normalise_stored_timestamps()
+
+    #: Bumped when a migration must run once. PRAGMA user_version lives in the
+    #: DB header, so it survives restarts and every process that opens the
+    #: file sees it.
+    _SCHEMA_VERSION = 1
+
+    #: TEXT timestamp columns compared as strings in SQL. `for_ip` does
+    #: `MAX(u.last_seen)` and `ORDER BY last_seen DESC`, both of which are
+    #: lexicographic and so wrong across mixed offsets.
+    _TIMESTAMP_COLUMNS = {
+        "credential_pairs": ("first_seen", "last_seen"),
+        "credential_usage": ("first_seen", "last_seen"),
+    }
+
+    def _normalise_stored_timestamps(self) -> int:
+        """Rewrite persisted timestamps to UTC — see tpot2cti.timestamps.
+
+        This store has its OWN database, so CycleState's migration cannot
+        reach it. Without this, `for_ip`'s newest-first ordering returns a
+        legacy "10:30+02:00" (= 08:30Z) ahead of a genuinely newer
+        "09:00+00:00", and the "most recent credentials" an analyst reads are
+        simply the wrong ones.
+        """
+        # The shared migration drives its own transaction (BEGIN IMMEDIATE),
+        # so it needs the raw connection rather than the committing
+        # contextmanager, which would nest transactions.
+        return normalise_timestamp_columns(
+            self._conn_obj, self._TIMESTAMP_COLUMNS, self._SCHEMA_VERSION,
+            label="credentials",
+        )
 
     # ------------------------------------------------------------------
     # write path

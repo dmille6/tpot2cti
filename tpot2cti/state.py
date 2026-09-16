@@ -257,66 +257,10 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
 
 
 
-def _as_instant(value):
-    """Parse a stored timestamp for COMPARISON, or None if unusable.
-
-    Stored values are a mix: rows written before _parse_timestamp normalised
-    to UTC keep their source offset, newer ones are always +00:00. Only an
-    instant comparison is meaningful across that mix.
-    """
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00").replace("z", "+00:00"))
-        # astimezone() is part of the parse, not a safe tail call: a stored
-        # "0001-01-01T00:00:00+01:00" converts to a year-zero instant and
-        # raises OverflowError. Uncaught, that escaped _normalise_stored_
-        # timestamps and out of CycleState.__init__ — one unconvertible row
-        # in the database and the connector could never start again, on every
-        # retry, forever. Same guard _parse_timestamp already has; this is
-        # where it was missing.
-        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
-            else dt.astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
-def _earlier(a, b):
-    """The earlier of two stored timestamps, preserving the original string.
-
-    An absent or unparseable value never WINS: a NULL first_seen would
-    otherwise sort before every real timestamp and permanently pin the window
-    open. A malformed pair degrades to raw string comparison rather than
-    crashing the cycle that touched the row.
-    """
-    if not a:
-        return b
-    if not b:
-        return a
-    ia, ib = _as_instant(a), _as_instant(b)
-    if ia is None and ib is None:
-        return a if str(a) <= str(b) else b   # neither means anything; be stable
-    if ia is None:
-        return b                              # a valid bound always beats junk
-    if ib is None:
-        return a
-    return a if ia <= ib else b
-
-
-def _later(a, b):
-    """The later of two stored timestamps. Same null/unparseable rule."""
-    if not a:
-        return b
-    if not b:
-        return a
-    ia, ib = _as_instant(a), _as_instant(b)
-    if ia is None and ib is None:
-        return a if str(a) >= str(b) else b
-    if ia is None:
-        return b
-    if ib is None:
-        return a
-    return a if ia >= ib else b
+from tpot2cti.timestamps import as_instant as _as_instant  # noqa: E402
+from tpot2cti.timestamps import earlier as _earlier        # noqa: E402
+from tpot2cti.timestamps import later as _later            # noqa: E402
+from tpot2cti.timestamps import normalise_timestamp_columns  # noqa: E402
 
 
 class CycleState:
@@ -346,85 +290,9 @@ class CycleState:
     _SCHEMA_VERSION = 1
 
     def _normalise_stored_timestamps(self, c) -> int:
-        """Rewrite persisted timestamps to UTC, once, under an exclusive lock.
-
-        Fixing the MERGE was not enough. The comparisons that decide what an
-        analyst SEES happen in SQL, which compares TEXT and cannot call a
-        Python helper:
-
-            WHERE last_seen >= ? AND first_seen <= ?     window query
-            SELECT MIN(first_seen), MAX(last_seen)       campaign bounds
-            prev >= current_last_seen                    profile refresh
-
-        A legacy "10:30+02:00" (= 08:30Z) sorts after a new "09:00+00:00"
-        while being earlier, so a correctly-merged row could still be omitted
-        from a window it belongs in. Normalising the DATA makes lexicographic
-        order equal chronological order again and fixes every one of those
-        sites without touching them.
-
-        CONCURRENCY. Several containers open this file (core, credentials,
-        blocklists, noisefloor, backfill). The first version of this read the
-        whole table and then wrote row by row on an autocommit connection, so
-        a writer committing between the read and the write had its newer value
-        overwritten by this migration's stale snapshot — silent data loss,
-        reproduced on review. BEGIN IMMEDIATE takes the write lock BEFORE the
-        read, the version check happens under that lock, and the rewrite plus
-        the version bump commit together, so a second process either waits and
-        then sees the new version, or is excluded entirely.
-        """
-        if c.execute("PRAGMA user_version").fetchone()[0] >= self._SCHEMA_VERSION:
-            return 0
-        changed = 0
-        c.execute("BEGIN IMMEDIATE")
-        try:
-            # Re-check under the lock: another process may have migrated
-            # while we waited for it.
-            if c.execute("PRAGMA user_version").fetchone()[0] >= self._SCHEMA_VERSION:
-                c.execute("ROLLBACK")
-                return 0
-            for table, cols in self._TIMESTAMP_COLUMNS.items():
-                try:
-                    rows = c.execute(
-                        f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
-                except sqlite3.OperationalError:
-                    # Only "no such table" is an expected miss. Anything else
-                    # is an operational failure and must not be mistaken for
-                    # a table that simply is not in this schema version.
-                    continue
-                for row in rows:
-                    rowid, values = row[0], row[1:]
-                    fixed = [
-                        (_as_instant(v).isoformat() if _as_instant(v) is not None else v)
-                        for v in values
-                    ]
-                    if list(fixed) != list(values):
-                        c.execute(
-                            f"UPDATE {table} SET "
-                            + ", ".join(f"{col} = ?" for col in cols)
-                            + " WHERE rowid = ?",
-                            (*fixed, rowid),
-                        )
-                        changed += 1
-            c.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
-            c.execute("COMMIT")
-        except Exception:
-            # SQLite may already have rolled back on the error, and an
-            # unconditional ROLLBACK then raises "cannot rollback - no
-            # transaction is active", REPLACING the real failure as the
-            # exception that propagates.
-            if c.in_transaction:
-                try:
-                    c.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-            raise
-        if changed:
-            logger.info(
-                f"state: normalised persisted timestamps to UTC on {changed} "
-                f"row(s) — legacy offset-bearing values broke SQL text "
-                f"comparison (window queries, campaign bounds, profile refresh)"
-            )
-        return changed
+        """Delegates to the shared migration — see tpot2cti.timestamps."""
+        return normalise_timestamp_columns(
+            c, self._TIMESTAMP_COLUMNS, self._SCHEMA_VERSION, label="state")
 
     def _init_db(self) -> None:
         with self._conn() as c:
