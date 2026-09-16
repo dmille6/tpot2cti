@@ -32,6 +32,11 @@ from typing import Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+#: Rows held in memory at once while migrating. The live tables run to
+#: millions of rows; this is what keeps a one-time migration from
+#: allocating GBs of tuples under the write lock.
+_BATCH = 10_000
+
 
 def as_instant(value) -> Optional[datetime.datetime]:
     """Parse a stored timestamp for COMPARISON, or None if unusable.
@@ -159,42 +164,45 @@ def normalise_timestamp_columns(
         incomplete = False
         for table, cols in tables.items():
             try:
-                # Only CANDIDATE rows, and streamed rather than materialised.
+                # EXHAUSTIVE, in bounded batches.
                 #
-                # Measured on the live host 2026-09-16: credential_usage has
-                # 4,495,337 rows and credential_pairs 3,230,280, and ZERO of
-                # them are legacy — every value is already "+00:00". A
-                # fetchall() over 7.7M rows to discover there is nothing to do
-                # means GBs of Python tuples built while holding the write
-                # lock that the credentials writer needs.
+                # A WHERE filter selecting "obviously wrong" spellings lived
+                # here and UNDER-SELECTED: "09:00:00.1+00:00",
+                # "09:00:00,9+00:00" and "095900+00:00" all end "+00:00" with
+                # a "T" at position 11, pass any such heuristic, and are still
+                # not canonical — and "…,9+00:00" sorts BEFORE "….100000+00:00"
+                # while being later. A filter that misses a row is worse than
+                # no filter: the version gets stamped and nothing revisits it.
+                # Canonicality is decided by canonical(), which cannot be
+                # expressed in SQL, so every row must be offered to it.
                 #
-                # A value already ending in "+00:00" is already normalised, so
-                # anything else is the candidate set. That is sound rather
-                # than merely fast: a "Z" suffix, a non-UTC offset and a naive
-                # value all fail the test and get selected; and among values
-                # that all end in "+00:00", lexicographic order already equals
-                # chronological order, which is the property being restored.
-                # A cheap SUPERSET of the rows that need work, so the scan
-                # does not materialise 7.7M already-correct rows (measured
-                # live) to discover there is nothing to do. Canonical is
-                # T-separated and "+00:00"; anything failing either test is a
-                # candidate, and `canonical()` then decides for real. The
-                # filter may over-select, which costs nothing; it must never
-                # under-select, which is why BOTH properties are checked.
-                where = " OR ".join(
-                    f"({col} NOT LIKE '%+00:00' OR substr({col}, 11, 1) <> 'T')"
-                    for col in cols
-                )
-                # fetchall() on the CANDIDATE set, which is bounded and
-                # usually empty — not on the table. Iterating the cursor
-                # instead would be worse, not better: the loop below UPDATEs
-                # the same table it is reading, and SQLite does not define
-                # what an open SELECT cursor sees when its table is modified
-                # underneath it. Tried that first; it silently skipped the
-                # row it was supposed to fix.
-                rows = c.execute(
-                    f"SELECT rowid, {', '.join(cols)} FROM {table} "
-                    f"WHERE {where}").fetchall()
+                # What actually mattered was MEMORY: 7.7M credential rows
+                # measured live, fetchall()'d into Python tuples while holding
+                # the write lock. Paging by rowid bounds that to _BATCH rows.
+                # rowid is stable under UPDATE, so paging and updating cannot
+                # interfere — which iterating one open cursor while updating
+                # its own table would.
+                last_rowid = -1
+                while True:
+                    batch = c.execute(
+                        f"SELECT rowid, {', '.join(cols)} FROM {table} "
+                        f"WHERE rowid > ? ORDER BY rowid LIMIT {_BATCH}",
+                        (last_rowid,),
+                    ).fetchall()
+                    if not batch:
+                        break
+                    last_rowid = batch[-1][0]
+                    for row in batch:
+                        rowid, values = row[0], row[1:]
+                        fixed = [canonical(v) for v in values]
+                        if list(fixed) != list(values):
+                            c.execute(
+                                f"UPDATE {table} SET "
+                                + ", ".join(f"{col} = ?" for col in cols)
+                                + " WHERE rowid = ?",
+                                (*fixed, rowid),
+                            )
+                            changed += 1
             except sqlite3.OperationalError as e:
                 # "no such table" is an expected miss — a schema version that
                 # simply lacks it. ANY OTHER operational failure means this
@@ -211,19 +219,6 @@ def normalise_timestamp_columns(
                     )
                     incomplete = True
                 continue
-            for row in rows:
-                rowid, values = row[0], row[1:]
-                fixed = []
-                for v in values:
-                    fixed.append(canonical(v))
-                if list(fixed) != list(values):
-                    c.execute(
-                        f"UPDATE {table} SET "
-                        + ", ".join(f"{col} = ?" for col in cols)
-                        + " WHERE rowid = ?",
-                        (*fixed, rowid),
-                    )
-                    changed += 1
         if not incomplete:
             c.execute(f"PRAGMA user_version = {schema_version}")
         c.execute("COMMIT")

@@ -155,55 +155,60 @@ def test_an_unreadable_table_leaves_the_version_unstamped(tmp_path):
     c.close()
 
 
-def test_the_migration_only_reads_rows_that_need_changing(tmp_path):
-    """It must not materialise the whole table to find nothing to do.
+def test_the_migration_never_holds_more_than_a_batch_in_memory(tmp_path):
+    """Bounded memory, not fewer rows.
 
-    Live measurement 2026-09-16: 7.7M credential rows, ZERO of them legacy.
-    A fetchall() over all of them builds GBs of tuples while holding the write
-    lock the credentials writer needs.
-
-    Asserted by counting what the SELECT actually returns, not by timing.
+    This asserted the opposite until 2026-09-16: that a WHERE filter kept the
+    migration from reading already-correct rows. That filter UNDER-SELECTED
+    (see the canonicalisation test below), and a migration that misses a row
+    then stamps itself complete is worse than one that reads everything. The
+    real requirement was never "read less" — it was "do not materialise 7.7M
+    rows at once under the write lock".
     """
     import sqlite3
-    from tpot2cti.timestamps import normalise_timestamp_columns
+    from tpot2cti import timestamps as T
 
     db = tmp_path / "big.db"
     real = sqlite3.connect(db, isolation_level=None)
     real.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
     real.executemany("INSERT INTO t VALUES (?, ?)",
-                     [("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00")] * 500)
+                     [("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00")] * 250)
     real.execute("INSERT INTO t VALUES (?, ?)",
                  ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
 
-    seen = {"rows": 0}
+    seen = {"max_batch": 0, "total": 0}
 
     class Counting:
-        """Forwards to the real connection, counting rows the migration reads."""
         def __init__(self, conn): self._c = conn
         def execute(self, sql, *a):
             cur = self._c.execute(sql, *a)
             if sql.lstrip().upper().startswith("SELECT ROWID"):
                 rows = cur.fetchall()
-                seen["rows"] += len(rows)
+                seen["max_batch"] = max(seen["max_batch"], len(rows))
+                seen["total"] += len(rows)
 
-                class _Done:            # the migration calls .fetchall() on it
+                class _Done:
                     def fetchall(self_inner): return rows
                 return _Done()
             return cur
         @property
         def in_transaction(self): return self._c.in_transaction
 
-    changed = normalise_timestamp_columns(
-        Counting(real), {"t": ("first_seen", "last_seen")}, 1, label="t")
+    orig, T._BATCH = T._BATCH, 100
+    try:
+        changed = T.normalise_timestamp_columns(
+            Counting(real), {"t": ("first_seen", "last_seen")}, 1, label="t")
+    finally:
+        T._BATCH = orig
 
     assert changed == 1, f"the one legacy row should have been fixed, got {changed}"
-    assert seen["rows"] == 1, (
-        f"the migration read {seen['rows']} rows to fix 1 — it is scanning "
-        "every already-normalised row into memory"
+    assert seen["total"] == 251, (
+        f"read {seen['total']} of 251 rows — the scan is not exhaustive"
     )
-    fixed = real.execute(
-        "SELECT COUNT(*) FROM t WHERE first_seen LIKE '%+00:00'").fetchone()[0]
-    assert fixed == 501, "the legacy row was not normalised"
+    assert seen["max_batch"] <= 100, (
+        f"a single read pulled {seen['max_batch']} rows with _BATCH=100 — "
+        "memory is not bounded"
+    )
     real.close()
 
 
@@ -260,6 +265,15 @@ def test_the_filter_never_under_selects(tmp_path):
         "2026-09-16T09:00:00Z",          # Z suffix
         "2026-09-16T09:00:00z",          # lowercase z
         "2026-09-16T09:00:00",           # naive
+        # The five codex reproduced as slipping past the old WHERE filter:
+        # each ends "+00:00" with a "T" at position 11 and is still not
+        # canonical. "…,9+00:00" even sorts BEFORE "….100000+00:00" while
+        # being later.
+        "2026-09-16T09:00:00.1+00:00",
+        "2026-09-16T09:00:00.000000+00:00",
+        "2026-09-16T09:00:00,9+00:00",
+        "2026-09-16T095900+00:00",
+        "2026-09-16T09:00+00:00",
     ]
     for v in cases:
         c.execute("INSERT INTO t VALUES (?, ?)", (v, v))
