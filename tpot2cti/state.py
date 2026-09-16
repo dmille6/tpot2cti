@@ -286,8 +286,12 @@ def _earlier(a, b):
     if not b:
         return a
     ia, ib = _as_instant(a), _as_instant(b)
-    if ia is None or ib is None:
-        return a if str(a) <= str(b) else b
+    if ia is None and ib is None:
+        return a if str(a) <= str(b) else b   # neither means anything; be stable
+    if ia is None:
+        return b                              # a valid bound always beats junk
+    if ib is None:
+        return a
     return a if ia <= ib else b
 
 
@@ -298,8 +302,12 @@ def _later(a, b):
     if not b:
         return a
     ia, ib = _as_instant(a), _as_instant(b)
-    if ia is None or ib is None:
+    if ia is None and ib is None:
         return a if str(a) >= str(b) else b
+    if ia is None:
+        return b
+    if ib is None:
+        return a
     return a if ia >= ib else b
 
 
@@ -316,9 +324,69 @@ class CycleState:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    #: Tables whose TEXT timestamp columns are compared as strings in SQL.
+    #: Kept here rather than inline so adding a column is one edit, not a hunt.
+    _TIMESTAMP_COLUMNS = {
+        "attacker_activity": ("first_seen", "last_seen"),
+        "campaign_artifacts": ("first_seen", "last_seen"),
+        "attacker_profile_emit_log": ("last_seen_seen", "emitted_at"),
+    }
+
+    def _normalise_stored_timestamps(self, c) -> int:
+        """Rewrite persisted timestamps to UTC. Returns rows changed.
+
+        Fixing the MERGE was not enough. Rows written before
+        _parse_timestamp normalised keep their source offset, and the
+        comparisons that matter happen in SQL, which compares TEXT:
+
+            WHERE last_seen >= ? AND first_seen <= ?     (window query)
+            SELECT MIN(first_seen), MAX(last_seen)       (campaign bounds)
+            prev >= current_last_seen                    (profile refresh)
+
+        None of those can call a Python helper. A legacy "10:30+02:00"
+        (= 08:30Z) sorts after a new "09:00+00:00" while being earlier, so a
+        correctly-merged row could still be omitted from a window query it
+        belongs in, give wrong campaign extrema, or suppress a profile
+        refresh for genuinely newer activity. Reproduced on review of #45.
+
+        Normalising the DATA makes lexicographic order equal chronological
+        order again, so every one of those comparisons becomes correct
+        without touching them. Runs on open, idempotent, and skips rows it
+        cannot parse rather than destroying them.
+        """
+        changed = 0
+        for table, cols in self._TIMESTAMP_COLUMNS.items():
+            try:
+                rows = c.execute(
+                    f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
+            except sqlite3.Error:
+                continue        # table not present in this schema version
+            for row in rows:
+                rowid, values = row[0], row[1:]
+                fixed = []
+                for v in values:
+                    dt = _as_instant(v)
+                    fixed.append(dt.isoformat() if dt is not None else v)
+                if list(fixed) != list(values):
+                    c.execute(
+                        f"UPDATE {table} SET "
+                        + ", ".join(f"{col} = ?" for col in cols)
+                        + " WHERE rowid = ?",
+                        (*fixed, rowid),
+                    )
+                    changed += 1
+        if changed:
+            logger.info(
+                f"state: normalised persisted timestamps to UTC on {changed} "
+                f"row(s) — legacy offset-bearing values broke SQL text "
+                f"comparison (window queries, campaign bounds, profile refresh)"
+            )
+        return changed
+
     def _init_db(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._normalise_stored_timestamps(c)
         logger.debug(f"State DB initialized at {self.db_path}")
 
     @contextmanager

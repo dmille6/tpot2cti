@@ -616,12 +616,32 @@ def test_merging_across_the_offset_boundary_does_not_invert_the_window():
     assert last == fresh
 
 
-def test_a_malformed_stored_timestamp_degrades_instead_of_crashing():
-    """One bad row must not take down the cycle that touches it."""
+def test_a_malformed_stored_timestamp_never_beats_a_valid_one():
+    """One bad row must not take down the cycle — and must not WIN it either.
+
+    The first version of this asserted only `is not None`, which passes
+    whichever value wins and so asserted nothing. codex reproduced
+    `_later("not-a-date", valid) -> "not-a-date"` through an actual upsert.
+    Junk that wins a max() pins the bound to a string with no chronological
+    meaning, and every later comparison against it is arbitrary.
+    """
     from tpot2cti.state import _earlier, _later
-    assert _earlier("not-a-date", "2026-09-16T09:00:00+00:00") is not None
-    assert _later("not-a-date", "2026-09-16T09:00:00+00:00") is not None
-    assert _earlier(None, "2026-09-16T09:00:00+00:00") == "2026-09-16T09:00:00+00:00"
+    valid = "2026-09-16T09:00:00+00:00"
+
+    # Junk on BOTH sides of the sort order, on purpose. "not-a-date" sorts
+    # AFTER a 2026 timestamp, so a broken string-comparison implementation
+    # still returns the right answer for it and the assertion proves nothing
+    # — the mutation run caught exactly that. "!" sorts BEFORE, which is what
+    # discriminates.
+    for junk in ("not-a-date", "!", "0000-bad", "zzz"):
+        assert _earlier(junk, valid) == valid, f"_earlier lost to {junk!r}"
+        assert _earlier(valid, junk) == valid, f"_earlier lost to {junk!r}"
+        assert _later(junk, valid) == valid, f"_later lost to {junk!r}"
+        assert _later(valid, junk) == valid, f"_later lost to {junk!r}"
+
+    # two unparseable values: no chronological answer exists, just be stable
+    assert _earlier("x", "y") == "x"
+    assert _later("x", "y") == "y"
 
 
 def test_an_out_of_range_timestamp_returns_none_not_an_exception():
@@ -684,3 +704,86 @@ def test_the_real_merge_path_does_not_invert_an_upgraded_row(tmp_path):
     assert datetime.fromisoformat(first) <= datetime.fromisoformat(last), (
         f"stored window is inverted: first_seen={first} last_seen={last}"
     )
+
+
+# ── the queries, not just the merge ──────────────────────────────────────
+#
+# Fixing upsert_attacker_activity left the real exposure open: the
+# comparisons that decide what an analyst SEES happen in SQL, which compares
+# TEXT and cannot call a Python helper. A correctly-merged row whose
+# first_seen kept a legacy "+02:00" spelling is still omitted from a window
+# query it belongs in. codex reproduced exactly that. So the fix is to
+# normalise the DATA on open, which makes lexicographic order equal
+# chronological order again for every one of those call sites at once.
+
+def test_a_legacy_offset_row_is_found_by_the_window_query(tmp_path):
+    from datetime import datetime, timezone
+    from tpot2cti.state import CycleState
+    from tpot2cti.parsers.base import AttackSession, ParsedEvent
+
+    db = tmp_path / "state.db"
+    st = CycleState(db_path=db)
+
+    def sess(dt, ip="203.0.113.88"):
+        ev = ParsedEvent(src_ip=ip, timestamp=dt, sensor_hostname="s1",
+                         event_type="Cowrie", dst_port=22)
+        ev.meta = {}
+        s = AttackSession.from_event(ev)
+        s.first_seen = s.last_seen = dt
+        return s
+
+    st.upsert_attacker_activity(sess(datetime(2026, 9, 16, 8, 30, tzinfo=timezone.utc)))
+    # Rewrite to the PRE-normalisation spelling, as rows on disk still carry.
+    with st._conn() as c:
+        c.execute("UPDATE attacker_activity SET first_seen = ?, last_seen = ?",
+                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+
+    # Reopening runs the normalisation.
+    st2 = CycleState(db_path=db)
+    with st2._conn() as c:
+        first, last = c.execute(
+            "SELECT first_seen, last_seen FROM attacker_activity").fetchone()
+    assert first.endswith("+00:00"), f"not normalised: {first}"
+    assert datetime.fromisoformat(first) == datetime(
+        2026, 9, 16, 8, 30, tzinfo=timezone.utc), "normalisation moved the instant"
+
+    # And the text-comparison window query now finds it.
+    with st2._conn() as c:
+        hit = c.execute(
+            "SELECT COUNT(*) FROM attacker_activity "
+            "WHERE last_seen >= ? AND first_seen <= ?",
+            ("2026-09-16T08:00:00+00:00", "2026-09-16T09:30:00+00:00"),
+        ).fetchone()[0]
+    assert hit == 1, (
+        "the attacker is inside 08:00Z–09:30Z but the text window query "
+        "missed it — legacy offset spelling still breaks SQL comparison"
+    )
+
+
+def test_normalisation_is_idempotent_and_spares_unparseable_rows(tmp_path):
+    """Running it twice must not drift, and a junk row must survive rather
+    than be destroyed by a migration it cannot satisfy."""
+    from tpot2cti.state import CycleState
+    from tpot2cti.parsers.base import AttackSession, ParsedEvent
+    from datetime import datetime, timezone
+
+    db = tmp_path / "state.db"
+    st = CycleState(db_path=db)
+    ev = ParsedEvent(src_ip="203.0.113.99", timestamp=datetime(2026, 9, 16, 8, tzinfo=timezone.utc),
+                     sensor_hostname="s1", event_type="Cowrie", dst_port=22)
+    ev.meta = {}
+    s = AttackSession.from_event(ev)
+    s.first_seen = s.last_seen = ev.timestamp
+    st.upsert_attacker_activity(s)
+    with st._conn() as c:
+        c.execute("UPDATE attacker_activity SET first_seen = ?", ("not-a-date",))
+
+    once = CycleState(db_path=db)
+    with once._conn() as c:
+        a = c.execute("SELECT first_seen, last_seen FROM attacker_activity").fetchone()
+    twice = CycleState(db_path=db)
+    with twice._conn() as c:
+        b = c.execute("SELECT first_seen, last_seen FROM attacker_activity").fetchone()
+
+    assert a == b, "normalisation is not idempotent"
+    assert a[0] == "not-a-date", "an unparseable value was destroyed, not skipped"
