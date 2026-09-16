@@ -256,6 +256,13 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
 """
 
 
+
+from tpot2cti.timestamps import as_instant as _as_instant  # noqa: E402
+from tpot2cti.timestamps import earlier as _earlier        # noqa: E402
+from tpot2cti.timestamps import later as _later            # noqa: E402
+from tpot2cti.timestamps import normalise_timestamp_columns  # noqa: E402
+
+
 class CycleState:
     """SQLite-backed state for the importer cycle loop."""
 
@@ -269,9 +276,28 @@ class CycleState:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    #: Tables whose TEXT timestamp columns are compared as strings in SQL.
+    #: Kept here rather than inline so adding a column is one edit, not a hunt.
+    _TIMESTAMP_COLUMNS = {
+        "attacker_activity": ("first_seen", "last_seen"),
+        "campaign_artifacts": ("first_seen", "last_seen"),
+        "attacker_profile_emit_log": ("last_seen_seen", "emitted_at"),
+    }
+
+    #: Bumped when a migration below must run once. PRAGMA user_version is
+    #: stored in the DB header, so it survives restarts and is visible to
+    #: every process that opens the file.
+    _SCHEMA_VERSION = 1
+
+    def _normalise_stored_timestamps(self, c) -> int:
+        """Delegates to the shared migration — see tpot2cti.timestamps."""
+        return normalise_timestamp_columns(
+            c, self._TIMESTAMP_COLUMNS, self._SCHEMA_VERSION, label="state")
+
     def _init_db(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._normalise_stored_timestamps(c)
         logger.debug(f"State DB initialized at {self.db_path}")
 
     @contextmanager
@@ -1166,8 +1192,15 @@ class CycleState:
                 self._decode_json_list(old_ports), dst_ports_add,
             )
 
-            new_first = old_first_seen if old_first_seen <= first_seen else first_seen
-            new_last = old_last_seen if old_last_seen >= last_seen else last_seen
+            # Compared as INSTANTS, not as strings. Rows written before
+            # _parse_timestamp normalised to UTC carry their source offset, so
+            # a stored "10:30+02:00" (= 08:30Z) sorts AFTER a new "09:00+00:00"
+            # (= 09:00Z) lexicographically while being half an hour earlier.
+            # String min()/max() across that boundary returns first_seen LATER
+            # than last_seen -- an inverted window, on rows that were correct
+            # before the upgrade. Reproduced on review of #45.
+            new_first = _earlier(old_first_seen, first_seen)
+            new_last = _later(old_last_seen, last_seen)
 
             c.execute(
                 "UPDATE attacker_activity SET "
