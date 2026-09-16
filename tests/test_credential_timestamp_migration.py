@@ -38,7 +38,7 @@ def test_newest_first_ordering_survives_a_legacy_offset_row(tmp_path):
         c.execute("UPDATE credential_usage SET first_seen = ?, last_seen = ? "
                   "WHERE credential_id IN (SELECT credential_id FROM "
                   "credential_pairs WHERE username = 'older')",
-                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+                  ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
         c.execute("PRAGMA user_version = 0")
     store.close()
 
@@ -89,7 +89,7 @@ def test_the_pairs_table_is_migrated_too(tmp_path):
     _seed(store, "u", datetime(2026, 9, 16, 8, 30, tzinfo=timezone.utc))
     with store._conn() as c:
         c.execute("UPDATE credential_pairs SET first_seen = ?, last_seen = ?",
-                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+                  ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
         c.execute("PRAGMA user_version = 0")
     store.close()
 
@@ -117,7 +117,7 @@ def test_an_unreadable_table_leaves_the_version_unstamped(tmp_path):
     c = sqlite3.connect(db, isolation_level=None)
     c.execute("CREATE TABLE present (first_seen TEXT, last_seen TEXT)")
     c.execute("INSERT INTO present VALUES (?, ?)",
-              ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+              ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
 
     # The table must EXIST for this to be a genuine operational failure —
     # a missing table raises "no such table", which is an expected miss and
@@ -152,4 +152,162 @@ def test_an_unreadable_table_leaves_the_version_unstamped(tmp_path):
         "re-scan forever"
     )
     d.close()
+    c.close()
+
+
+def test_the_migration_never_holds_more_than_a_batch_in_memory(tmp_path):
+    """Bounded memory, not fewer rows.
+
+    This asserted the opposite until 2026-09-16: that a WHERE filter kept the
+    migration from reading already-correct rows. That filter UNDER-SELECTED
+    (see the canonicalisation test below), and a migration that misses a row
+    then stamps itself complete is worse than one that reads everything. The
+    real requirement was never "read less" — it was "do not materialise 7.7M
+    rows at once under the write lock".
+    """
+    import sqlite3
+    from tpot2cti import timestamps as T
+
+    db = tmp_path / "big.db"
+    real = sqlite3.connect(db, isolation_level=None)
+    real.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    real.executemany("INSERT INTO t VALUES (?, ?)",
+                     [("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00")] * 250)
+    real.execute("INSERT INTO t VALUES (?, ?)",
+                 ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+
+    seen = {"max_batch": 0, "total": 0}
+
+    class Counting:
+        def __init__(self, conn): self._c = conn
+        def execute(self, sql, *a):
+            cur = self._c.execute(sql, *a)
+            if sql.lstrip().upper().startswith("SELECT ROWID"):
+                rows = cur.fetchall()
+                seen["max_batch"] = max(seen["max_batch"], len(rows))
+                seen["total"] += len(rows)
+
+                class _Done:
+                    def fetchall(self_inner): return rows
+                return _Done()
+            return cur
+        @property
+        def in_transaction(self): return self._c.in_transaction
+
+    orig, T._BATCH = T._BATCH, 100
+    try:
+        changed = T.normalise_timestamp_columns(
+            Counting(real), {"t": ("first_seen", "last_seen")}, 1, label="t")
+    finally:
+        T._BATCH = orig
+
+    assert changed == 1, f"the one legacy row should have been fixed, got {changed}"
+    assert seen["total"] == 251, (
+        f"read {seen['total']} of 251 rows — the scan is not exhaustive"
+    )
+    assert seen["max_batch"] <= 100, (
+        f"a single read pulled {seen['max_batch']} rows with _BATCH=100 — "
+        "memory is not bounded"
+    )
+    real.close()
+
+
+def test_migration_canonicalises_the_separator(tmp_path):
+    """Everything ends up in the spelling future writes will use.
+
+    All production writers call isoformat() (T-separated). A space-separated
+    row — which sqlite3's adapter produces if anything ever bypasses those
+    writers — must be rewritten to "T", not preserved: space is chr(32) and
+    "T" is chr(84), so a preserved space sorts before every future write
+    regardless of instant.
+
+    An earlier version of this test asserted the opposite, from a fixture that
+    bypassed the public API and so measured the adapter rather than the code.
+    """
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns
+
+    db = tmp_path / "sep.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    c.execute("INSERT INTO t VALUES (?, ?)",            # canonical already
+              ("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00"))
+    c.execute("INSERT INTO t VALUES (?, ?)",            # space + legacy offset
+              ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+    c.execute("INSERT INTO t VALUES (?, ?)",            # space, already UTC
+              ("2026-09-16 07:00:00+00:00", "2026-09-16 07:00:00+00:00"))
+
+    normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+
+    rows = [r[0] for r in c.execute("SELECT last_seen FROM t ORDER BY last_seen")]
+    assert all(r[10] == "T" for r in rows), f"not canonicalised: {rows}"
+    assert rows == sorted(rows), "guard"
+    assert rows[0].startswith("2026-09-16T07:00:00"), rows
+    assert rows[-1].startswith("2026-09-16T09:00:00"), (
+        f"ordering is wrong after migration: {rows}"
+    )
+    c.close()
+
+
+def test_the_filter_never_under_selects(tmp_path):
+    """The SQL filter is an optimisation; missing a row that needs work would
+    stamp the version and leave it permanently wrong."""
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns, canonical
+
+    db = tmp_path / "f.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    cases = [
+        "2026-09-16 09:00:00+00:00",     # space separator, UTC
+        "2026-09-16T09:00:00+02:00",     # T, non-UTC
+        "2026-09-16 09:00:00+02:00",     # space, non-UTC
+        "2026-09-16T09:00:00Z",          # Z suffix
+        "2026-09-16T09:00:00z",          # lowercase z
+        "2026-09-16T09:00:00",           # naive
+        # The five codex reproduced as slipping past the old WHERE filter:
+        # each ends "+00:00" with a "T" at position 11 and is still not
+        # canonical. "…,9+00:00" even sorts BEFORE "….100000+00:00" while
+        # being later.
+        "2026-09-16T09:00:00.1+00:00",
+        "2026-09-16T09:00:00.000000+00:00",
+        "2026-09-16T09:00:00,9+00:00",
+        "2026-09-16T095900+00:00",
+        "2026-09-16T09:00+00:00",
+    ]
+    for v in cases:
+        c.execute("INSERT INTO t VALUES (?, ?)", (v, v))
+
+    normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+
+    for stored, original in zip(
+        [r[0] for r in c.execute("SELECT first_seen FROM t")], cases
+    ):
+        assert stored == canonical(original), (
+            f"{original!r} was left as {stored!r} — the filter under-selected"
+        )
+    c.close()
+
+
+def test_negative_rowids_are_migrated(tmp_path):
+    """SQLite rowids can be negative, and a -1 paging sentinel skipped them
+    while the migration stamped itself complete — so nothing ever revisited
+    them. Found by codex on the third review of #47."""
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns
+
+    db = tmp_path / "neg.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, first_seen TEXT, last_seen TEXT)")
+    for rid in (-500, -1, 0, 7):
+        c.execute("INSERT INTO t (id, first_seen, last_seen) VALUES (?, ?, ?)",
+                  (rid, "2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+
+    changed = normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+    assert changed == 4, f"only {changed} of 4 rows migrated — negative rowids skipped"
+
+    left = c.execute(
+        "SELECT COUNT(*) FROM t WHERE first_seen NOT LIKE '%+00:00'").fetchone()[0]
+    assert left == 0, f"{left} row(s) still legacy after a 'complete' migration"
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 1
     c.close()
