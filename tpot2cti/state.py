@@ -332,49 +332,76 @@ class CycleState:
         "attacker_profile_emit_log": ("last_seen_seen", "emitted_at"),
     }
 
+    #: Bumped when a migration below must run once. PRAGMA user_version is
+    #: stored in the DB header, so it survives restarts and is visible to
+    #: every process that opens the file.
+    _SCHEMA_VERSION = 1
+
     def _normalise_stored_timestamps(self, c) -> int:
-        """Rewrite persisted timestamps to UTC. Returns rows changed.
+        """Rewrite persisted timestamps to UTC, once, under an exclusive lock.
 
-        Fixing the MERGE was not enough. Rows written before
-        _parse_timestamp normalised keep their source offset, and the
-        comparisons that matter happen in SQL, which compares TEXT:
+        Fixing the MERGE was not enough. The comparisons that decide what an
+        analyst SEES happen in SQL, which compares TEXT and cannot call a
+        Python helper:
 
-            WHERE last_seen >= ? AND first_seen <= ?     (window query)
-            SELECT MIN(first_seen), MAX(last_seen)       (campaign bounds)
-            prev >= current_last_seen                    (profile refresh)
+            WHERE last_seen >= ? AND first_seen <= ?     window query
+            SELECT MIN(first_seen), MAX(last_seen)       campaign bounds
+            prev >= current_last_seen                    profile refresh
 
-        None of those can call a Python helper. A legacy "10:30+02:00"
-        (= 08:30Z) sorts after a new "09:00+00:00" while being earlier, so a
-        correctly-merged row could still be omitted from a window query it
-        belongs in, give wrong campaign extrema, or suppress a profile
-        refresh for genuinely newer activity. Reproduced on review of #45.
+        A legacy "10:30+02:00" (= 08:30Z) sorts after a new "09:00+00:00"
+        while being earlier, so a correctly-merged row could still be omitted
+        from a window it belongs in. Normalising the DATA makes lexicographic
+        order equal chronological order again and fixes every one of those
+        sites without touching them.
 
-        Normalising the DATA makes lexicographic order equal chronological
-        order again, so every one of those comparisons becomes correct
-        without touching them. Runs on open, idempotent, and skips rows it
-        cannot parse rather than destroying them.
+        CONCURRENCY. Several containers open this file (core, credentials,
+        blocklists, noisefloor, backfill). The first version of this read the
+        whole table and then wrote row by row on an autocommit connection, so
+        a writer committing between the read and the write had its newer value
+        overwritten by this migration's stale snapshot — silent data loss,
+        reproduced on review. BEGIN IMMEDIATE takes the write lock BEFORE the
+        read, the version check happens under that lock, and the rewrite plus
+        the version bump commit together, so a second process either waits and
+        then sees the new version, or is excluded entirely.
         """
+        if c.execute("PRAGMA user_version").fetchone()[0] >= self._SCHEMA_VERSION:
+            return 0
         changed = 0
-        for table, cols in self._TIMESTAMP_COLUMNS.items():
-            try:
-                rows = c.execute(
-                    f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
-            except sqlite3.Error:
-                continue        # table not present in this schema version
-            for row in rows:
-                rowid, values = row[0], row[1:]
-                fixed = []
-                for v in values:
-                    dt = _as_instant(v)
-                    fixed.append(dt.isoformat() if dt is not None else v)
-                if list(fixed) != list(values):
-                    c.execute(
-                        f"UPDATE {table} SET "
-                        + ", ".join(f"{col} = ?" for col in cols)
-                        + " WHERE rowid = ?",
-                        (*fixed, rowid),
-                    )
-                    changed += 1
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-check under the lock: another process may have migrated
+            # while we waited for it.
+            if c.execute("PRAGMA user_version").fetchone()[0] >= self._SCHEMA_VERSION:
+                c.execute("ROLLBACK")
+                return 0
+            for table, cols in self._TIMESTAMP_COLUMNS.items():
+                try:
+                    rows = c.execute(
+                        f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
+                except sqlite3.OperationalError:
+                    # Only "no such table" is an expected miss. Anything else
+                    # is an operational failure and must not be mistaken for
+                    # a table that simply is not in this schema version.
+                    continue
+                for row in rows:
+                    rowid, values = row[0], row[1:]
+                    fixed = [
+                        (_as_instant(v).isoformat() if _as_instant(v) is not None else v)
+                        for v in values
+                    ]
+                    if list(fixed) != list(values):
+                        c.execute(
+                            f"UPDATE {table} SET "
+                            + ", ".join(f"{col} = ?" for col in cols)
+                            + " WHERE rowid = ?",
+                            (*fixed, rowid),
+                        )
+                        changed += 1
+            c.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
         if changed:
             logger.info(
                 f"state: normalised persisted timestamps to UTC on {changed} "

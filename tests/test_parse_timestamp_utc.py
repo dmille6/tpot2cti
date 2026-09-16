@@ -733,10 +733,15 @@ def test_a_legacy_offset_row_is_found_by_the_window_query(tmp_path):
         return s
 
     st.upsert_attacker_activity(sess(datetime(2026, 9, 16, 8, 30, tzinfo=timezone.utc)))
-    # Rewrite to the PRE-normalisation spelling, as rows on disk still carry.
+    # Rewrite to the PRE-normalisation spelling AND reset the schema version,
+    # so this is a database from before the migration existed. The migration
+    # is one-time by design (gated on PRAGMA user_version); a fixture that
+    # relied on it re-running every open would be testing something the
+    # production path never does.
     with st._conn() as c:
         c.execute("UPDATE attacker_activity SET first_seen = ?, last_seen = ?",
                   ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+        c.execute("PRAGMA user_version = 0")
 
     # Reopening runs the normalisation.
     st2 = CycleState(db_path=db)
@@ -777,6 +782,7 @@ def test_normalisation_is_idempotent_and_spares_unparseable_rows(tmp_path):
     st.upsert_attacker_activity(s)
     with st._conn() as c:
         c.execute("UPDATE attacker_activity SET first_seen = ?", ("not-a-date",))
+        c.execute("PRAGMA user_version = 0")
 
     once = CycleState(db_path=db)
     with once._conn() as c:
@@ -787,3 +793,69 @@ def test_normalisation_is_idempotent_and_spares_unparseable_rows(tmp_path):
 
     assert a == b, "normalisation is not idempotent"
     assert a[0] == "not-a-date", "an unparseable value was destroyed, not skipped"
+
+
+def test_the_migration_runs_once_and_is_version_gated(tmp_path):
+    """It must not rescan every table on every open.
+
+    Several containers open this file; a full scan per open is both wasted
+    work and a window for the concurrent-clobber this migration was rewritten
+    to avoid.
+    """
+    from tpot2cti.state import CycleState
+    db = tmp_path / "state.db"
+    st = CycleState(db_path=db)
+    with st._conn() as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == \
+            CycleState._SCHEMA_VERSION, "version not stamped on first open"
+
+    # A legacy value written AFTER the migration ran is left alone — the real
+    # path cannot produce one, because the parser normalises at the source.
+    with st._conn() as c:
+        c.execute("INSERT INTO attacker_activity "
+                  "(src_ip, parser, sensor, first_seen, last_seen) "
+                  "VALUES ('203.0.113.5','Cowrie','s1',?,?)",
+                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+    CycleState(db_path=db)
+    with st._conn() as c:
+        got = c.execute("SELECT first_seen FROM attacker_activity "
+                        "WHERE src_ip='203.0.113.5'").fetchone()[0]
+    assert got == "2026-09-16T10:30:00+02:00", (
+        "the migration re-ran on an already-migrated database"
+    )
+
+
+def test_a_concurrent_write_is_not_clobbered_by_the_migration(tmp_path):
+    """The first version read the whole table, then wrote row-by-row on an
+    autocommit connection — a writer committing in between had its newer
+    value overwritten by the migration's stale snapshot. Reproduced by codex.
+
+    BEGIN IMMEDIATE takes the write lock before the read, so the other writer
+    is excluded rather than raced.
+    """
+    import sqlite3
+    from tpot2cti.state import CycleState
+    db = tmp_path / "state.db"
+    st = CycleState(db_path=db)
+    with st._conn() as c:
+        c.execute("INSERT INTO attacker_activity "
+                  "(src_ip, parser, sensor, first_seen, last_seen) "
+                  "VALUES ('203.0.113.6','Cowrie','s1',?,?)",
+                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+        c.execute("PRAGMA user_version = 0")
+
+    other = sqlite3.connect(db, isolation_level=None, timeout=1)
+    other.execute("BEGIN IMMEDIATE")          # hold the write lock
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            CycleState(db_path=db)            # must block then fail, not clobber
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+
+    with st._conn() as c:
+        still = c.execute("SELECT first_seen FROM attacker_activity "
+                          "WHERE src_ip='203.0.113.6'").fetchone()[0]
+        ver = c.execute("PRAGMA user_version").fetchone()[0]
+    assert still == "2026-09-16T10:30:00+02:00", "row changed despite the lock"
+    assert ver == 0, "version was bumped without the migration committing"
