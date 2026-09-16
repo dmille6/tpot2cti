@@ -327,8 +327,16 @@ class BaseParser:
             except (TypeError, ValueError) as e:
                 logger.debug(f"unparseable @timestamp {ts!r}: {e}")
                 return None
-        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
-            else dt.astimezone(timezone.utc)
+        try:
+            # astimezone() is part of the parse, not a safe tail call:
+            # "0001-01-01T00:00:00+01:00" converts to a year-zero instant and
+            # raises OverflowError. Outside the guard that escapes as an
+            # exception from a method whose contract is "a datetime or None".
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+                else dt.astimezone(timezone.utc)
+        except (OverflowError, OSError, ValueError) as e:
+            logger.debug(f"un-normalisable @timestamp {ts!r}: {e}")
+            return None
 
     @staticmethod
     def _populate_geoip(doc: dict, event: ParsedEvent) -> None:

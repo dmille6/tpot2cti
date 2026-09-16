@@ -225,8 +225,11 @@ class SuricataParser(BaseParser):
         `_parse_timestamp`). It used to read `doc["@timestamp"]` raw, which
         made the id a function of how the sensor SPELLED the instant rather
         than of the instant: the same alert written "…T09:00:00Z" and
-        "…T11:00:00+02:00" produced two different session ids, and the
-        Sighting id downstream is derived from that. Falls back to the raw
+        "…T11:00:00+02:00" produced two different session ids. That drives
+        distinct-session accounting (and so fallback Sighting counts) and any
+        session Note built from these sessions -- NOT the Sighting id itself,
+        which comes from (sensor, target, day). An earlier version of this
+        comment claimed otherwise. Falls back to the raw
         value only when the caller passes nothing.
         """
         flow = doc.get("flow_id") or "noflow"

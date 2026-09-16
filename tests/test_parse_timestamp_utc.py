@@ -537,3 +537,150 @@ def test_a_relationship_publishes_the_normalised_time_not_the_raw_one(builder):
         "spellings on the published graph"
     )
     assert rel2["stop_time"] == rel["stop_time"]
+
+
+# ── the Suricata session id, which this PR changed but did not pin ────────
+#
+# `_session_id_for` used to interpolate the RAW `@timestamp` string, making
+# the id a function of how a sensor SPELLED an instant rather than of the
+# instant. This PR passes the normalised timestamp instead. Nothing asserted
+# it: blanking the normalised value in `_session_id_for` failed zero tests,
+# so the fix would have regressed in silence.
+#
+# CORRECTION: an earlier version of this comment, and the PR's own comment in
+# suricata.py, said the Sighting id derives from the session id. It does not.
+# Sighting ids come from (sensor, target, day, discriminator) -- checked on
+# main, flagged by codex. What the session id actually drives is distinct-
+# session accounting (hence fallback Sighting counts) and any session Note
+# built from these sessions. Still worth pinning, just not for the stated
+# reason; overstating the blast radius is the same habit as understating it.
+
+def test_one_instant_spelled_two_ways_is_one_suricata_session():
+    from tpot2cti.parsers.base import BaseParser
+    from tpot2cti.parsers.suricata import SuricataParser
+
+    def doc(ts):
+        return {"@timestamp": ts, "src_ip": "203.0.113.1", "dest_ip": "10.0.0.1",
+                "src_port": 4444, "dest_port": 80,
+                "alert": {"signature_id": 2001}, "flow_id": 12345}
+
+    z, off = doc("2026-09-16T09:00:00Z"), doc("2026-09-16T11:00:00+02:00")
+    t_z = BaseParser._parse_timestamp(z)
+    t_off = BaseParser._parse_timestamp(off)
+    assert t_z == t_off, "guard: the fixture must be ONE instant, two spellings"
+
+    assert SuricataParser._session_id_for(z, t_z) == \
+        SuricataParser._session_id_for(off, t_off), (
+        "the same alert at the same instant produced two session ids because "
+        "the sensors spelled the timestamp differently"
+    )
+
+
+def test_different_instants_still_get_different_suricata_sessions():
+    """Positive control — collapsing everything would also pass the above."""
+    from tpot2cti.parsers.base import BaseParser
+    from tpot2cti.parsers.suricata import SuricataParser
+
+    def doc(ts):
+        return {"@timestamp": ts, "src_ip": "203.0.113.1", "dest_ip": "10.0.0.1",
+                "src_port": 4444, "dest_port": 80,
+                "alert": {"signature_id": 2001}, "flow_id": 12345}
+
+    a, b = doc("2026-09-16T09:00:00Z"), doc("2026-09-16T09:00:01Z")
+    assert SuricataParser._session_id_for(a, BaseParser._parse_timestamp(a)) != \
+        SuricataParser._session_id_for(b, BaseParser._parse_timestamp(b))
+
+
+# ── the upgrade path: rows written BEFORE normalisation ──────────────────
+#
+# Normalising new writes to UTC is right, but the SQLite rows already on disk
+# carry whatever offset their source used. state.py merged activity bounds by
+# STRING comparison, so a stored "10:30+02:00" (= 08:30Z) sorts after a new
+# "09:00+00:00" (= 09:00Z) while being earlier. The merge then stores
+# first_seen LATER than last_seen -- corrupting rows that were correct before
+# the upgrade. Reproduced by codex on review of #45.
+
+def test_merging_across_the_offset_boundary_does_not_invert_the_window():
+    from datetime import datetime
+    from tpot2cti.state import _earlier, _later
+
+    stored = "2026-09-16T10:30:00+02:00"   # 08:30Z, written pre-normalisation
+    fresh = "2026-09-16T09:00:00+00:00"    # 09:00Z, written post-normalisation
+    assert stored > fresh, "guard: the fixture must disagree lexicographically"
+
+    first, last = _earlier(stored, fresh), _later(stored, fresh)
+    assert datetime.fromisoformat(first) <= datetime.fromisoformat(last), (
+        f"first_seen {first} is AFTER last_seen {last} — an inverted window"
+    )
+    assert first == stored, "the earlier instant is the +02:00 row"
+    assert last == fresh
+
+
+def test_a_malformed_stored_timestamp_degrades_instead_of_crashing():
+    """One bad row must not take down the cycle that touches it."""
+    from tpot2cti.state import _earlier, _later
+    assert _earlier("not-a-date", "2026-09-16T09:00:00+00:00") is not None
+    assert _later("not-a-date", "2026-09-16T09:00:00+00:00") is not None
+    assert _earlier(None, "2026-09-16T09:00:00+00:00") == "2026-09-16T09:00:00+00:00"
+
+
+def test_an_out_of_range_timestamp_returns_none_not_an_exception():
+    """astimezone() raises OverflowError near the datetime boundary, and the
+    contract here is 'a datetime or None'."""
+    from tpot2cti.parsers.base import BaseParser
+    assert BaseParser._parse_timestamp(
+        {"@timestamp": "0001-01-01T00:00:00+01:00"}) is None
+    assert BaseParser._parse_timestamp({"@timestamp": "garbage"}) is None
+    assert BaseParser._parse_timestamp({"@timestamp": ""}) is None
+
+
+def test_a_null_bound_never_wins_the_comparison():
+    """A NULL first_seen sorts before every real timestamp, which would pin
+    the activity window open forever if it were allowed to win."""
+    from tpot2cti.state import _earlier, _later
+    real = "2026-09-16T09:00:00+00:00"
+    assert _earlier(None, real) == real
+    assert _earlier(real, None) == real
+    assert _later(None, real) == real
+    assert _later("", real) == real
+
+
+def test_the_real_merge_path_does_not_invert_an_upgraded_row(tmp_path):
+    """Exercises upsert_attacker_activity, not just the helpers.
+
+    Testing `_earlier`/`_later` alone proved nothing about the call site:
+    reverting state.py's merge to the old string comparison failed ZERO tests
+    until this one existed. The helper being right does not make the caller
+    use it — that is the whole shape of this defect class.
+    """
+    from datetime import datetime, timezone
+    from tpot2cti.state import CycleState
+    from tpot2cti.parsers.base import AttackSession, ParsedEvent
+
+    st = CycleState(db_path=tmp_path / "state.db")
+    ip = "203.0.113.77"
+
+    def sess(dt):
+        ev = ParsedEvent(src_ip=ip, timestamp=dt, sensor_hostname="s1",
+                         event_type="Cowrie", dst_port=22)
+        ev.meta = {}
+        s = AttackSession.from_event(ev)
+        s.first_seen = s.last_seen = dt
+        return s
+
+    # Seed a row, then hand-write it back in the PRE-normalisation spelling:
+    # an offset-bearing timestamp, exactly as rows on disk still carry.
+    st.upsert_attacker_activity(sess(datetime(2026, 9, 16, 8, 30, tzinfo=timezone.utc)))
+    with st._conn() as c:
+        c.execute("UPDATE attacker_activity SET first_seen = ?, last_seen = ?",
+                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+
+    # A later observation, written post-normalisation as +00:00.
+    st.upsert_attacker_activity(sess(datetime(2026, 9, 16, 9, 0, tzinfo=timezone.utc)))
+
+    with st._conn() as c:
+        first, last = c.execute(
+            "SELECT first_seen, last_seen FROM attacker_activity").fetchone()
+    assert datetime.fromisoformat(first) <= datetime.fromisoformat(last), (
+        f"stored window is inverted: first_seen={first} last_seen={last}"
+    )

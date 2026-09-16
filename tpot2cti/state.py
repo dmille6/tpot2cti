@@ -256,6 +256,53 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
 """
 
 
+
+def _as_instant(value):
+    """Parse a stored timestamp for COMPARISON, or None if unusable.
+
+    Stored values are a mix: rows written before _parse_timestamp normalised
+    to UTC keep their source offset, newer ones are always +00:00. Only an
+    instant comparison is meaningful across that mix.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00").replace("z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _earlier(a, b):
+    """The earlier of two stored timestamps, preserving the original string.
+
+    An absent or unparseable value never WINS: a NULL first_seen would
+    otherwise sort before every real timestamp and permanently pin the window
+    open. A malformed pair degrades to raw string comparison rather than
+    crashing the cycle that touched the row.
+    """
+    if not a:
+        return b
+    if not b:
+        return a
+    ia, ib = _as_instant(a), _as_instant(b)
+    if ia is None or ib is None:
+        return a if str(a) <= str(b) else b
+    return a if ia <= ib else b
+
+
+def _later(a, b):
+    """The later of two stored timestamps. Same null/unparseable rule."""
+    if not a:
+        return b
+    if not b:
+        return a
+    ia, ib = _as_instant(a), _as_instant(b)
+    if ia is None or ib is None:
+        return a if str(a) >= str(b) else b
+    return a if ia >= ib else b
+
+
 class CycleState:
     """SQLite-backed state for the importer cycle loop."""
 
@@ -1166,8 +1213,15 @@ class CycleState:
                 self._decode_json_list(old_ports), dst_ports_add,
             )
 
-            new_first = old_first_seen if old_first_seen <= first_seen else first_seen
-            new_last = old_last_seen if old_last_seen >= last_seen else last_seen
+            # Compared as INSTANTS, not as strings. Rows written before
+            # _parse_timestamp normalised to UTC carry their source offset, so
+            # a stored "10:30+02:00" (= 08:30Z) sorts AFTER a new "09:00+00:00"
+            # (= 09:00Z) lexicographically while being half an hour earlier.
+            # String min()/max() across that boundary returns first_seen LATER
+            # than last_seen -- an inverted window, on rows that were correct
+            # before the upgrade. Reproduced on review of #45.
+            new_first = _earlier(old_first_seen, first_seen)
+            new_last = _later(old_last_seen, last_seen)
 
             c.execute(
                 "UPDATE attacker_activity SET "
