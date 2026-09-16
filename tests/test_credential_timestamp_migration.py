@@ -207,15 +207,17 @@ def test_the_migration_only_reads_rows_that_need_changing(tmp_path):
     real.close()
 
 
-def test_migration_keeps_the_stored_date_time_separator(tmp_path):
-    """sqlite3's adapter writes "2026-09-16 08:30:00+00:00" with a SPACE;
-    isoformat() emits "T". Space is chr(32), "T" is chr(84), so under the TEXT
-    comparison these columns are sorted by, every space-separated value sorts
-    before every T-separated one regardless of instant.
+def test_migration_canonicalises_the_separator(tmp_path):
+    """Everything ends up in the spelling future writes will use.
 
-    A migration that rewrites one row with "T" while its neighbours keep a
-    space corrupts the ordering it exists to fix. Found by seeding through
-    CredentialStore's own writer instead of a hand-built fixture.
+    All production writers call isoformat() (T-separated). A space-separated
+    row — which sqlite3's adapter produces if anything ever bypasses those
+    writers — must be rewritten to "T", not preserved: space is chr(32) and
+    "T" is chr(84), so a preserved space sorts before every future write
+    regardless of instant.
+
+    An earlier version of this test asserted the opposite, from a fixture that
+    bypassed the public API and so measured the adapter rather than the code.
     """
     import sqlite3
     from tpot2cti.timestamps import normalise_timestamp_columns
@@ -223,21 +225,51 @@ def test_migration_keeps_the_stored_date_time_separator(tmp_path):
     db = tmp_path / "sep.db"
     c = sqlite3.connect(db, isolation_level=None)
     c.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
-    # space-separated, already UTC (what the adapter writes)
-    c.execute("INSERT INTO t VALUES (?, ?)",
-              ("2026-09-16 09:00:00+00:00", "2026-09-16 09:00:00+00:00"))
-    # space-separated but a legacy offset — the row that gets rewritten
-    c.execute("INSERT INTO t VALUES (?, ?)",
+    c.execute("INSERT INTO t VALUES (?, ?)",            # canonical already
+              ("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00"))
+    c.execute("INSERT INTO t VALUES (?, ?)",            # space + legacy offset
               ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+    c.execute("INSERT INTO t VALUES (?, ?)",            # space, already UTC
+              ("2026-09-16 07:00:00+00:00", "2026-09-16 07:00:00+00:00"))
 
     normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
 
-    rows = [r[0] for r in c.execute("SELECT last_seen FROM t ORDER BY last_seen DESC")]
-    assert all(" " in r[:11] for r in rows), (
-        f"separator changed during migration: {rows} — mixed 'T' and ' ' "
-        "makes TEXT ordering meaningless"
+    rows = [r[0] for r in c.execute("SELECT last_seen FROM t ORDER BY last_seen")]
+    assert all(r[10] == "T" for r in rows), f"not canonicalised: {rows}"
+    assert rows == sorted(rows), "guard"
+    assert rows[0].startswith("2026-09-16T07:00:00"), rows
+    assert rows[-1].startswith("2026-09-16T09:00:00"), (
+        f"ordering is wrong after migration: {rows}"
     )
-    assert rows[0].startswith("2026-09-16 09:00:00"), (
-        f"newest-first returned {rows[0]} — 08:30Z outsorted 09:00Z"
-    )
+    c.close()
+
+
+def test_the_filter_never_under_selects(tmp_path):
+    """The SQL filter is an optimisation; missing a row that needs work would
+    stamp the version and leave it permanently wrong."""
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns, canonical
+
+    db = tmp_path / "f.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    cases = [
+        "2026-09-16 09:00:00+00:00",     # space separator, UTC
+        "2026-09-16T09:00:00+02:00",     # T, non-UTC
+        "2026-09-16 09:00:00+02:00",     # space, non-UTC
+        "2026-09-16T09:00:00Z",          # Z suffix
+        "2026-09-16T09:00:00z",          # lowercase z
+        "2026-09-16T09:00:00",           # naive
+    ]
+    for v in cases:
+        c.execute("INSERT INTO t VALUES (?, ?)", (v, v))
+
+    normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+
+    for stored, original in zip(
+        [r[0] for r in c.execute("SELECT first_seen FROM t")], cases
+    ):
+        assert stored == canonical(original), (
+            f"{original!r} was left as {stored!r} — the filter under-selected"
+        )
     c.close()

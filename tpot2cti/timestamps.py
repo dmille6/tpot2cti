@@ -98,28 +98,28 @@ def later(a, b):
     return a if ia >= ib else b
 
 
-def _normalised_like(value):
-    """UTC-normalise `value`, KEEPING its date/time separator.
+def canonical(value):
+    """The one spelling every writer in this codebase produces: isoformat().
 
-    Not cosmetic. sqlite3's datetime adapter stores "2026-09-16 08:30:00+00:00"
-    with a SPACE; `datetime.isoformat()` emits "T". Space is chr(32) and "T" is
-    chr(84), so under the TEXT comparison these columns are sorted by, EVERY
-    space-separated value sorts before EVERY T-separated one, whatever the
-    actual instants are.
+    All four producers of these columns call `.isoformat()` — credential_store
+    (both public entry points), state's activity bounds, campaigns' artifact
+    bounds, profile emission. So the canonical form is T-separated, UTC,
+    "+00:00". Normalising TO that matches what the next write will look like,
+    which is the point: TEXT ordering is only meaningful when migrated rows
+    and future rows agree.
 
-    Rewriting a legacy row with "T" while its neighbours keep a space
-    therefore corrupts exactly the ordering this migration exists to repair.
-    Caught by running the credential store's own writer rather than a
-    hand-built fixture — the convention is the adapter's, not the code's.
+    An earlier version of this preserved whatever separator the input had.
+    That was a weaker fix arrived at from a bad measurement -- a test that
+    bypassed the public API and handed a datetime to the private _upsert, so
+    sqlite3's adapter wrote a SPACE separator that no production path
+    produces. Preserving it would have frozen legacy rows in a spelling that
+    sorts before every future write (space is chr(32), "T" is chr(84)),
+    forever.
 
     Unparseable values come back unchanged.
     """
     dt = as_instant(value)
-    if dt is None:
-        return value
-    raw = str(value)
-    sep = " " if (len(raw) > 10 and raw[10] == " ") else "T"
-    return dt.isoformat(sep=sep)
+    return value if dt is None else dt.isoformat()
 
 
 def normalise_timestamp_columns(
@@ -174,7 +174,17 @@ def normalise_timestamp_columns(
                 # value all fail the test and get selected; and among values
                 # that all end in "+00:00", lexicographic order already equals
                 # chronological order, which is the property being restored.
-                where = " OR ".join(f"{col} NOT LIKE '%+00:00'" for col in cols)
+                # A cheap SUPERSET of the rows that need work, so the scan
+                # does not materialise 7.7M already-correct rows (measured
+                # live) to discover there is nothing to do. Canonical is
+                # T-separated and "+00:00"; anything failing either test is a
+                # candidate, and `canonical()` then decides for real. The
+                # filter may over-select, which costs nothing; it must never
+                # under-select, which is why BOTH properties are checked.
+                where = " OR ".join(
+                    f"({col} NOT LIKE '%+00:00' OR substr({col}, 11, 1) <> 'T')"
+                    for col in cols
+                )
                 # fetchall() on the CANDIDATE set, which is bounded and
                 # usually empty — not on the table. Iterating the cursor
                 # instead would be worse, not better: the loop below UPDATEs
@@ -205,7 +215,7 @@ def normalise_timestamp_columns(
                 rowid, values = row[0], row[1:]
                 fixed = []
                 for v in values:
-                    fixed.append(_normalised_like(v))
+                    fixed.append(canonical(v))
                 if list(fixed) != list(values):
                     c.execute(
                         f"UPDATE {table} SET "
