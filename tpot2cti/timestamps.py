@@ -98,6 +98,30 @@ def later(a, b):
     return a if ia >= ib else b
 
 
+def _normalised_like(value):
+    """UTC-normalise `value`, KEEPING its date/time separator.
+
+    Not cosmetic. sqlite3's datetime adapter stores "2026-09-16 08:30:00+00:00"
+    with a SPACE; `datetime.isoformat()` emits "T". Space is chr(32) and "T" is
+    chr(84), so under the TEXT comparison these columns are sorted by, EVERY
+    space-separated value sorts before EVERY T-separated one, whatever the
+    actual instants are.
+
+    Rewriting a legacy row with "T" while its neighbours keep a space
+    therefore corrupts exactly the ordering this migration exists to repair.
+    Caught by running the credential store's own writer rather than a
+    hand-built fixture — the convention is the adapter's, not the code's.
+
+    Unparseable values come back unchanged.
+    """
+    dt = as_instant(value)
+    if dt is None:
+        return value
+    raw = str(value)
+    sep = " " if (len(raw) > 10 and raw[10] == " ") else "T"
+    return dt.isoformat(sep=sep)
+
+
 def normalise_timestamp_columns(
     c: sqlite3.Connection,
     tables: Mapping[str, Sequence[str]],
@@ -135,8 +159,32 @@ def normalise_timestamp_columns(
         incomplete = False
         for table, cols in tables.items():
             try:
+                # Only CANDIDATE rows, and streamed rather than materialised.
+                #
+                # Measured on the live host 2026-09-16: credential_usage has
+                # 4,495,337 rows and credential_pairs 3,230,280, and ZERO of
+                # them are legacy — every value is already "+00:00". A
+                # fetchall() over 7.7M rows to discover there is nothing to do
+                # means GBs of Python tuples built while holding the write
+                # lock that the credentials writer needs.
+                #
+                # A value already ending in "+00:00" is already normalised, so
+                # anything else is the candidate set. That is sound rather
+                # than merely fast: a "Z" suffix, a non-UTC offset and a naive
+                # value all fail the test and get selected; and among values
+                # that all end in "+00:00", lexicographic order already equals
+                # chronological order, which is the property being restored.
+                where = " OR ".join(f"{col} NOT LIKE '%+00:00'" for col in cols)
+                # fetchall() on the CANDIDATE set, which is bounded and
+                # usually empty — not on the table. Iterating the cursor
+                # instead would be worse, not better: the loop below UPDATEs
+                # the same table it is reading, and SQLite does not define
+                # what an open SELECT cursor sees when its table is modified
+                # underneath it. Tried that first; it silently skipped the
+                # row it was supposed to fix.
                 rows = c.execute(
-                    f"SELECT rowid, {', '.join(cols)} FROM {table}").fetchall()
+                    f"SELECT rowid, {', '.join(cols)} FROM {table} "
+                    f"WHERE {where}").fetchall()
             except sqlite3.OperationalError as e:
                 # "no such table" is an expected miss — a schema version that
                 # simply lacks it. ANY OTHER operational failure means this
@@ -157,8 +205,7 @@ def normalise_timestamp_columns(
                 rowid, values = row[0], row[1:]
                 fixed = []
                 for v in values:
-                    dt = as_instant(v)
-                    fixed.append(dt.isoformat() if dt is not None else v)
+                    fixed.append(_normalised_like(v))
                 if list(fixed) != list(values):
                     c.execute(
                         f"UPDATE {table} SET "

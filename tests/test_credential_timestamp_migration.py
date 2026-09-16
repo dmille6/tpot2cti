@@ -38,7 +38,7 @@ def test_newest_first_ordering_survives_a_legacy_offset_row(tmp_path):
         c.execute("UPDATE credential_usage SET first_seen = ?, last_seen = ? "
                   "WHERE credential_id IN (SELECT credential_id FROM "
                   "credential_pairs WHERE username = 'older')",
-                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+                  ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
         c.execute("PRAGMA user_version = 0")
     store.close()
 
@@ -89,7 +89,7 @@ def test_the_pairs_table_is_migrated_too(tmp_path):
     _seed(store, "u", datetime(2026, 9, 16, 8, 30, tzinfo=timezone.utc))
     with store._conn() as c:
         c.execute("UPDATE credential_pairs SET first_seen = ?, last_seen = ?",
-                  ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+                  ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
         c.execute("PRAGMA user_version = 0")
     store.close()
 
@@ -117,7 +117,7 @@ def test_an_unreadable_table_leaves_the_version_unstamped(tmp_path):
     c = sqlite3.connect(db, isolation_level=None)
     c.execute("CREATE TABLE present (first_seen TEXT, last_seen TEXT)")
     c.execute("INSERT INTO present VALUES (?, ?)",
-              ("2026-09-16T10:30:00+02:00", "2026-09-16T10:30:00+02:00"))
+              ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
 
     # The table must EXIST for this to be a genuine operational failure —
     # a missing table raises "no such table", which is an expected miss and
@@ -152,4 +152,92 @@ def test_an_unreadable_table_leaves_the_version_unstamped(tmp_path):
         "re-scan forever"
     )
     d.close()
+    c.close()
+
+
+def test_the_migration_only_reads_rows_that_need_changing(tmp_path):
+    """It must not materialise the whole table to find nothing to do.
+
+    Live measurement 2026-09-16: 7.7M credential rows, ZERO of them legacy.
+    A fetchall() over all of them builds GBs of tuples while holding the write
+    lock the credentials writer needs.
+
+    Asserted by counting what the SELECT actually returns, not by timing.
+    """
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns
+
+    db = tmp_path / "big.db"
+    real = sqlite3.connect(db, isolation_level=None)
+    real.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    real.executemany("INSERT INTO t VALUES (?, ?)",
+                     [("2026-09-16T09:00:00+00:00", "2026-09-16T09:00:00+00:00")] * 500)
+    real.execute("INSERT INTO t VALUES (?, ?)",
+                 ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+
+    seen = {"rows": 0}
+
+    class Counting:
+        """Forwards to the real connection, counting rows the migration reads."""
+        def __init__(self, conn): self._c = conn
+        def execute(self, sql, *a):
+            cur = self._c.execute(sql, *a)
+            if sql.lstrip().upper().startswith("SELECT ROWID"):
+                rows = cur.fetchall()
+                seen["rows"] += len(rows)
+
+                class _Done:            # the migration calls .fetchall() on it
+                    def fetchall(self_inner): return rows
+                return _Done()
+            return cur
+        @property
+        def in_transaction(self): return self._c.in_transaction
+
+    changed = normalise_timestamp_columns(
+        Counting(real), {"t": ("first_seen", "last_seen")}, 1, label="t")
+
+    assert changed == 1, f"the one legacy row should have been fixed, got {changed}"
+    assert seen["rows"] == 1, (
+        f"the migration read {seen['rows']} rows to fix 1 — it is scanning "
+        "every already-normalised row into memory"
+    )
+    fixed = real.execute(
+        "SELECT COUNT(*) FROM t WHERE first_seen LIKE '%+00:00'").fetchone()[0]
+    assert fixed == 501, "the legacy row was not normalised"
+    real.close()
+
+
+def test_migration_keeps_the_stored_date_time_separator(tmp_path):
+    """sqlite3's adapter writes "2026-09-16 08:30:00+00:00" with a SPACE;
+    isoformat() emits "T". Space is chr(32), "T" is chr(84), so under the TEXT
+    comparison these columns are sorted by, every space-separated value sorts
+    before every T-separated one regardless of instant.
+
+    A migration that rewrites one row with "T" while its neighbours keep a
+    space corrupts the ordering it exists to fix. Found by seeding through
+    CredentialStore's own writer instead of a hand-built fixture.
+    """
+    import sqlite3
+    from tpot2cti.timestamps import normalise_timestamp_columns
+
+    db = tmp_path / "sep.db"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (first_seen TEXT, last_seen TEXT)")
+    # space-separated, already UTC (what the adapter writes)
+    c.execute("INSERT INTO t VALUES (?, ?)",
+              ("2026-09-16 09:00:00+00:00", "2026-09-16 09:00:00+00:00"))
+    # space-separated but a legacy offset — the row that gets rewritten
+    c.execute("INSERT INTO t VALUES (?, ?)",
+              ("2026-09-16 10:30:00+02:00", "2026-09-16 10:30:00+02:00"))
+
+    normalise_timestamp_columns(c, {"t": ("first_seen", "last_seen")}, 1, label="t")
+
+    rows = [r[0] for r in c.execute("SELECT last_seen FROM t ORDER BY last_seen DESC")]
+    assert all(" " in r[:11] for r in rows), (
+        f"separator changed during migration: {rows} — mixed 'T' and ' ' "
+        "makes TEXT ordering meaningless"
+    )
+    assert rows[0].startswith("2026-09-16 09:00:00"), (
+        f"newest-first returned {rows[0]} — 08:30Z outsorted 09:00Z"
+    )
     c.close()
