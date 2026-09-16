@@ -94,6 +94,12 @@ class CycleConfig:
     initial_lookback_hours: int = 0          # 0 = "start fresh from now"
     ignore_types: list[str] = field(default_factory=list)
     batch_size: int = 1000
+    #: Hard ceiling on events materialised in ONE cycle. The 24h time cap
+    #: does not bound memory -- density is not constant, and a 16.3h window
+    #: was 2.24M events / 13 GiB. 400k is sized to keep peak RSS in single-
+    #: digit GiB with the parsed-events + sessions + STIX generations all
+    #: live at once. 0 disables the cap.
+    max_events_per_cycle: int = 400_000
     cycle_anchor_hour_utc: Optional[int] = None  # None = no anchor sleep
     transient_retry_seconds: int = 60       # per LESSONS §5
     #: Seconds to sleep between the publisher's three passes. Per PoC
@@ -324,6 +330,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
             default=["P0f"],
         ),
         batch_size=_env_int(env, "TPOT2CTI_BATCH_SIZE", default=1000),
+        max_events_per_cycle=_env_int(
+            env, "TPOT2CTI_MAX_EVENTS_PER_CYCLE", default=400_000),
         cycle_anchor_hour_utc=(
             _env_int(env, "TPOT2CTI_CYCLE_ANCHOR_HOUR_UTC", default=-1)
             if env.get("TPOT2CTI_CYCLE_ANCHOR_HOUR_UTC") else None

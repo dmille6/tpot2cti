@@ -363,8 +363,14 @@ def generate_campaign_id(artifact_key: str) -> str:
     return sdo_id("campaign", "campaign", artifact_key)
 
 
-def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") -> str:
-    """Sighting SRO id. Seed: ``sighting:<sensor>:<session_id>[:<discriminator>]``.
+def generate_sighting_id(sensor: str, bucket: str, discriminator: str = "") -> str:
+    """Sighting SRO id. Seed: ``sighting:<sensor>:<bucket>[:<discriminator>]``.
+
+    ``bucket`` is whatever the caller wants one Sighting per. It used to be
+    the session id, i.e. one Sighting per session; :meth:`build_sighting`
+    now passes ``<target_ref>:<YYYY-MM-DD>`` so a day of sessions from one
+    address on one sensor becomes ONE Sighting. Kept generic here because
+    the id function should not care what the unit of observation is.
 
     The optional ``discriminator`` lets callers mint a second distinct
     Sighting ID for the same (sensor, session) pair — used by the dual-
@@ -376,8 +382,8 @@ def generate_sighting_id(sensor: str, session_id: str, discriminator: str = "") 
     updates the same Sighting count, not orphan a new one.
     """
     if discriminator:
-        return sdo_id("sighting", "sighting", sensor, session_id, discriminator)
-    return sdo_id("sighting", "sighting", sensor, session_id)
+        return sdo_id("sighting", "sighting", sensor, bucket, discriminator)
+    return sdo_id("sighting", "sighting", sensor, bucket)
 
 
 def generate_relationship_id(src_id: str, dst_id: str, rel_type: str) -> str:

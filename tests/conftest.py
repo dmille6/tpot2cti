@@ -129,6 +129,20 @@ def parser_docs(now_utc):
         "Mailoney":      make_common_doc("Mailoney", now=now_utc),
         "Medpot":        make_common_doc("Medpot", now=now_utc),
         "Miniprint":     make_common_doc("Miniprint", now=now_utc),
+        "RDPHoneypot":   {
+            **make_common_doc("RDPHoneypot", now=now_utc),
+            "eventid": "rdphoneypot.login",
+            "session": "0123456789ab",
+            "username": "Administrator",
+            "password": "",
+            "domain": "",
+            "derived_domain": "WORKGROUP",
+            "auth_method": "NLA",
+            "nt_response": "0101000000000000",
+            "message": ("Login from 203.0.113.42:1234, hostname: 'PC1' "
+                        "to domain: 'WORKGROUP', username: 'Administrator', "
+                        "hashcat: 'Administrator::WORKGROUP:aa:bb:cc'."),
+        },
         "NGINX":         make_common_doc("NGINX", now=now_utc),
         "Redishoneypot": make_common_doc("Redishoneypot", now=now_utc),
         "Router":        make_common_doc("Router", now=now_utc),

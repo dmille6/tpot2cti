@@ -37,3 +37,7 @@ Thumbs.db
 # Local override files
 docker-compose.override.yml
 .claude/
+
+# .env backups hold live secrets — never commit them
+.env.bak*
+.env.*.bak

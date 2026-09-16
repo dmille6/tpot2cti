@@ -42,6 +42,7 @@ is better than no publish — next cycle re-emits.
 
 from __future__ import annotations
 
+import threading
 import logging
 import time
 import uuid
@@ -117,6 +118,26 @@ if _assigned != KNOWN_STIX_TYPES:
         "Fix FOUNDATION_TYPES / ENTITY_TYPES / RELATIONSHIP_TYPES or "
         "KNOWN_STIX_TYPES so they agree."
     )
+def _sighting_dt(value):
+    """Parse a STIX timestamp to an aware UTC datetime, or None.
+
+    Mirrors stix/builder._as_dt. Sighting windows are merged by comparing
+    these, not the raw strings -- lexicographic order equals chronological
+    order only when every value carries the same UTC offset, which nothing
+    guarantees once an aggregate has been merged from several sources.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +150,7 @@ class PublishResult:
 
     Recorded into :class:`tpot2cti.state.CycleState` by the caller (via
     a generic key/value row keyed by ``cycle_id``) and surfaced in the
-    cycle summary log line + the ``data/cycles.jsonl`` audit doc.
+    cycle summary log line and the ``cycle_log`` table in state.db.
     """
 
     cycle_id: str
@@ -189,9 +210,16 @@ class Publisher:
         *,
         indexing_delay_seconds: Optional[int] = None,
         redactor: Optional["SensorRedactor"] = None,
+        helper=None,
     ) -> None:
         self.client = client
         self.state = state
+        #: An OpenCTIConnectorHelper, present ONLY when chunked publishing
+        #: is enabled. Absent means the serial path, which is the default:
+        #: this connector otherwise never builds a helper, and doing so has
+        #: side effects (pycti hijacks the root logger; the connector
+        #: registers itself).
+        self.helper = helper
         # Sensor-identity redaction. Lives HERE, not in the builders, because
         # every emission path funnels through publish() — CORE, malware
         # ingest, noisefloor, blocklists, selftest — including the three that
@@ -371,13 +399,86 @@ class Publisher:
                 "id": bundle_id,
                 "objects": objs,
             }
+            # Announce BEFORE sending. A pass that logs only on completion is
+            # indistinguishable from a hang for its entire duration — which is
+            # how a 7-day stall and a 3.4-hour slow pass both read as dead.
+            logger.info(
+                f"[{cycle_id}] Pass '{name}' starting: {len(objs)} object(s) "
+                f"— import_bundle_from_json makes sequential per-object calls, "
+                f"so this can legitimately run for a long time"
+            )
+            _hb_stop = threading.Event()
+            
+            def _heartbeat(_name=name, _cid=cycle_id, _n=len(objs)):
+                waited = 0
+                while not _hb_stop.wait(30):
+                    waited += 30
+                    logger.info(
+                        f"[{_cid}] Pass '{_name}' still sending "
+                        f"({_n} object(s), {waited}s elapsed)"
+                    )
+                    if self.state is not None:
+                        try:
+                            self.state.heartbeat()
+                        except Exception:  # noqa: BLE001
+                            pass
+            
+            _hb = threading.Thread(target=_heartbeat, daemon=True,
+                                   name=f"pass-hb-{name}")
+            _hb.start()
             try:
-                stats = self.client.send_bundle(envelope)
+                if self.helper is not None:
+                    # Chunked queue transport. Measured on LIVE v2 infrastructure:
+                    # 15.7 obj/s against the 5.5 obj/s serial baseline = 2.9x, with
+                    # the pass barrier holding (120 relationships referencing
+                    # entities from a previous chunked pass, no dangling refs) and
+                    # the gate correctly refusing a poisoned chunk that OpenCTI had
+                    # itself reported as `complete`.
+                    from tpot2cti.chunked_publish import publish_pass_chunked
+                    from tpot2cti.work_wait import wait_for_work
+                    _wid = self.helper.api.work.initiate_work(
+                        self.helper.connect_id, f"{cycle_id}:{name}")
+                    _t0 = time.monotonic()
+                    _ok, _detail = publish_pass_chunked(
+                        helper=self.helper, state=self.state, cycle_id=cycle_id,
+                        pass_name=name, objects=objs, work_id=_wid,
+                        wait_for_work=wait_for_work)
+                    stats = {"sent": len(objs), "duration_s": time.monotonic() - _t0}
+                    if not _ok:
+                        # Deliberately not raised: the pass is recorded unclean in
+                        # the ledger and publish_is_clean() will refuse the cursor.
+                        # Raising would discard the passes that DID land, and
+                        # re-covering a window is free while skipping one is not.
+                        msg = f"chunked pass not clean: {_detail}"
+                        logger.error(f"[{cycle_id}] {msg}")
+                        errors.append(msg)
+                else:
+                    stats = self.client.send_bundle(envelope)
                 logger.info(
                     f"[{cycle_id}] Pass '{name}' sent: "
                     f"{stats.get('sent', len(objs))} object(s) in "
                     f"{stats.get('duration_s', 0.0):.2f}s"
                 )
+
+                # Persist the pass, tagged with the transport that produced it.
+                # Recording this on the CURRENT (serial) path first is the point: it
+                # establishes a baseline before anything is flipped, so a later
+                # throughput claim is a query against two labelled populations rather
+                # than a memory of a log line that has since rotated away.
+                if self.state is not None:
+                    try:
+                        self.state.record_publish_pass(
+                            cycle_id, name,
+                            objects=len(objs),
+                            duration_s=stats.get("duration_s", 0.0),
+                            transport="chunked" if self.helper is not None else "serial",
+                            chunks=(self.state.publish_chunk_count(
+                                cycle_id, name) or 1),
+                            errors=0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Telemetry must never fail a publish.
+                        pass
             except Exception as exc:  # noqa: BLE001
                 # Partial publish > no publish. Continue to next pass.
                 msg = (
@@ -387,6 +488,8 @@ class Publisher:
                 )
                 logger.warning(f"[{cycle_id}] {msg}")
                 errors.append(msg)
+            finally:
+                _hb_stop.set()
 
             # Liveness heartbeat — each pass can take minutes at hive
             # scale; bump after every one (success OR partial failure) so
@@ -522,6 +625,32 @@ class Publisher:
                     xref_merged.append(xref)
             if xref_merged:
                 base["external_references"] = xref_merged
+
+            # --- sighting aggregation ------------------------------------
+            # Sightings are day-bucketed and aggregated in the BUILDER
+            # (stix/builder._merge_or_emit_sighting), which sums count over
+            # distinct sessions. This is the second line of defence, for
+            # duplicates arriving from separate builder instances (e.g. the
+            # several attacker_profile builds) in one publish.
+            #
+            # count takes MAX, deliberately NOT sum: the builder already
+            # summed, so two copies of one aggregate are the SAME
+            # observations counted twice, and summing them would invent
+            # activity. Max keeps the fuller aggregate without inflating.
+            if base.get("type") == "sighting":
+                counts = [v.get("count") for v in variants
+                          if isinstance(v.get("count"), int)]
+                if counts:
+                    base["count"] = max(counts)
+                # Compared as datetimes, never as strings: an offset-bearing
+                # timestamp sorts wrong lexicographically ("09:00+02:00" is
+                # EARLIER than "08:30+00:00" but sorts after it).
+                for key, pick in (("first_seen", min), ("last_seen", max)):
+                    stamps = [v.get(key) for v in variants if v.get(key)]
+                    parsed = [(_sighting_dt(s), s) for s in stamps]
+                    parsed = [p for p in parsed if p[0] is not None]
+                    if parsed:
+                        base[key] = pick(parsed, key=lambda p: p[0])[1]
 
             # --- confidence: max across variants -------------------------
             confidences = [

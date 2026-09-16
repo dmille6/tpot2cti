@@ -77,6 +77,17 @@ STALENESS_MULTIPLIER: float = 2.0
 # (a big first catch-up) still won't flap the container.
 NO_SUCCESS_CEILING_MULTIPLIER: float = 3.0
 
+# The no-success ceiling is ALSO allowed to be this many times the last
+# successful cycle's measured duration. A connector whose cycle is longer
+# than its poll interval (the backfill: ~2,895s cycles at a PT1M interval)
+# would otherwise be permanently unhealthy while working perfectly, and a
+# permanently-red check is one everybody learns to ignore.
+#
+# 2.0 leaves room for a cycle to run twice its usual length before the
+# check fires, which is slack enough to absorb a slow hive without
+# absorbing a stall.
+OBSERVED_DURATION_CEILING_MULTIPLIER: float = 2.0
+
 
 # ---------------------------------------------------------------------------
 # ISO 8601 duration parsing — we accept the subset T-Pot/V1_SPEC uses
@@ -237,6 +248,29 @@ class HealthStatus:
 
         last_ts_iso, last_duration_s, last_success, any_completed = \
             self._cycle_summary()
+
+        # The ceiling must also clear a cycle that legitimately takes longer
+        # than its own poll interval, or it condemns the container to
+        # permanent red no matter how well it is working.
+        #
+        # Measured: the backfill instance polls at PT1M (so it starts the
+        # next 24h day-step immediately) while a day-step actually takes
+        # ~2,895s. Its ceiling was 180s. It reported "cycling-no-success"
+        # continuously while succeeding every 48 minutes -- a signal that is
+        # never green carries exactly as little information as one that is
+        # never red, and this project has already lost a whole-site power
+        # event to a check that paged every night.
+        #
+        # Anchored to the last SUCCESSFUL cycle's duration, so it cannot
+        # inflate without bound: a genuinely hung cycle never completes, so
+        # it never raises the ceiling it would need to hide behind. That is
+        # the property that keeps this from re-opening the 16-day stall the
+        # ceiling was added for.
+        if last_duration_s:
+            max_no_success_s = max(
+                max_no_success_s,
+                last_duration_s * OBSERVED_DURATION_CEILING_MULTIPLIER,
+            )
         heartbeat_iso, heartbeat_age_s = self._heartbeat_age(now)
         heartbeat_fresh = (
             heartbeat_age_s is not None and heartbeat_age_s <= stale_after_s

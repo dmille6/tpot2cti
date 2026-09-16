@@ -120,6 +120,7 @@ _PARSER_DISPATCH: dict[str, str] = {
     "Medpot":       "build_medpot_session",
     "Router":       "build_router_session",
     "Heralding":    "build_heralding_session",
+    "RDPHoneypot":  "build_rdphoneypot_session",
     "Mailoney":     "build_mailoney_session",
     "Beelzebub":    "build_beelzebub_session",
     "__fallback__": "build_fallback_event",
@@ -265,6 +266,24 @@ class _Shutdown:
 # ---------------------------------------------------------------------------
 # Cycle window computation
 # ---------------------------------------------------------------------------
+
+def _doc_timestamp(doc):
+    """Parse a hive doc's `@timestamp` into an aware UTC datetime, or None.
+
+    Used only to decide where a volume-capped window STOPS, so a
+    unparseable value must return None rather than a guess: the caller
+    keeps reading instead of advancing the cursor somewhere it cannot
+    justify. Advancing on a guess is how 80M documents went unread.
+    """
+    raw = doc.get("@timestamp")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
 
 def _compute_window(
     state: CycleState, cfg: Config, now: datetime
@@ -487,6 +506,83 @@ def run_cycle(
         # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
         benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
 
+    # --- volume cap ------------------------------------------------------
+    # The 24h time cap above does NOT bound memory, because density is not
+    # constant. A 16.3h window -- comfortably UNDER the cap -- was 2.24M
+    # events and 13 GiB RSS, because the whole window is materialised:
+    # parsed events, then sessions, then STIX objects, all live at once.
+    # The predecessor system hit this same wall and exhausted a 4 GB limit.
+    #
+    # Capping by EVENT COUNT bounds the thing that actually causes the
+    # memory. When the cap trips we stop and hand the cursor the timestamp
+    # of the event that tripped it. The ES range is half-open [start, end)
+    # so that timestamp is EXCLUDED from this window, and the next cycle
+    # re-covers it from `gte`. Nothing is skipped -- which matters more than
+    # it sounds: this cursor used to jump to the present instead of walking
+    # forward, and that left 80,260,536 documents permanently unread in the
+    # 2026-07-19 outage. Re-covering is free (ids are deterministic UUID5
+    # and the publisher keeps max(score) with label union, so replay
+    # converges); skipping is not recoverable.
+    #
+    # Never split a timestamp equivalence class by ADVANCING past it -- both
+    # frontier models, asked independently, named that as the one rule. We
+    # satisfy it by excluding the boundary rather than by draining it.
+    _max_events = cfg.cycle.max_events_per_cycle
+    _capped_end = None
+    # --- fetch/parse progress heartbeat ---------------------------------
+    # This phase used to print nothing at all: one cycle was silent from
+    # 12:12 to 13:05 while RSS climbed 1.4 -> 13 GiB. A stall there looked
+    # exactly like normal work.
+    #
+    # It reports FORWARD PROGRESS, not elapsed time, and that distinction is
+    # the whole point. This project's recurring injury is a reassuring signal
+    # decoupled from real work -- a green timer that never ran a successful
+    # job, an ES zero read as "fine", every component self-reporting healthy
+    # while ~9,000 attackers fell between them. "still working, 1800s
+    # elapsed" is that same lie with a new coat of paint: it is emitted just
+    # as faithfully by a wedged socket as by a busy one.
+    #
+    # So each tick prints the DELTA since the previous tick, and a delta of
+    # zero is logged at WARNING, escalating to ERROR. A reader can tell
+    # "slow" from "stopped" without attaching a debugger.
+    _hb_progress = {"read": 0, "parsed": 0}
+    _hb_stop = threading.Event()
+
+    def _fetch_parse_heartbeat():
+        prev, stalled, waited = 0, 0, 0
+        while not _hb_stop.wait(30):
+            waited += 30
+            cur = _hb_progress["read"]
+            delta = cur - prev
+            prev = cur
+            if delta == 0:
+                stalled += 1
+                # 30s of nothing can be one slow ES page; 3 minutes of
+                # nothing is a different claim, so the level escalates
+                # rather than crying wolf on the first tick.
+                log = logger.error if stalled >= 6 else logger.warning
+                log(
+                    "[%s] fetch/parse NO PROGRESS for %ds "
+                    "(read=%d parsed=%d) -- slow ES page or a stall",
+                    cycle_id, stalled * 30, cur, _hb_progress["parsed"],
+                )
+            else:
+                stalled = 0
+                logger.info(
+                    "[%s] fetch/parse: read=%d parsed=%d (+%d in 30s, %.0f/s, "
+                    "%ds elapsed)",
+                    cycle_id, cur, _hb_progress["parsed"], delta, delta / 30.0,
+                    waited,
+                )
+            if state is not None:
+                try:
+                    state.heartbeat()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    _hb = threading.Thread(target=_fetch_parse_heartbeat, daemon=True,
+                           name="fetch-parse-hb")
+    _hb.start()
     try:
         for doc in es.stream_events(
             window_start, window_end,
@@ -496,6 +592,43 @@ def run_cycle(
             suricata_alert_only=suricata_alert_only,
         ):
             events_read += 1
+            if events_read % 1000 == 0:
+                # Sampled rather than per-doc: 2.2M dict writes per cycle
+                # would cost more than the signal is worth, and 1000 docs is
+                # far finer than the 30s tick.
+                _hb_progress["read"] = events_read
+                _hb_progress["parsed"] = events_parsed
+            if _max_events and events_read >= _max_events:
+                _ts = _doc_timestamp(doc)
+                if _ts is None:
+                    # No usable timestamp means no safe place to stop: advancing
+                    # the cursor on a guess is the failure mode this whole block
+                    # exists to avoid. Keep reading.
+                    pass
+                elif _ts <= window_start:
+                    # Degenerate: the cap tripped inside the FIRST instant of the
+                    # window, so stopping here would produce a zero-width window
+                    # and the cycle would make no progress for ever. Keep reading
+                    # until the clock moves; overshooting the cap is survivable,
+                    # a stalled cursor is not.
+                    logger.error(
+                        "[%s] volume cap tripped at %d events but still inside the "
+                        "window's first instant (%s) -- reading past the cap to "
+                        "guarantee forward progress. A single timestamp holding "
+                        ">%d events is a flood; expect high memory this cycle.",
+                        cycle_id, events_read, window_start.isoformat(), _max_events,
+                    )
+                else:
+                    _capped_end = _ts
+                    logger.warning(
+                        "[%s] volume cap: stopping at %d events; window truncated "
+                        "to [%s, %s). Remaining events are NOT skipped -- the "
+                        "cursor stops here and the next cycle resumes from this "
+                        "boundary.",
+                        cycle_id, events_read, window_start.isoformat(),
+                        _capped_end.isoformat(),
+                    )
+                    break
             try:
                 event = dispatch(doc)
             except Exception as e:
@@ -596,6 +729,44 @@ def run_cycle(
             duration_seconds=time.monotonic() - started_monotonic,
         )
         raise
+    finally:
+        # Stop the progress heartbeat on EVERY exit path. A daemon
+        # thread left running would keep printing fetch/parse progress
+        # while the cycle is actually in its publish phase -- a
+        # liveness signal describing work that already finished is the
+        # precise failure this heartbeat was added to prevent.
+        _hb_stop.set()
+    # A tripped volume cap truncates the window. Reassigning here means the
+    # cursor (state.set_last_run), the cycle summary and the query-excluded
+    # accounting all describe what was ACTUALLY read, rather than what was
+    # requested -- a cursor that advances past unread data is the one
+    # failure this pipeline cannot recover from.
+    if _capped_end is not None:
+        window_end = _capped_end
+    # --- semantic invariant: was the progress on the RIGHT data? --------
+    # A forward-progress heartbeat proves the machine is moving. It cannot
+    # prove it is moving the right data, and that is exactly the failure
+    # this codebase keeps hitting: an ES query with a wrong field name
+    # returns a clean, fast, entirely wrong result set, and every counter
+    # above it climbs honestly the whole way.
+    #
+    # So the cycle asserts a RATIO it has no excuse to violate: reading
+    # hundreds of thousands of events and parsing almost none of them means
+    # the query matched a population the parsers do not recognise. Bounded
+    # loosely on purpose -- this is a tripwire for "the shape changed
+    # underneath us", not a quality metric, and a tight band here would
+    # just become the next thing everyone learns to ignore.
+    if events_read >= 10_000:
+        parsed_ratio = events_parsed / float(events_read)
+        if parsed_ratio < 0.01:
+            logger.error(
+                "[%s] SEMANTIC STALL: read %d events but parsed only %d "
+                "(%.3f%%). Throughput was fine, so nothing above this line "
+                "looked wrong -- suspect the query matched the wrong "
+                "population (field renamed, mapping changed, ignore_types "
+                "drifted) rather than a parser bug.",
+                cycle_id, events_read, events_parsed, parsed_ratio * 100.0,
+            )
 
     # Consolidated drop breakdown — every event read is accounted for as
     # exactly one of: parsed, unparsed, dispatch-error, self/internal, benign.
@@ -696,6 +867,38 @@ def run_cycle(
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
     builder = builder_factory()
+    # Authoritative per-day counts for the Sightings this cycle will emit.
+    # OpenCTI REPLACES a sighting's count on upsert rather than summing it
+    # (measured: one went 22,119 -> 3,484 when a later, narrower cycle
+    # re-covered part of the same day), so writing this cycle's slice would
+    # overwrite a fuller number with a smaller one. The day's own total is
+    # idempotent under replace and only grows as the day fills.
+    #
+    # Upper bound is window_end, not the clock, so the count never claims
+    # events this connector has not yet imported.
+    #
+    # Best-effort: on failure the builder falls back to per-cycle counts,
+    # which is the pre-existing behaviour. A cycle that publishes real
+    # intel with imperfect counts beats a cycle that publishes nothing.
+    try:
+        _day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        builder.daily_event_counts = es.daily_event_counts(
+            _day_start, window_end,
+            index_pattern=cfg.es.index_pattern,
+            ignore_types=effective_ignore_types,
+        )
+        logger.info(
+            "[%s] authoritative daily counts: %d (src_ip, sensor, day) pair(s) "
+            "over [%s, %s)",
+            cycle_id, len(builder.daily_event_counts),
+            _day_start.isoformat(), window_end.isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[%s] daily count aggregation failed (%s); sighting counts fall "
+            "back to this cycle's slice and may be overwritten by a later, "
+            "narrower cycle", cycle_id, exc,
+        )
     all_objects: list[dict] = []
     sessions_by_type: dict[str, int] = {}
     # Per-cycle set of attacker IPs that contributed at least one session
@@ -1185,9 +1388,46 @@ def main() -> int:
     # a stack restart until OpenCTI warmed up). See _connect_opencti.
     opencti = _connect_opencti(cfg, connector_id=cfg.connector_ids.core)
     restore_logging()      # pycti's __init__ may have clobbered handlers
+    # Chunked queue publishing — OFF by default, one env var to flip.
+    #
+    # Serial publish is ~93% of cycle time and v2 sits at 1.04x the
+    # throughput it needs, i.e. break-even with no margin. The chunked
+    # path measured 15.7 obj/s against 5.5 serial on live infrastructure
+    # (2.9x), which takes the cycle to ~0.39x and the margin to ~2.7x.
+    #
+    # The helper is built ONLY when the flag is on. Instantiating
+    # OpenCTIConnectorHelper is not free: pycti resets the root logger
+    # (hence restore_logging below) and the connector registers itself.
+    # Paying that when the feature is off would be a side effect nobody
+    # asked for.
+    _chunked = os.environ.get(
+        "TPOT2CTI_CHUNKED_PUBLISH", "false").lower() in ("1", "true", "yes")
+    _pub_helper = None
+    if _chunked:
+        try:
+            os.environ.setdefault(
+                "OPENCTI_TOKEN", os.environ.get("OPENCTI_ADMIN_TOKEN", ""))
+            from pycti import OpenCTIConnectorHelper
+            _pub_helper = OpenCTIConnectorHelper({})
+            # restore_logging is imported at module scope (line 60). Importing
+            # it again HERE made the name function-local for the whole of main(),
+            # so the pre-existing call ~20 lines earlier hit an unbound local and
+            # the connector crash-looped -- and only when the flag was OFF, because
+            # then this block never runs and the name is never bound.
+            restore_logging()
+            logger.warning("CHUNKED PUBLISH ENABLED — queue transport in use")
+        except Exception as exc:  # noqa: BLE001
+            # Fail to the serial path rather than not publishing. Loudly:
+            # silently falling back would leave the throughput unchanged
+            # with no indication the flag did nothing.
+            logger.error("chunked publish requested but the helper could not "
+                         "be built (%s: %s) — FALLING BACK TO SERIAL",
+                         type(exc).__name__, exc)
+
     publisher = Publisher(
         opencti, state=state,
         indexing_delay_seconds=cfg.cycle.indexing_delay_seconds,
+        helper=_pub_helper,
     )
 
     # Benign-scanner allowlist — static yaml, loaded once at startup.
