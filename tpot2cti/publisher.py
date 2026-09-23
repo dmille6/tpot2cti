@@ -42,6 +42,7 @@ is better than no publish — next cycle re-emits.
 
 from __future__ import annotations
 
+import os
 import threading
 import logging
 import time
@@ -61,6 +62,28 @@ from tpot2cti.stix.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Relationship types whose meaning cannot change once published.
+#:
+#: `located-at` (IP -> Country/City), `belongs-to` (IP -> AS) and `based-on`
+#: (Indicator -> Observable) carry no mutable payload. Crucially their STIX
+#: ids are deterministic over their endpoints, so an address that genuinely
+#: moves to a new AS or country yields a DIFFERENT id and is published
+#: normally. Suppression can therefore only ever skip a byte-identical
+#: restatement of an edge OpenCTI already accepted.
+#:
+#: Deliberately NOT here: sightings (last_seen advances), related-to
+#: (description carries session detail), and anything scored or labelled --
+#: those legitimately change and must keep being upserted.
+IMMUTABLE_RELATIONSHIP_TYPES = frozenset({"located-at", "belongs-to", "based-on"})
+
+#: Emit-once can be turned off without a rebuild. If OpenCTI ever loses these
+#: edges (restore from an older snapshot, retention pass, manual delete) the
+#: ledger would keep asserting they exist -- set this false, or call
+#: state.clear_immutable_emitted(), and the next cycle re-emits everything.
+EMIT_ONCE_ENABLED = (os.environ.get("TPOT2CTI_EMIT_ONCE", "true").strip().lower()
+                     not in ("0", "false", "no", "off"))
+
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +168,9 @@ def _sighting_dt(value):
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+
+
+
 class PublishResult:
     """Outcome of one ``Publisher.publish()`` call.
 
@@ -379,6 +405,10 @@ class Publisher:
         # logged, intentional drop.
         deduped, n_stripped = self._strip_unresolvable_references(deduped, cycle_id)
 
+        # --- Step 2c: drop immutable edges we have already published -----
+        deduped, suppressed_ids = self._suppress_already_emitted(
+            deduped, cycle_id)
+
         # --- Step 3: partition into three passes -------------------------
         passes = self._partition(deduped, cycle_id)
         pass_counts = {name: len(objs) for name, objs in passes.items()}
@@ -543,6 +573,27 @@ class Publisher:
                     f"(non-fatal): {e}"
                 )
 
+        # Record the immutable edges THIS cycle landed -- but only if the
+        # cycle was error-free. Recording an id we did not actually land
+        # would suppress it for ever: it would exist in our ledger and
+        # nowhere else. "We tried" is not good enough here, which is the
+        # same standard the cursor is held to.
+        if self.state is not None and EMIT_ONCE_ENABLED and not errors:
+            newly = [o.get("id") for o in passes.get("relationships", [])
+                     if o.get("relationship_type") in IMMUTABLE_RELATIONSHIP_TYPES
+                     and o.get("id")]
+            if newly:
+                try:
+                    self.state.mark_immutable_emitted(newly)
+                    logger.info(
+                        "[%s] emit-once: recorded %d immutable edge(s); "
+                        "ledger now %d", cycle_id, len(newly),
+                        self.state.immutable_emitted_count())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] emit-once: ledger write failed "
+                                   "(non-fatal, they will simply be "
+                                   "re-emitted): %s", cycle_id, exc)
+
         logger.info(
             f"[{cycle_id}] Publish complete: "
             f"passes={pass_counts} dedup={before}->{after} "
@@ -554,6 +605,46 @@ class Publisher:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _suppress_already_emitted(
+        self, objects: list[dict], cycle_id: str,
+    ) -> tuple[list[dict], list[str]]:
+        """Remove immutable edges this connector has already published.
+
+        `object_max_state` merges cross-cycle state but does not suppress
+        re-emission, so every recurring IP dragged its geo and ASN edges
+        through the queue again on every cycle. On the first clean cycle
+        after the 2026-09-03 outage, 35,836 objects were published and 6,201
+        were actually created -- the rest were no-op upserts.
+
+        Only exact STIX ids already recorded as SUCCESSFULLY published are
+        dropped, so this cannot lose a genuinely new edge.
+        """
+        if not EMIT_ONCE_ENABLED or self.state is None or not objects:
+            return objects, []
+        candidates = [o.get("id") for o in objects
+                      if o.get("type") == "relationship"
+                      and o.get("relationship_type") in IMMUTABLE_RELATIONSHIP_TYPES
+                      and o.get("id")]
+        if not candidates:
+            return objects, []
+        try:
+            already = self.state.immutable_already_emitted(candidates)
+        except Exception as exc:  # noqa: BLE001
+            # Failing open is right: publishing a duplicate is free, and
+            # dropping an edge because a lookup broke is not.
+            logger.warning("[%s] emit-once: ledger read failed, publishing "
+                           "everything (%s)", cycle_id, exc)
+            return objects, []
+        if not already:
+            return objects, []
+        kept = [o for o in objects if o.get("id") not in already]
+        logger.info(
+            "[%s] emit-once: suppressed %d immutable edge(s) already "
+            "published (%d candidate(s) of %d objects) -- %.1f%% of the "
+            "bundle", cycle_id, len(already), len(candidates), len(objects),
+            100.0 * len(already) / max(len(objects), 1))
+        return kept, sorted(already)
 
     def _dedup_label_union(self, objects: list[dict]) -> list[dict]:
         """Collapse duplicate STIX ids; union list-set fields.

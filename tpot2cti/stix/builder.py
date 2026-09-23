@@ -3740,8 +3740,22 @@ class STIXBuilder:
                     domain_id = self._emit_domain(host, out=out, session=session)
                     if domain_id and (
                         rel := self.build_relationship(
-                            url_id, "resolves-to", domain_id,
-                            description=f"C2 endpoint {url[:120]} resolves to {host}",
+                            # NOT "resolves-to". OpenCTI rejects that pairing outright
+                            # ("The relationship type resolves-to is not allowed between
+                            # Url and Domain-Name") and it is wrong semantically anyway:
+                            # a DOMAIN resolves to an address; a URL merely CONTAINS a
+                            # domain. The Domain -> resolves-to -> IPv4 edge elsewhere in
+                            # this file is the legitimate use and is unaffected.
+                            #
+                            # This one edge deadlocked the connector for ~5 hours on
+                            # 2026-09-02. The object is rejected deterministically, so the
+                            # pass never reaches zero errors, is_clean stays False, the
+                            # cycle is marked failed -- and a failed cycle holds the cursor
+                            # by design. The same 400k window was re-read and re-failed
+                            # every cycle, indefinitely. A poison object does not merely
+                            # lose itself; it stops everything queued behind it.
+                            url_id, "related-to", domain_id,
+                            description=f"C2 endpoint {url[:120]} contains host {host}",
                         )
                     ):
                         out.append(rel)

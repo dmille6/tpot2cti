@@ -168,6 +168,23 @@ CREATE TABLE IF NOT EXISTS object_max_state (
     updated_at    TEXT NOT NULL
 );
 
+-- Immutable edges we have already published successfully.
+--
+-- `object_max_state` MERGES cross-cycle state; it does not SUPPRESS
+-- re-emission. So an edge like `IP belongs-to AS197015` -- which can never
+-- change, because a different AS would produce a different STIX id -- was
+-- republished in every cycle that IP recurred, for ever, as a no-op upsert.
+-- Measured on cycle 649: 35,836 objects published, 6,201 actually created.
+--
+-- Keyed on the exact STIX id, which is what makes this safe: if an address
+-- genuinely moves to another AS or country, the new edge has a DIFFERENT
+-- deterministic id and is not suppressed. We only ever skip a byte-identical
+-- restatement of something OpenCTI already accepted.
+CREATE TABLE IF NOT EXISTS immutable_emitted (
+    stix_id          TEXT PRIMARY KEY,
+    first_emitted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
 
@@ -255,6 +272,10 @@ CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_last_seen
     ON campaign_artifacts(last_seen);
 """
 
+
+def _utcnow_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
 from tpot2cti.timestamps import as_instant as _as_instant  # noqa: E402
@@ -520,6 +541,90 @@ class CycleState:
                 " error_summary=COALESCE(error_summary,'') || ?"
                 " WHERE cycle_id=? AND pass_name=? AND chunk_index=?",
                 (f" | QUARANTINED: {reason}", cycle_id, pass_name, chunk_index))
+
+    # ── poison tracking ────────────────────────────────────────────────
+    #
+    # Holding the cursor on a failed publish is correct and it is what stops
+    # us silently skipping data. It assumes, though, that failures are
+    # TRANSIENT -- a blip, a busy platform -- so that retrying eventually
+    # clears them.
+    #
+    # On 2026-09-02 a single relationship that OpenCTI's schema forbids
+    # (Url --resolves-to--> Domain-Name) proved that assumption wrong. The
+    # object failed deterministically, the pass never reached zero errors, the
+    # cycle never succeeded, and the cursor never moved. Ten cycles, five
+    # hours, the same 400,000 events re-read and re-failed, every component
+    # reporting healthy. The safety mechanism became the outage.
+    #
+    # So a failure that has PROVEN itself permanent gets an escape hatch. The
+    # bar is deliberately high and the evidence is kept:
+    #   * the SAME error signature must recur on N consecutive cycles. A
+    #     changing signature means something transient is happening and we
+    #     keep retrying, which is the behaviour that protects data.
+    #   * the abandoned object ids are recorded, not just counted.
+    #   * quarantining is logged at ERROR and surfaced in status output.
+    # Quarantine buys progress at the cost of specific, named objects. That
+    # trade must always be visible, or it becomes silent data loss -- which is
+    # a worse failure than the deadlock it cures.
+
+    def _ensure_poison_table(self, c) -> None:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS poison_tracker (
+                pass_name    TEXT PRIMARY KEY,
+                signature    TEXT NOT NULL,
+                consecutive  INTEGER NOT NULL,
+                first_seen   TEXT NOT NULL,
+                last_seen    TEXT NOT NULL,
+                sample       TEXT
+            )""")
+
+    def note_publish_failure(self, pass_name, signature, sample=""):
+        """Record a failed publish and return how many CONSECUTIVE cycles have
+        now failed with this exact signature.
+
+        A different signature resets the counter to 1: two different problems
+        in a row are not one permanent problem, and treating them as one would
+        quarantine data that a retry would have delivered.
+        """
+        now = _utcnow_iso()
+        with self._conn() as c:
+            self._ensure_poison_table(c)
+            row = c.execute("SELECT signature, consecutive FROM poison_tracker "
+                            "WHERE pass_name = ?", (pass_name,)).fetchone()
+            if row and row[0] == signature:
+                n = int(row[1]) + 1
+                c.execute("UPDATE poison_tracker SET consecutive=?, last_seen=?, "
+                          "sample=? WHERE pass_name=?", (n, now, sample[:2000], pass_name))
+            else:
+                n = 1
+                c.execute("INSERT OR REPLACE INTO poison_tracker"
+                          "(pass_name,signature,consecutive,first_seen,last_seen,sample)"
+                          " VALUES (?,?,?,?,?,?)",
+                          (pass_name, signature, 1, now, now, sample[:2000]))
+        return n
+
+    def clear_publish_failure(self, pass_name) -> None:
+        """A clean pass means whatever was wrong is gone. Reset, so an
+        unrelated failure weeks later does not inherit an old streak and get
+        quarantined on its first occurrence."""
+        with self._conn() as c:
+            self._ensure_poison_table(c)
+            c.execute("DELETE FROM poison_tracker WHERE pass_name = ?", (pass_name,))
+
+    def poison_status(self):
+        """Current poison streaks, for status reporting. A streak below the
+        quarantine threshold is still worth seeing: it is a publish that is
+        failing right now."""
+        try:
+            with self._conn() as c:
+                self._ensure_poison_table(c)
+                return [dict(zip(("pass_name", "signature", "consecutive",
+                                  "first_seen", "last_seen", "sample"), r))
+                        for r in c.execute(
+                            "SELECT pass_name,signature,consecutive,first_seen,"
+                            "last_seen,sample FROM poison_tracker")]
+        except Exception:  # noqa: BLE001
+            return []
 
     def publish_is_clean(self, cycle_id):
         """May the cursor advance for this cycle? Returns (bool, reason).
@@ -859,6 +964,62 @@ class CycleState:
     # across cycles; need connector-side memory of the highest-signal
     # emission to preserve it through low-signal re-emissions).
     # ----------------------------------------------------------------------
+
+    def immutable_already_emitted(self, stix_ids: list[str]) -> set[str]:
+        """Which of these ids have we already published successfully?
+
+        Chunked for the same reason get_max_state_bulk is: an unchunked
+        ``IN (...)`` over a large bundle raises "too many SQL variables"
+        and stalls ingestion.
+        """
+        if not stix_ids:
+            return set()
+        found: set[str] = set()
+        with self._conn() as c:
+            for i in range(0, len(stix_ids), self._SQL_VAR_CHUNK):
+                part = stix_ids[i:i + self._SQL_VAR_CHUNK]
+                q = ("SELECT stix_id FROM immutable_emitted WHERE stix_id IN "
+                     "(" + ",".join("?" * len(part)) + ")")
+                found.update(r[0] for r in c.execute(q, part))
+        return found
+
+    def mark_immutable_emitted(self, stix_ids: list[str]) -> int:
+        """Record ids as published. ONLY call this for a fully-clean cycle.
+
+        Recording an id we did not actually land would suppress it for ever
+        -- the edge would exist in our ledger and nowhere else. That is why
+        the caller gates this on an error-free publish rather than on
+        "we tried".
+        """
+        if not stix_ids:
+            return 0
+        now = _utcnow_iso()
+        n = 0
+        with self._conn() as c:
+            for i in range(0, len(stix_ids), self._SQL_VAR_CHUNK):
+                part = stix_ids[i:i + self._SQL_VAR_CHUNK]
+                c.executemany(
+                    "INSERT OR IGNORE INTO immutable_emitted"
+                    "(stix_id, first_emitted_at) VALUES (?, ?)",
+                    [(sid, now) for sid in part])
+                n += len(part)
+        return n
+
+    def immutable_emitted_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
+
+    def clear_immutable_emitted(self) -> int:
+        """Escape hatch: forget everything, so the next cycle re-emits it all.
+
+        Needed if OpenCTI ever loses these edges (a restore from an older
+        snapshot, a retention pass, a manual delete). Without this the
+        ledger would keep asserting they exist.
+        """
+        with self._conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
+            c.execute("DELETE FROM immutable_emitted")
+            return n
 
     def get_max_state_bulk(
         self,
