@@ -5,6 +5,14 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### SIP_FRAUD: count the PBX `900` prefix (owner decision 2026-09-27)
+
+- `is_intl_dial` also covers `900` (PBX outside line 9, then `00`), the
+  analogue of `9011`. On the hive over 14 days this adds 12,198 SentryPeer
+  docs, all from addresses that also dial the `+`/`00`/`011`/`9011` forms, so
+  it accepts more of their sessions and adds no new address. A `900x`
+  extension (fewer than four digits after `900`) does not count.
+
 ### DR-01 SIP_FRAUD, the first evidence class behind the gate (owner decision 2026-09-27)
 
 - `evidence.decide()` now decides SentryPeer sessions: accepted as
