@@ -64,6 +64,7 @@ def _session(doc):
     ("9005551234", True),           # accepted look-alike: NANP 900 premium number (a toll-fraud target too)
     ("9001234", True),              # accepted look-alike: a long extension starting 900
     ("90001234", True),             # accepted look-alike: 9000 + digits
+    ("19005551234", False),         # 1+900 is not an exit-code form
     ("9001", False),                # a 900x extension: fewer than four digits after 900
     ("900123", False),
     ("5551234", False),             # local
