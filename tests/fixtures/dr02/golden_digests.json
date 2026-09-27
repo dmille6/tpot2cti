@@ -1,0 +1,13 @@
+{
+  "generated_from": "origin/main 71e47ec (clean worktree, harness only)",
+  "cycle": {
+    "sha256": "13050e2ca4a48992886fa7aaa6a8cb63d75139c748597e1aec799bf61edc2ee7",
+    "objects": 184,
+    "bytes": 170484
+  },
+  "direct": {
+    "sha256": "d25ff2881a9f28a831e9b09e5522c0264b56af607bfd21b69d24f3802a2016f3",
+    "objects": 35,
+    "bytes": 32028
+  }
+}
