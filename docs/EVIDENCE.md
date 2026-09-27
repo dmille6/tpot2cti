@@ -1,6 +1,8 @@
 # The evidence contract
 
 > **Status: DESIGN — not yet implemented.**
+> Where the gate sits (DR-02) is built and flag-gated; see
+> [`EVIDENCE_GATE.md`](EVIDENCE_GATE.md). The evidence types below are not.
 > Nothing described here exists in code. This is the contract to build
 > against. See [`CHANGELOG.md`](../CHANGELOG.md) for what actually ships.
 

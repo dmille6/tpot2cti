@@ -469,7 +469,8 @@ class TpotESClient:
 # ---------------------------------------------------------------------- #
 
     def daily_event_counts(self, day_start, upper, index_pattern="logstash-*",
-                           ignore_types=None, page=2000, max_pages=40):
+                           ignore_types=None, page=2000, max_pages=40,
+                           types_out=None):
         """(src_ip, sensor, YYYY-MM-DD) -> event count for [day_start, upper).
 
         Exists because OpenCTI REPLACES a Sighting's `count` on upsert rather
@@ -494,6 +495,16 @@ class TpotESClient:
         partial map degrades to per-cycle counts for the addresses it did
         not reach, which is the pre-existing behaviour, rather than
         stalling the cycle.
+
+        `index_pattern` is the COUNTS pattern (TPOT2CTI_COUNTS_INDEX_PATTERN,
+        defaulting to ES_INDEX_PATTERN), not necessarily the event-read one.
+        No document is skipped for being tagged ``throttled`` (DR-02 point 6):
+        a throttled document is still an event the source sent.
+
+        `types_out`, when a dict is passed (sighting_grain=sensor-ip-day), is
+        filled with the same keys -> sorted list of the honeypot ``type``
+        values seen that day, via a terms sub-aggregation. None (the default)
+        leaves the query exactly as it was.
         """
         out: dict = {}
         after = None
@@ -512,18 +523,27 @@ class TpotESClient:
             ]}
             if after:
                 comp["after"] = after
+            pairs: dict = {"composite": comp}
+            if types_out is not None:
+                pairs["aggs"] = {"types": {"terms": {"field": "type.keyword",
+                                                     "size": 64}}}
             resp = self._search_with_retry({
                 "index": index_pattern,
                 "size": 0,
                 "track_total_hits": False,
                 "query": {"bool": {"must": must}},
-                "aggs": {"pairs": {"composite": comp}},
+                "aggs": {"pairs": pairs},
             })
             agg = resp.get("aggregations", {}).get("pairs", {})
             buckets = agg.get("buckets") or []
             for b in buckets:
                 k = b["key"]
                 out[(k["ip"], k["host"], k["day"])] = b["doc_count"]
+                if types_out is not None:
+                    types_out[(k["ip"], k["host"], k["day"])] = sorted(
+                        tb["key"] for tb in
+                        (b.get("types") or {}).get("buckets") or []
+                        if tb.get("key"))
             after = agg.get("after_key")
             if not after or not buckets:
                 break

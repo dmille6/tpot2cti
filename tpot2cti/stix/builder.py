@@ -19,6 +19,7 @@ from urllib.parse import urlparse, urlsplit
 from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti import attack_mapping
+from tpot2cti import evidence
 from tpot2cti import port_intel
 from tpot2cti.stix.rendering import (
     render_cowrie_session_note_body,
@@ -868,6 +869,32 @@ class STIXBuilder:
         #: day total, and summing them would multiply it by the session count.
         self._authoritative_sightings: set = set()
 
+        # ── DR-02: evidence gate, decoupled sightings, sighting grain ──────
+        # All three default to today's behaviour; see docs/EVIDENCE_GATE.md.
+        cycle = config.cycle
+        self._gate_mode: str = getattr(cycle, "evidence_gate", evidence.GATE_OFF)
+        self._sightings_decoupled: bool = bool(getattr(cycle, "sightings_decoupled", False))
+        self._grain_types: bool = getattr(cycle, "sighting_grain", "legacy") == "sensor-ip-day"
+        #: Counters for /health (evidence_gate). Per bundle, like the
+        #: rejected_* counters above.
+        self.gate_stats = evidence.GateStats(
+            mode=self._gate_mode,
+            sightings_decoupled=self._sightings_decoupled,
+            sighting_grain=getattr(cycle, "sighting_grain", "legacy"),
+        )
+        #: Indicator ids an ``enforce`` refusal withheld. finalize_bundle
+        #: drops every reference to one that no other session emitted, so a
+        #: refused Indicator cannot come back as a dangling edge end.
+        self._gate_withheld_ids: set[str] = set()
+        #: observable-side sighting id -> True once any session in this
+        #: bundle also had an Indicator for that (sensor, IP, day).
+        self._obs_sighting_has_indicator: dict[str, bool] = {}
+        #: (src_ip, sensor, YYYY-MM-DD) -> honeypot types ES saw that day.
+        #: Filled by main.run_cycle only when sighting_grain=sensor-ip-day.
+        self.daily_event_types: dict = {}
+        #: sighting id -> honeypot types folded into it (sensor-ip-day only).
+        self._sighting_types: dict[str, set] = {}
+
     # ──────────────────────────────────────────────────────────────────
     # Object stamping (created_by_ref + markings + confidence + timestamps)
     # ──────────────────────────────────────────────────────────────────
@@ -942,7 +969,8 @@ class STIXBuilder:
     _SIGHTING_DESC_MAX = 5
 
     def _merge_or_emit_sighting(self, obj: dict, session,
-                                authoritative: bool = False) -> Optional[dict]:
+                                authoritative: bool = False,
+                                day_types: Optional[list] = None) -> Optional[dict]:
         """Emit a Sighting, or fold it into the same-day one already kept.
 
         Sighting ids are day-bucketed, so every session from one address on
@@ -977,6 +1005,8 @@ class STIXBuilder:
             self._sighting_sessions[oid] = {getattr(session, "session_id", None)}
             if stamped.get("description"):
                 self._sighting_descriptions[oid] = [stamped["description"]]
+            if self._grain_types:
+                self._fold_sighting_types(oid, stamped, session, day_types)
             return stamped
 
         # --- duplicate: fold this observation into the kept object ------
@@ -1013,8 +1043,42 @@ class STIXBuilder:
             if extra:
                 text += f"\n(+{extra} further session(s) this day)"
             kept["description"] = text
+        if self._grain_types:
+            self._fold_sighting_types(oid, kept, session, day_types)
 
         return None
+
+    def _fold_sighting_types(self, oid: str, kept: dict, session,
+                             day_types: Optional[list]) -> None:
+        """sighting_grain=sensor-ip-day: lead the description with every
+        honeypot type seen for this (sensor, address, UTC day).
+
+        The id grain is unchanged -- it already is (sensor, target, day), so
+        Cowrie, Suricata and a drive-by type from one address on one sensor
+        on one day are ONE Sighting per side. What was wrong is the text:
+        the description listed only the per-session lines that HAD one
+        (Cowrie, Honeytrap, fallback), so a Sighting whose count covered
+        Suricata and Heralding too read as "Cowrie SSH". The count is the
+        day's total over all non-ignored types (daily_event_counts), so the
+        type list must be too: the types this bundle saw, plus the types ES
+        reports for the whole day when main.run_cycle fetched them. OpenCTI
+        replaces the description on upsert, and the ES list is what keeps a
+        narrow later cycle from shrinking it.
+        """
+        types = self._sighting_types.setdefault(oid, set())
+        et = getattr(session, "event_type", None)
+        if et:
+            types.add(str(et))
+        types.update(str(x) for x in (day_types or ()) if x)
+        header = "Types seen from this address on this sensor this UTC day: " + (
+            ", ".join(sorted(types)) if types else "unknown")
+        lines = self._sighting_descriptions.get(oid) or []
+        shown = lines[: self._SIGHTING_DESC_MAX]
+        extra = len(lines) - len(shown)
+        text = "\n".join([header, *shown])
+        if extra:
+            text += f"\n(+{extra} further session(s) this day)"
+        kept["description"] = text
 
     def _widen_relationship_window(self, oid: str, dup: dict) -> None:
         """Union the duplicate's observation window into the one we kept.
@@ -2654,6 +2718,36 @@ class STIXBuilder:
             count = _auth
         obj = {
             "type": "sighting",
+            # See _sighting_id: AGGREGATED per (sensor, target, UTC day).
+            "id": self._sighting_id(target_ref, sensor_hostname, session,
+                                    id_discriminator),
+            "sighting_of_ref": target_ref,
+            "where_sighted_refs": [sensor_id],
+            "first_seen": session.first_seen.isoformat(),
+            "last_seen": session.last_seen.isoformat(),
+            "count": count,
+        }
+        if description:
+            obj["description"] = description
+        return self._merge_or_emit_sighting(
+            obj, session, authoritative=_auth is not None,
+            day_types=(self.daily_event_types.get(
+                (session.src_ip, sensor_hostname, _day))
+                if self._grain_types else None),
+        )
+
+    @staticmethod
+    def _sighting_id(target_ref: str, sensor_hostname: str,
+                     session: AttackSession, id_discriminator: str = "") -> str:
+        """The Sighting id: one per (sensor, target, UTC day of first_seen).
+
+        This is TODAY'S GRAIN, documented in docs/EVIDENCE_GATE.md section 3:
+        ``target`` is the IP Indicator (no discriminator) or the attacker's
+        IP observable (discriminator ``ipv4``, used for IPv6 observables
+        too), so one address on one sensor on one UTC day has at most two
+        Sightings, whatever honeypot types it touched.
+        """
+        return generate_sighting_id(
             # AGGREGATED per (sensor, target, UTC day) — NOT per session.
             # Seeding on session_id minted one sighting per session (two, with
             # the dual pattern): measured 21,628 sightings from 613 IPs in ONE
@@ -2666,21 +2760,10 @@ class STIXBuilder:
             # v1 learned this the expensive way: a microsecond-resolution
             # first_seen in its sighting seed caused an alias explosion and
             # 758 GB of history. It day-buckets now; so do we.
-            "id": generate_sighting_id(
-                sensor_hostname,
-                f"{target_ref}:{session.first_seen.strftime('%Y-%m-%d')}",
-                id_discriminator,
-            ),
-            "sighting_of_ref": target_ref,
-            "where_sighted_refs": [sensor_id],
-            "first_seen": session.first_seen.isoformat(),
-            "last_seen": session.last_seen.isoformat(),
-            "count": count,
-        }
-        if description:
-            obj["description"] = description
-        return self._merge_or_emit_sighting(obj, session,
-                                            authoritative=_auth is not None)
+            sensor_hostname,
+            f"{target_ref}:{session.first_seen.strftime('%Y-%m-%d')}",
+            id_discriminator,
+        )
 
     def build_dual_sighting(
         self,
@@ -2730,7 +2813,132 @@ class STIXBuilder:
             )
             if obs_sighting:
                 out.append(obs_sighting)
+            if sensor_hostname:
+                oid = self._sighting_id(ipv4_id, sensor_hostname, session, "ipv4")
+                if oid in self._sightings:
+                    self._obs_sighting_has_indicator[oid] = (
+                        self._obs_sighting_has_indicator.get(oid, False)
+                        or bool(indicator_id))
         return out
+
+    # ──────────────────────────────────────────────────────────────────
+    # DR-02: the evidence gate and the five dual-sighting sites
+    # ──────────────────────────────────────────────────────────────────
+
+    def _indicator_permitted(self, session: AttackSession, site: str) -> bool:
+        """Ask the evidence gate whether ``session`` may mint its IP
+        Indicator. The ONE place the builder consults tpot2cti.evidence.
+
+        off      -> True without consulting the gate (today's output).
+        shadow   -> consult, count, log a refusal; always True.
+        enforce  -> consult, count, log a refusal; False on refusal, and
+                    the Indicator id is remembered so finalize_bundle can
+                    drop references to it.
+        """
+        mode = self._gate_mode
+        if mode == evidence.GATE_OFF:
+            return True
+        decision = evidence.decide(session, site=site)
+        self.gate_stats.record(decision)
+        if decision.accept:
+            return True
+        evidence.log_decision(mode, decision, session, site=site)
+        if mode != evidence.GATE_ENFORCE:
+            return True
+        self.gate_stats.indicators_withheld += 1
+        ind_id = attacker_ip_indicator_id(session.src_ip)
+        if ind_id:
+            self._gate_withheld_ids.add(ind_id)
+        return False
+
+    def indicator_available(self, indicator_id: Optional[str]) -> bool:
+        """May a producer anchor an edge on this attacker-IP Indicator?
+
+        False only when an ``enforce`` refusal withheld it in THIS bundle and
+        no other session here emitted it -- exactly the ids finalize_bundle
+        would strip. True otherwise, which includes Indicators OpenCTI may
+        already hold from earlier cycles: the builder cannot see OpenCTI,
+        so an address refused in an EARLIER cycle is not caught here (see
+        docs/EVIDENCE_GATE.md section 8). Always True outside ``enforce``.
+
+        For producers that record "sent" in durable state (campaigns), so
+        they skip a member now rather than mark it emitted and have
+        finalize_bundle silently drop its edge.
+        """
+        if not indicator_id or not self._gate_withheld_ids:
+            return True
+        return not (indicator_id in self._gate_withheld_ids
+                    and indicator_id not in self._emitted_ids)
+
+    def _site_sightings(
+        self,
+        ip_ind_id: Optional[str],
+        ipv4_id: Optional[str],
+        session: AttackSession,
+        **kwargs,
+    ) -> list[dict]:
+        """The dual Sighting for one of the five Indicator sites.
+
+        Before DR-02 every site called build_dual_sighting only inside
+        ``if ip_ind_id:``, so a session with no Indicator left no Sighting
+        at all -- not even the observable's, which records only that the
+        address was seen. With TPOT2CTI_SIGHTINGS_DECOUPLED on, the
+        observable side is emitted anyway; off keeps today's behaviour.
+        Either way the outcome is counted (evidence_gate.site_calls).
+        """
+        if ip_ind_id:
+            self.gate_stats.site_calls["with_indicator"] += 1
+            return self.build_dual_sighting(
+                ip_ind_id, ipv4_id, session.sensor_hostname, session, **kwargs)
+        if self._sightings_decoupled and ipv4_id:
+            self.gate_stats.site_calls["observable_only"] += 1
+            return self.build_dual_sighting(
+                None, ipv4_id, session.sensor_hostname, session, **kwargs)
+        self.gate_stats.site_calls["none"] += 1
+        return []
+
+    def finalize_bundle(self, objects: list[dict]) -> list[dict]:
+        """Last builder step before publish (called by main.run_cycle).
+
+        1. Counts observable-side Sightings with and without an Indicator.
+        2. ``enforce`` only: drops every relationship, and strips every
+           ``object_refs`` entry, that points at an Indicator a refusal
+           withheld and no other session in this bundle emitted. Several
+           producers anchor on the Indicator id without checking it exists
+           (build_session_attack_patterns, _build_web_session,
+           _build_protocol_session, _build_malware_session, campaigns,
+           attacker_profile), and OpenCTI accepts a dangling ref and then
+           never resolves it.
+
+        Returns ``objects`` itself when there is nothing to withhold, so
+        ``off`` and ``shadow`` hand the publisher the very same list.
+        """
+        stats = self.gate_stats
+        stats.observable_sightings_with_indicator = sum(
+            1 for v in self._obs_sighting_has_indicator.values() if v)
+        stats.observable_sightings_without_indicator = sum(
+            1 for v in self._obs_sighting_has_indicator.values() if not v)
+        withheld = self._gate_withheld_ids - self._emitted_ids
+        if not withheld:
+            return objects
+        kept: list[dict] = []
+        for obj in objects:
+            if obj.get("type") == "relationship" and (
+                    obj.get("source_ref") in withheld
+                    or obj.get("target_ref") in withheld):
+                stats.relationships_dropped += 1
+                continue
+            refs = obj.get("object_refs")
+            if isinstance(refs, list) and any(r in withheld for r in refs):
+                remaining = [r for r in refs if r not in withheld]
+                stats.object_refs_dropped += len(refs) - len(remaining)
+                if not remaining:
+                    # object_refs is REQUIRED on a Note/Report; one with
+                    # nothing left to reference cannot be published.
+                    continue
+                obj["object_refs"] = remaining
+            kept.append(obj)
+        return kept
 
     # ──────────────────────────────────────────────────────────────────
     # High-level convenience: build the common entity bundle for one
@@ -2869,8 +3077,10 @@ class STIXBuilder:
 
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
-        # IP Indicator + based-on → IPv4
-        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        # IP Indicator + based-on → IPv4 (only if the evidence gate permits)
+        ip_ind_id = (
+            self._emit_ip_indicator(session.src_ip, out=out, session=session)
+            if self._indicator_permitted(session, "cowrie") else None)
         if ip_ind_id:
             if rel := self.build_relationship(
                 ip_ind_id, "based-on", ipv4_id,
@@ -2993,13 +3203,12 @@ class STIXBuilder:
             self._emit_domain(fqdn, out=out, session=session)
 
         # Dual sighting (Indicator + Observable) — see build_dual_sighting
-        # docstring for the OpenCTI UX rationale.
-        if ip_ind_id:
-            out.extend(self.build_dual_sighting(
-                ip_ind_id, ipv4_id, session.sensor_hostname, session,
-                count=session.event_count,
-                description=render_cowrie_sighting_description(session),
-            ))
+        # docstring for the OpenCTI UX rationale, _site_sightings for DR-02.
+        out.extend(self._site_sightings(
+            ip_ind_id, ipv4_id, session,
+            count=session.event_count,
+            description=render_cowrie_sighting_description(session),
+        ))
 
         # Per-session Notes replaced by attacker-profile Notes emitted from
         # main.run_cycle (see tpot2cti/attacker_profile.py); per-session
@@ -3039,8 +3248,10 @@ class STIXBuilder:
 
         ipv4_id = attacker_ip_observable_id(session.src_ip)
 
-        # IP Indicator + based-on → IPv4
-        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        # IP Indicator + based-on → IPv4 (only if the evidence gate permits)
+        ip_ind_id = (
+            self._emit_ip_indicator(session.src_ip, out=out, session=session)
+            if self._indicator_permitted(session, "suricata") else None)
         if ip_ind_id:
             if rel := self.build_relationship(
                 ip_ind_id, "based-on", ipv4_id,
@@ -3170,11 +3381,7 @@ class STIXBuilder:
                     out.append(rel)
 
         # ── Dual sighting (Indicator + IPv4 observable) ───────────────
-        if ip_ind_id:
-            out.extend(self.build_dual_sighting(
-                ip_ind_id, ipv4_id, session.sensor_hostname, session,
-                count=1,
-            ))
+        out.extend(self._site_sightings(ip_ind_id, ipv4_id, session, count=1))
 
         return out
 
@@ -3218,11 +3425,13 @@ class STIXBuilder:
         # This one enriches the object IN PLACE before emitting, so it needs
         # the dict, not just the id -- hence _emit_node directly rather than
         # the _emit_ip_indicator wrapper. Same two-None contract either way.
-        ip_ind = self.build_ip_indicator(session.src_ip, session=session)
-        if ip_ind:
-            self._enrich_honeytrap_indicator(ip_ind, session, scan_labels, scan_phrase, fp)
-        ip_ind_id = self._emit_node(
-            ip_ind, out=out, node_id=attacker_ip_indicator_id(session.src_ip))
+        ip_ind_id: Optional[str] = None
+        if self._indicator_permitted(session, "honeytrap"):
+            ip_ind = self.build_ip_indicator(session.src_ip, session=session)
+            if ip_ind:
+                self._enrich_honeytrap_indicator(ip_ind, session, scan_labels, scan_phrase, fp)
+            ip_ind_id = self._emit_node(
+                ip_ind, out=out, node_id=attacker_ip_indicator_id(session.src_ip))
         if ip_ind_id:
             if rel := self.build_relationship(
                 ip_ind_id, "based-on", ipv4_id,
@@ -3230,12 +3439,12 @@ class STIXBuilder:
             ):
                 out.append(rel)
 
-            # Dual sighting (Indicator + IPv4 observable).
-            out.extend(self.build_dual_sighting(
-                ip_ind_id, ipv4_id, session.sensor_hostname, session,
-                count=session.event_count,
-                description=render_honeytrap_sighting_description(session, event),
-            ))
+        # Dual sighting (Indicator + IPv4 observable).
+        out.extend(self._site_sightings(
+            ip_ind_id, ipv4_id, session,
+            count=session.event_count,
+            description=render_honeytrap_sighting_description(session, event),
+        ))
 
         # Rare but valuable: a captured follow-up binary. Emit the File
         # observable + URL→File / probe→File edges via the shared chain.
@@ -3322,9 +3531,10 @@ class STIXBuilder:
             if attacker_objs:
                 ipv4_id = attacker_ip_observable_id(first.src_ip)
 
-            # IP Indicator + based-on → IPv4
-            ip_ind_id = self._emit_ip_indicator(
-                first.src_ip, out=out, session=session)
+            # IP Indicator + based-on → IPv4 (only if the evidence gate permits)
+            ip_ind_id = (
+                self._emit_ip_indicator(first.src_ip, out=out, session=session)
+                if self._indicator_permitted(session, "fallback") else None)
             if ip_ind_id:
                 if ipv4_id:
                     if rel := self.build_relationship(
@@ -3333,17 +3543,17 @@ class STIXBuilder:
                     ):
                         out.append(rel)
 
-                # Dual sighting on Indicator + IPv4 observable — per-event
-                # summary (unknown_type + dst_port) lives on the Sighting
-                # `description` field. Per LESSONS §7.1 we do NOT
-                # emit a separate Note per event for high-volume / low-
-                # signal protocols. If a maintainer wants per-event
-                # forensics, the raw doc is preserved on T-Pot's ES.
-                out.extend(self.build_dual_sighting(
-                    ip_ind_id, ipv4_id, session.sensor_hostname, session,
-                    count=session.event_count,
-                    description=render_fallback_sighting_description(first, unknown_type),
-                ))
+            # Dual sighting on Indicator + IPv4 observable — per-event
+            # summary (unknown_type + dst_port) lives on the Sighting
+            # `description` field. Per LESSONS §7.1 we do NOT
+            # emit a separate Note per event for high-volume / low-
+            # signal protocols. If a maintainer wants per-event
+            # forensics, the raw doc is preserved on T-Pot's ES.
+            out.extend(self._site_sightings(
+                ip_ind_id, ipv4_id, session,
+                count=session.event_count,
+                description=render_fallback_sighting_description(first, unknown_type),
+            ))
         else:
             # Edge case: unknown-type event has no src_ip.  Without an IP
             # there is no Sighting to attach a description to — emit a
@@ -3465,22 +3675,24 @@ class STIXBuilder:
         out.extend(self.build_sensor_context(session.sensor_hostname))
         out.extend(self.build_attacker_context(first, session=session))
 
-        # IP Indicator + Sighting
-        ip_ind_id = self._emit_ip_indicator(session.src_ip, out=out, session=session)
+        # IP Indicator (only if the evidence gate permits) + Sighting
+        ipv4_id = attacker_ip_observable_id(session.src_ip)
+        ip_ind_id = (
+            self._emit_ip_indicator(session.src_ip, out=out, session=session)
+            if self._indicator_permitted(session, "driveby") else None)
         if ip_ind_id:
             # based-on → IPv4 observable (already emitted above)
-            ipv4_id = attacker_ip_observable_id(session.src_ip)
             rel = self.build_relationship(
                 ip_ind_id, "based-on", ipv4_id,
                 description=f"IP indicator for {session.src_ip}",
             )
             if rel:
                 out.append(rel)
-            # Dual sighting (Indicator + IPv4 observable)
-            out.extend(self.build_dual_sighting(
-                ip_ind_id, ipv4_id, session.sensor_hostname, session,
-                count=session.event_count,
-            ))
+        # Dual sighting (Indicator + IPv4 observable)
+        out.extend(self._site_sightings(
+            ip_ind_id, ipv4_id, session,
+            count=session.event_count,
+        ))
 
         return out
 
