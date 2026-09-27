@@ -18,8 +18,8 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 - `parsers/sentrypeer.py`: `is_intl_dial` also covers the `011` (North
   American exit code) and `9011` (PBX outside line 9, then 011) prefixes,
   besides `+` and `00` (DR-01 M7: the same destinations are dialled all four
-  ways; `+`/`00` alone caught 78 of 89 long-number dialers). This flag is
-  also rendered in the SIP Note, so those sessions now say so.
+  ways; `+`/`00` alone caught 78 of 89 long-number dialers). Nothing outside
+  the gate reads the flag, so this changes no output in `off` or `shadow`.
 
 ### DR-02 evidence gate scaffolding (flags default to today's output)
 
