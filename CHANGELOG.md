@@ -17,9 +17,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   scoring moves to the classes with the rest of DR-01.
 - `parsers/sentrypeer.py`: `is_intl_dial` also covers the `011` (North
   American exit code) and `9011` (PBX outside line 9, then 011) prefixes,
-  besides `+` and `00` (DR-01 M7: the same destinations are dialled all four
-  ways; `+`/`00` alone caught 78 of 89 long-number dialers). Nothing outside
-  the gate reads the flag, so this changes no output in `off` or `shadow`.
+  besides `+` and `00` (DR-01 M7 saw the same destinations as `+`, `00`,
+  `011`, `9011`, `900` and bare; `+`/`00` alone caught 78 of 89 long-number
+  dialers; the owner approved `011`/`9011`). The whole value must now be the
+  prefix and ASCII digits (one trailing `;` allowed): `+1234abc` or
+  `0111234@sip` no longer count. Nothing outside the gate reads the flag, so
+  this changes no output in `off` or `shadow`.
+- Refusal log lines are grouped: one `evidence_gate` line per (reason, site,
+  address, sensor, type) per cycle, with `sessions` and `events` counts,
+  instead of one per session (SentryPeer REGISTERs alone would have been
+  ~28k lines a day).
 
 ### DR-02 evidence gate scaffolding (flags default to today's output)
 

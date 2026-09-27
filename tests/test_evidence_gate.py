@@ -157,6 +157,7 @@ IDENTICAL_STATES = {
     "unset": {},
     "off": {GATE: "off", DECOUPLED: "false", GRAIN: "legacy"},
     "shadow": {GATE: "shadow"},
+    "shadow+decoupled (the deployed state)": {GATE: "shadow", DECOUPLED: "true"},
     "enforce+decoupled (stub)": {GATE: "enforce", DECOUPLED: "true"},
     "enforce (stub)": {GATE: "enforce"},
     "decoupled only": {DECOUPLED: "true"},

@@ -2830,8 +2830,8 @@ class STIXBuilder:
         Indicator. The ONE place the builder consults tpot2cti.evidence.
 
         off      -> True without consulting the gate (today's output).
-        shadow   -> consult, count, log a refusal; always True.
-        enforce  -> consult, count, log a refusal; False on refusal, and
+        shadow   -> consult, count, group a refusal for the log; always True.
+        enforce  -> consult, count, group a refusal; False on refusal, and
                     the Indicator id is remembered so finalize_bundle can
                     drop references to it.
         """
@@ -2842,7 +2842,7 @@ class STIXBuilder:
         self.gate_stats.record(decision)
         if decision.accept:
             return True
-        evidence.log_decision(mode, decision, session, site=site)
+        self.gate_stats.record_refusal(decision, session, site=site)
         if mode != evidence.GATE_ENFORCE:
             return True
         self.gate_stats.indicators_withheld += 1
@@ -2914,6 +2914,7 @@ class STIXBuilder:
         ``off`` and ``shadow`` hand the publisher the very same list.
         """
         stats = self.gate_stats
+        evidence.log_refusals(self._gate_mode, stats)
         stats.observable_sightings_with_indicator = sum(
             1 for v in self._obs_sighting_has_indicator.values() if v)
         stats.observable_sightings_without_indicator = sum(

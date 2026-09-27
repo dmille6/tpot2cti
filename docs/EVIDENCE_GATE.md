@@ -44,14 +44,17 @@ are not gated: the gate decides whether an address is promoted.
 ## 2. What shadow logs
 
 Accepts are only counted, because one line per accepted session would be
-thousands of lines a cycle at hive scale. Each refusal writes one line whose
-message is `evidence_gate ` followed by a JSON object:
+thousands of lines a cycle at hive scale. Refusals are grouped per cycle by
+(reason, site, address, sensor, type): each group writes one line, when the
+bundle is finalized, whose message is `evidence_gate ` followed by a JSON
+object (one line per refused session would have been ~28k lines a day for
+SentryPeer REGISTERs alone):
 
 ```json
-{"action": "would-refuse", "event_count": 3, "event_type": "Cowrie",
- "first_seen": "2026-10-01T10:00:00+00:00", "mode": "shadow",
- "reason": "<DR-01 reason>", "sensor": "sensor01",
- "session_id": "…", "site": "cowrie", "src_ip": "…"}
+{"action": "would-refuse", "event_type": "Sentrypeer", "events": 41,
+ "first_seen": "2026-10-01T10:00:00+00:00", "last_seen": "2026-10-01T10:14:02+00:00",
+ "mode": "shadow", "reason": "sip-no-intl-dial", "sensor": "pbx-prod-01",
+ "sessions": 41, "site": "driveby", "src_ip": "…"}
 ```
 
 `action` is `refused` under `enforce`. To extract the lines from the JSON
@@ -128,9 +131,9 @@ Sighting the new mode never touches again keeps the old text.
 | Key | Meaning | Healthy reading |
 |---|---|---|
 | `mode`, `sightings_decoupled`, `sighting_grain` | the flags in force | what you deployed |
-| `accepted`, `refused` | sessions by gate reason (empty when `off`) | `stub-accept-all` only, until DR-01 |
+| `accepted`, `refused` | sessions by gate reason (empty when `off`) | `stub-accept-all`, plus `sip-fraud-intl-dial` / `sip-no-intl-dial` for SentryPeer (the other DR-01 classes pending) |
 | `accepted_total`, `refused_total` | sums of the above | refused share is the shadow's result |
-| `indicators_withheld` | refusals that withheld an Indicator (`enforce` only) | equals `refused_total` under `enforce` |
+| `indicators_withheld` | refused sessions under `enforce` (sessions, not Indicators: an address with 40 refused REGISTERs counts 40, and one of its sessions may still emit the Indicator) | equals `refused_total` under `enforce` |
 | `site_calls.with_indicator` | site calls where both Sighting sides existed | most calls |
 | `site_calls.observable_only` | calls where only the observable Sighting was emitted (decoupled) | grows with refusals once decoupled |
 | `site_calls.none` | calls that left **no** Sighting (no Indicator, not decoupled) | **0**; anything else is an observable Sighting lost |
@@ -186,8 +189,10 @@ flood pairs a day. Every other pair keeps its count.
 2. **`TPOT2CTI_EVIDENCE_GATE=shadow` and `TPOT2CTI_SIGHTINGS_DECOUPLED=true`**
    with the stub. This proves the plumbing only: output is still identical,
    and `accepted` shows `stub-accept-all` for every site call.
-3. **Deploy DR-01's `decide()` in shadow.** The 14-day shadow clock starts
-   here, not at step 2. Over the window, collect the refusal lines (for the
+3. **Deploy DR-01's `decide()` in shadow.** DR-01's classes land one at a
+   time; each class's 14-day shadow clock starts when it is deployed
+   (SIP_FRAUD first, owner decision 2026-09-27), and enforcement waits for
+   all of them. Over the window, collect the refusal lines (for the
    M2 join and the B-prime 5% trigger), `refused` by reason, and
    `last_cycle_duration_s` hourly (M3). The `/health` totals restart whenever
    the gate flags change (section 4). Deploying the predicate alone does not
@@ -244,6 +249,15 @@ diff the output.
 - **Under `enforce`, known gaps.** The cleanup in `finalize_bundle` sees one
   bundle only. It removes references to an Indicator withheld in that bundle,
   but it cannot know which Indicators OpenCTI already holds.
+  - **Blocking enforcement, over-strip across cycles:** an address whose
+    evidence session came in an EARLIER cycle (so OpenCTI holds its
+    Indicator) and whose later bundle has only refused sessions (e.g. a SIP
+    address that dialled abroad yesterday and only REGISTERs today) has its
+    Indicator treated as withheld, so the cleanup strips valid references to
+    it (the protocol AttackPattern `indicates` edge, profile Note refs). Also
+    note that Suricata SIP alerts on the same address still mint the
+    Indicator through the stub, so enforce may withhold less than shadow
+    counts suggest.
   - **Blocking enforcement:** attacker-profile Notes
     (`attacker_profile.py`, the live, daily and weekly emitters) put the
     address's Indicator id in `object_refs` for every active address. The
