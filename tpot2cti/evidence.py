@@ -24,7 +24,7 @@ one's. DR-01's classes land one at a time:
 
   * SIP_FRAUD (owner decision 2026-09-27): a SentryPeer session is evidence
     only when it dials an international number (``is_intl_dial``, set by
-    parsers/sentrypeer.py for "+", "00", "011" and "9011" prefixes). Any other
+    parsers/sentrypeer.py for "+", "00", "011", "9011" and "900" prefixes). Any other
     SentryPeer session (REGISTER, OPTIONS, an INVITE to a local number) is
     refused: in ``enforce`` it keeps its observable and Sighting but mints no
     Indicator.
