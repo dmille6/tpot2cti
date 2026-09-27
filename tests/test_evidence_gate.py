@@ -96,12 +96,26 @@ def test_gate_setting_parses_like_the_other_env_switches(raw, want):
     assert H.make_cfg({GATE: raw}).cycle.evidence_gate == want
 
 
-@pytest.mark.parametrize("key,bad", [(GATE, "enfroce"), (GATE, "on"),
-                                     (GRAIN, "per-type")])
+@pytest.mark.parametrize("key,bad", [
+    (GATE, "enfroce"), (GATE, "on"), (GRAIN, "per-type"),
+    # A boolean typo used to fall back to the default (false) silently.
+    (DECOUPLED, "ture"), (DECOUPLED, "flase"), (DECOUPLED, "enabled"),
+    (DECOUPLED, "2"), (DECOUPLED, "yes please"),
+])
 def test_a_typo_in_a_dr02_switch_stops_startup(key, bad):
     """A misspelt safety switch must not quietly mean 'off'."""
     with pytest.raises(ConfigError, match=key):
         H.make_cfg({key: bad})
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("true", True), ("TRUE", True), ("1", True), ("yes", True), ("On", True),
+    ("y", True), ("t", True), ("true  # rollout step 2", True),
+    ("false", False), ("0", False), ("NO", False), ("off", False), ("n", False),
+    ("f", False), ("", False), ("   ", False),
+])
+def test_decoupled_flag_accepts_the_boolean_vocabulary(raw, want):
+    assert H.make_cfg({DECOUPLED: raw}).cycle.sightings_decoupled is want
 
 
 def test_counts_pattern_is_separate_and_defaults_to_the_event_pattern():
@@ -365,6 +379,10 @@ def test_a_refused_indicator_emitted_by_another_session_keeps_its_edges(monkeypa
     assert ind in {o["id"] for o in objs}, "Cowrie accepted it, so it is emitted"
     assert b.gate_stats.refused == {"test-refuse": 1}
     assert b.gate_stats.relationships_dropped == 0
+    # The predicate campaigns use agrees: withheld by one session, emitted by
+    # another, so it is available to anchor on.
+    assert ind in b._gate_withheld_ids, "guard: the refusal did withhold it"
+    assert b.indicator_available(ind)
 
 
 def test_finalize_returns_the_same_list_when_nothing_is_withheld():
@@ -587,6 +605,149 @@ def test_counters_reach_state_and_health(tmp_path, monkeypatch):
     assert eg["last_cycle"] == last
     assert eg["totals"]["refused_total"] == 2 * n_suricata
 
+    # A flag change starts a new counting period with a new `since`: the
+    # enforce window must not carry the shadow cycles before it.
+    from datetime import timedelta
+    later = H.FIXED_NOW + timedelta(hours=1)
+    cfg2 = H.make_cfg({GATE: "enforce", DECOUPLED: "true"})
+    s3 = run_cycle(cfg2, state, H.FakeES(docs, {}), lambda: H._fixed_builder(cfg2),
+                   H.CapturingPublisher(), now=later)
+    totals = json.loads(state.get("evidence_gate_totals"))
+    assert totals["cycles"] == 1
+    assert totals["mode"] == "enforce"
+    assert totals["since"] == later.isoformat()
+    assert totals["refused"] == s3["evidence_gate"]["refused"] == {"test-refuse": n_suricata}
+
+
+class _FailingPublisher(H.CapturingPublisher):
+    def publish(self, objects, cycle_id=None):
+        from types import SimpleNamespace
+        self.objects = list(objects)
+        return SimpleNamespace(cycle_id=cycle_id, pass_counts={}, errors=["boom"])
+
+
+def test_a_failed_publish_is_not_added_to_the_totals(tmp_path):
+    """A failed cycle is retried over the same window; counting it would
+    count those sessions twice."""
+    from tpot2cti.main import run_cycle
+    from tpot2cti.state import CycleState
+    cfg = H.make_cfg({GATE: "shadow"})
+    docs, _ = H.load_cycle_docs()
+    state = CycleState(db_path=tmp_path / "state.db")
+    ok = run_cycle(cfg, state, H.FakeES(docs, {}), lambda: H._fixed_builder(cfg),
+                   H.CapturingPublisher(), now=H.FIXED_NOW)
+    bad = run_cycle(cfg, state, H.FakeES(docs, {}), lambda: H._fixed_builder(cfg),
+                    _FailingPublisher(), now=H.FIXED_NOW)
+    assert ok["publish_ok"] is True and bad["publish_ok"] is False
+    totals = json.loads(state.get("evidence_gate_totals"))
+    assert totals["cycles"] == 1
+    assert totals["accepted_total"] == ok["evidence_gate"]["accepted_total"]
+    # last_cycle still describes the latest attempt.
+    assert json.loads(state.get("last_cycle_evidence_gate")) == bad["evidence_gate"]
+
+
+def _raise(*a, **k):
+    raise RuntimeError("cleanup exploded")
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow"])
+def test_finalize_failure_outside_enforce_publishes_the_unfiltered_bundle(
+        mode, tmp_path, monkeypatch, caplog):
+    from tpot2cti.stix.builder import STIXBuilder
+    monkeypatch.setattr(STIXBuilder, "finalize_bundle", _raise)
+    with caplog.at_level(logging.ERROR, logger="tpot2cti.main"):
+        objs, summary, _, state = H.cycle_bundle(tmp_path, {GATE: mode})
+    assert summary["publish_ok"] is True
+    assert state.get_last_run() is not None
+    assert H.digest(objs) == H.golden()["cycle"]
+    assert any("bookkeeping failed" in r.getMessage() for r in caplog.records)
+
+
+def test_finalize_failure_under_enforce_fails_closed(tmp_path, monkeypatch, caplog):
+    from tpot2cti.stix.builder import STIXBuilder
+    monkeypatch.setattr(STIXBuilder, "finalize_bundle", _raise)
+    with caplog.at_level(logging.ERROR, logger="tpot2cti.main"):
+        objs, summary, _, state = H.cycle_bundle(
+            tmp_path, {GATE: "enforce", DECOUPLED: "true"})
+    assert objs == [], "nothing may be published without the enforce cleanup"
+    assert summary["publish_ok"] is False
+    assert state.get_last_run() is None, "the window must be retried"
+    assert state.get("evidence_gate_totals") is None
+    assert any("FAILED under enforce" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 9. Campaigns under enforce: a withheld member is deferred, not marked sent
+# ---------------------------------------------------------------------------
+
+def test_campaign_member_with_withheld_indicator_is_deferred(state_db, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from tpot2cti import campaigns
+    from tpot2cti.parsers.base import AttackSession, ParsedEvent
+    from tpot2cti.stix_ids import generate_campaign_id
+
+    sha = "c" * 64
+    key = f"malware:{sha}"
+    ip_a, ip_b = "45.10.1.1", "45.10.1.2"
+    t0 = datetime(2026, 3, 7, 10, 0, tzinfo=timezone.utc)
+
+    def sess(ip, at):
+        ev = ParsedEvent(src_ip=ip, timestamp=at, sensor_hostname="node1",
+                         event_type="Cowrie", dst_port=22, protocol="tcp")
+        s = AttackSession.from_event(ev)
+        s.malware_hashes.append(sha)
+        return s
+
+    def refuse_b(session, *, site):
+        if session.src_ip == ip_b:
+            return REFUSE
+        return evidence.GateDecision(True, "test-accept")
+    monkeypatch.setattr(evidence, "decide", refuse_b)
+
+    cfg = H.make_cfg({GATE: "enforce", DECOUPLED: "true"})
+    b = H._fixed_builder(cfg)
+    objs = []
+    for s in (sess(ip_a, t0), sess(ip_b, t0 + timedelta(minutes=5))):
+        campaigns.record_session_artifacts(state_db, s)
+        with b.session_context(s):
+            objs.extend(b.build_cowrie_session(s))
+    ind_a, ind_b = attacker_ip_indicator_id(ip_a), attacker_ip_indicator_id(ip_b)
+    assert b.indicator_available(ind_a) and not b.indicator_available(ind_b)
+
+    camp_objs = campaigns.emit_campaigns(state_db, b, [key])
+    camp_id = generate_campaign_id(key)
+    edges = {o["source_ref"] for o in camp_objs
+             if o.get("type") == "relationship" and o["target_ref"] == camp_id}
+    assert edges == {ind_a}, "only the member with an Indicator gets an edge"
+    before = b.gate_stats.relationships_dropped
+    b.finalize_bundle(objs + camp_objs)
+    assert b.gate_stats.relationships_dropped == before, \
+        "the campaign loop must not produce edges the cleanup then drops"
+    emitted = {r["src_ip"]: r["emitted"] for r in state_db.get_campaign_artifact_rows(key)}
+    assert emitted[ip_a] and not emitted[ip_b], \
+        "a deferred member must stay pending, not be marked sent"
+
+    # Next cycle B is accepted: its edge is attached then.
+    monkeypatch.setattr(evidence, "decide",
+                        lambda session, *, site: evidence.GateDecision(True, "ok"))
+    b2 = H._fixed_builder(cfg)
+    s_b = sess(ip_b, t0 + timedelta(minutes=30))
+    campaigns.record_session_artifacts(state_db, s_b)
+    with b2.session_context(s_b):
+        b2.build_cowrie_session(s_b)
+    camp2 = campaigns.emit_campaigns(state_db, b2, [key])
+    edges2 = {o["source_ref"] for o in camp2
+              if o.get("type") == "relationship" and o["target_ref"] == camp_id}
+    assert edges2 == {ind_b}
+    assert all(r["emitted"] for r in state_db.get_campaign_artifact_rows(key))
+
+
+def test_indicator_available_is_always_true_outside_enforce(monkeypatch):
+    _refuse_all(monkeypatch)
+    _, b = H.direct_bundle({GATE: "shadow"})
+    assert b.indicator_available(attacker_ip_indicator_id(H.DIRECT_IP))
+    assert b.indicator_available(None)
+
 
 def test_health_before_any_cycle_has_no_gate_block(state_db):
     from tpot2cti.health import HealthStatus
@@ -603,17 +764,33 @@ def test_off_mode_still_reports_sighting_counters(tmp_path):
     assert gs["site_calls"]["none"] == 0
 
 
-def test_merge_totals_sums_counters_and_keeps_latest_flags():
-    a = evidence.GateStats(mode="shadow")
+def test_merge_totals_sums_counters_within_one_flag_set():
+    a = evidence.GateStats(mode="shadow", sightings_decoupled=True)
     a.record(evidence.GateDecision(True, "x"))
     a.site_calls["with_indicator"] += 2
-    b = evidence.GateStats(mode="enforce", sightings_decoupled=True)
+    b = evidence.GateStats(mode="shadow", sightings_decoupled=True)
     b.record(evidence.GateDecision(False, "y"))
-    b.indicators_withheld = 1
-    t = evidence.merge_totals(None, a.to_dict())
-    t = evidence.merge_totals(t, b.to_dict())
-    assert t["cycles"] == 2
+    t = evidence.merge_totals(None, a.to_dict(), now_iso="T1")
+    t = evidence.merge_totals(t, b.to_dict(), now_iso="T2")
+    assert t["cycles"] == 2 and t["since"] == "T1"
     assert t["accepted"] == {"x": 1} and t["refused"] == {"y": 1}
     assert t["site_calls"]["with_indicator"] == 2
-    assert t["indicators_withheld"] == 1
-    assert t["mode"] == "enforce" and t["sightings_decoupled"] is True
+
+
+@pytest.mark.parametrize("change", [
+    {"mode": "enforce"}, {"sightings_decoupled": False},
+    {"sighting_grain": "sensor-ip-day"}])
+def test_merge_totals_restarts_when_any_flag_changes(change):
+    base = evidence.GateStats(mode="shadow", sightings_decoupled=True)
+    base.record(evidence.GateDecision(False, "y"))
+    base.indicators_withheld = 3
+    t = evidence.merge_totals(None, base.to_dict(), now_iso="T1")
+    nxt = evidence.GateStats(**{"mode": "shadow", "sightings_decoupled": True,
+                                "sighting_grain": "legacy", **change})
+    nxt.record(evidence.GateDecision(True, "x"))
+    t = evidence.merge_totals(t, nxt.to_dict(), now_iso="T2")
+    assert t["since"] == "T2" and t["cycles"] == 1
+    assert t["refused"] == {} and t["indicators_withheld"] == 0
+    assert t["accepted"] == {"x": 1}
+    for k, v in change.items():
+        assert t[k] == v

@@ -1142,20 +1142,36 @@ def run_cycle(
     # ── Step 5c: DR-02 evidence gate bookkeeping ──────────────────────
     # finalize_bundle returns the SAME list unless enforce withheld an
     # Indicator; then it drops every reference to it (docs/EVIDENCE_GATE.md).
-    all_objects = builder.finalize_bundle(all_objects)
-    evidence_gate_stats = builder.gate_stats.to_dict()
-    logger.info("evidence_gate_summary %s",
-                json.dumps(evidence_gate_stats, sort_keys=True))
+    #
+    # Never aborts the cycle. If it raises:
+    #   off / shadow -> log, publish the unfiltered bundle. Nothing was
+    #                   withheld, so the unfiltered bundle IS the result.
+    #   enforce      -> fail closed: log at ERROR, publish nothing, keep
+    #                   the cursor, so the next cycle retries the window.
+    #                   An unfiltered bundle could carry edges to withheld
+    #                   Indicators, which OpenCTI never resolves.
+    gate_block_publish = False
     try:
-        state.set("last_cycle_evidence_gate", json.dumps(evidence_gate_stats))
-        from tpot2cti.evidence import merge_totals
-        _prev = state.get("evidence_gate_totals")
-        _totals = merge_totals(json.loads(_prev) if _prev else None,
-                               evidence_gate_stats)
-        _totals.setdefault("since", now.isoformat())
-        state.set("evidence_gate_totals", json.dumps(_totals))
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"cycle {cycle_id}: could not persist evidence gate stats: {e}")
+        all_objects = builder.finalize_bundle(all_objects)
+    except Exception as e:  # noqa: BLE001
+        if cfg.cycle.evidence_gate == "enforce":
+            gate_block_publish = True
+            logger.exception(
+                f"cycle {cycle_id}: evidence gate cleanup FAILED under enforce "
+                f"({e}); publish withheld and cursor kept, the window will be "
+                f"retried next cycle")
+        else:
+            logger.exception(
+                f"cycle {cycle_id}: evidence gate bookkeeping failed ({e}); "
+                f"publishing the unfiltered bundle (gate mode "
+                f"{cfg.cycle.evidence_gate!r} withholds nothing)")
+    try:
+        evidence_gate_stats = builder.gate_stats.to_dict()
+        logger.info("evidence_gate_summary %s",
+                    json.dumps(evidence_gate_stats, sort_keys=True))
+    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+        evidence_gate_stats = {"error": str(e)}
+        logger.warning(f"cycle {cycle_id}: evidence gate counters unavailable: {e}")
 
     # ── Step 6: publish ───────────────────────────────────────────────
     sdos_by_type = _count_by_type(all_objects)
@@ -1163,6 +1179,9 @@ def run_cycle(
     publish_errors: list[str] = []
     publish_result: Any = None
     try:
+        if gate_block_publish:
+            raise RuntimeError(
+                "evidence gate cleanup failed under enforce; publish withheld")
         publish_result = publisher.publish(
             all_objects, cycle_id=str(cycle_id)
         )
@@ -1191,6 +1210,22 @@ def run_cycle(
             f"cycle {cycle_id}: publish failed; NOT advancing last_run "
             f"(next cycle will retry the same window)"
         )
+
+    # DR-02 counters for /health. `last_cycle` is written every cycle (it
+    # describes the latest attempt); the running totals only after a
+    # successful publish, because a failed one is retried over the same
+    # window and would otherwise be counted twice. Totals restart, with a
+    # new `since`, whenever the gate flags change (evidence.merge_totals).
+    try:
+        state.set("last_cycle_evidence_gate", json.dumps(evidence_gate_stats))
+        if publish_ok and "error" not in evidence_gate_stats:
+            from tpot2cti.evidence import merge_totals
+            _prev = state.get("evidence_gate_totals")
+            state.set("evidence_gate_totals", json.dumps(merge_totals(
+                json.loads(_prev) if _prev else None,
+                evidence_gate_stats, now_iso=now.isoformat())))
+    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+        logger.warning(f"cycle {cycle_id}: could not persist evidence gate stats: {e}")
 
     # ── Step 8: cycle summary ─────────────────────────────────────────
     duration_s = time.monotonic() - started_monotonic

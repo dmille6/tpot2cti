@@ -2851,6 +2851,25 @@ class STIXBuilder:
             self._gate_withheld_ids.add(ind_id)
         return False
 
+    def indicator_available(self, indicator_id: Optional[str]) -> bool:
+        """May a producer anchor an edge on this attacker-IP Indicator?
+
+        False only when an ``enforce`` refusal withheld it in THIS bundle and
+        no other session here emitted it -- exactly the ids finalize_bundle
+        would strip. True otherwise, which includes Indicators OpenCTI may
+        already hold from earlier cycles: the builder cannot see OpenCTI,
+        so an address refused in an EARLIER cycle is not caught here (see
+        docs/EVIDENCE_GATE.md section 8). Always True outside ``enforce``.
+
+        For producers that record "sent" in durable state (campaigns), so
+        they skip a member now rather than mark it emitted and have
+        finalize_bundle silently drop its edge.
+        """
+        if not indicator_id or not self._gate_withheld_ids:
+            return True
+        return not (indicator_id in self._gate_withheld_ids
+                    and indicator_id not in self._emitted_ids)
+
     def _site_sightings(
         self,
         ip_ind_id: Optional[str],

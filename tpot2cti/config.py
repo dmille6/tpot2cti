@@ -261,6 +261,34 @@ def _env_bool(env: dict, key: str, default: bool) -> bool:
     return truthy_str(env.get(key), default)
 
 
+_STRICT_TRUE = frozenset({"true", "1", "yes", "on", "y", "t"})
+_STRICT_FALSE = frozenset({"false", "0", "no", "off", "n", "f"})
+
+
+def _env_bool_strict(env: dict, key: str, default: bool) -> bool:
+    """Like :func:`_env_bool`, but an unrecognised non-empty value is a
+    ConfigError instead of the default. For safety switches, where
+    ``TPOT2CTI_SIGHTINGS_DECOUPLED=ture`` silently meaning false would turn
+    an intended protection off without a trace.
+
+    Same vocabulary as ``tpot2cti.env.truthy_str`` (case-insensitive,
+    inline ``# comment`` stripped); empty or unset -> ``default``.
+    """
+    raw = env.get(key)
+    if raw is None:
+        return default
+    val = str(raw).split("#", 1)[0].strip().lower()
+    if not val:
+        return default
+    if val in _STRICT_TRUE:
+        return True
+    if val in _STRICT_FALSE:
+        return False
+    raise ConfigError(
+        f"{key} must be a boolean (true/1/yes/on/y/t or false/0/no/off/n/f); "
+        f"got {raw!r}")
+
+
 def _env_choice(env: dict, key: str, default: str, choices: tuple) -> str:
     """A small enum setting: case-insensitive, inline ``# comment`` stripped
     (the docker --env-file footgun, see env.py), empty/unset -> default.
@@ -388,7 +416,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         drop_recon_process=_env_bool(env, "TPOT2CTI_DROP_RECON_PROCESS", default=True),
         evidence_gate=_env_choice(env, "TPOT2CTI_EVIDENCE_GATE", "off",
                                   ("off", "shadow", "enforce")),
-        sightings_decoupled=_env_bool(env, "TPOT2CTI_SIGHTINGS_DECOUPLED", default=False),
+        sightings_decoupled=_env_bool_strict(
+            env, "TPOT2CTI_SIGHTINGS_DECOUPLED", default=False),
         sighting_grain=_env_choice(env, "TPOT2CTI_SIGHTING_GRAIN", "legacy",
                                    SIGHTING_GRAINS),
     )

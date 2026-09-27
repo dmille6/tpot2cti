@@ -156,14 +156,25 @@ def log_decision(mode: str, decision: GateDecision, session, *, site: str) -> No
     logger.info("evidence_gate %s", json.dumps(payload, sort_keys=True, default=str))
 
 
-def merge_totals(totals: Optional[dict], cycle: dict) -> dict:
+#: The flags whose combination defines one counting period.
+_TOTALS_FLAGS = ("mode", "sightings_decoupled", "sighting_grain")
+
+
+def merge_totals(totals: Optional[dict], cycle: dict, *, now_iso: str) -> dict:
     """Add one cycle's :meth:`GateStats.to_dict` into running totals.
 
     Totals exist so an hourly sampler (the DR-02 M3 measurement) sees every
-    cycle, not one in four. Only the additive counters are summed; the
-    flags are reported as of the latest cycle.
+    cycle, not one in four. Only the additive counters are summed.
+
+    They RESTART, with ``since = now_iso``, when (mode, sightings_decoupled,
+    sighting_grain) differ from the stored ones -- a shadow window must not
+    carry the off-mode cycles before it -- and when there are none yet.
+    main.run_cycle calls this only after a successful publish, so a failed
+    cycle retried over the same window is counted once.
     """
-    t = dict(totals or {})
+    if not totals or any(totals.get(k) != cycle.get(k) for k in _TOTALS_FLAGS):
+        totals = {"since": now_iso}
+    t = dict(totals)
     t["cycles"] = int(t.get("cycles", 0)) + 1
     for key in ("accepted", "refused", "site_calls", "observable_sightings"):
         merged = dict(t.get(key) or {})
@@ -173,6 +184,6 @@ def merge_totals(totals: Optional[dict], cycle: dict) -> dict:
     for key in ("accepted_total", "refused_total", "indicators_withheld",
                 "relationships_dropped", "object_refs_dropped"):
         t[key] = int(t.get(key, 0)) + int(cycle.get(key, 0))
-    for key in ("mode", "sightings_decoupled", "sighting_grain"):
+    for key in _TOTALS_FLAGS:
         t[key] = cycle.get(key)
     return t

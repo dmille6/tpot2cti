@@ -13,14 +13,23 @@
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | `TPOT2CTI_EVIDENCE_GATE` | `off`, `shadow`, `enforce` | `off` | `off`: the gate is never consulted and output is byte-identical to the builder before the gate existed. `shadow`: every decision is counted and each refusal is logged; nothing emitted changes. `enforce`: a refused session mints no attacker-IP Indicator, and the bundle carries no relationship or `object_refs` entry pointing at an Indicator that was withheld and not emitted by another session. |
-| `TPOT2CTI_SIGHTINGS_DECOUPLED` | boolean | `false` | Emit the observable's `:ipv4` Sighting at all five dual-sighting sites even when no Indicator was minted, whether the gate refused it or it could not be built. Off keeps today's behaviour: no Indicator means no Sighting at all. |
+| `TPOT2CTI_SIGHTINGS_DECOUPLED` | `true`/`1`/`yes`/`on`/`y`/`t`, `false`/`0`/`no`/`off`/`n`/`f` | `false` | Emit the observable's `:ipv4` Sighting at all five dual-sighting sites even when no Indicator was minted, whether the gate refused it or it could not be built. Off keeps today's behaviour: no Indicator means no Sighting at all. |
 | `TPOT2CTI_SIGHTING_GRAIN` | `legacy`, `sensor-ip-day` | `legacy` | See section 3. |
 | `TPOT2CTI_COUNTS_INDEX_PATTERN` | index pattern | `ES_INDEX_PATTERN` | See section 5. |
 
 A value that is not in the list stops startup with a `ConfigError`, so a
-typo in a safety switch cannot quietly mean `off`. `enforce` without
-decoupled sightings is allowed but logs a warning at startup, and every
-refusal then shows up in `site_calls.none` (section 4).
+typo in a safety switch cannot quietly mean `off`. This includes the boolean:
+`TPOT2CTI_SIGHTINGS_DECOUPLED=ture` is an error, not `false`. Values are
+case-insensitive, an inline `# comment` is stripped, and empty means the
+default. `enforce` without decoupled sightings is allowed but logs a warning
+at startup, and every refusal then shows up in `site_calls.none` (section 4).
+
+**A bad value stops more than the core.** The malware-ingest, noisefloor,
+blocklists and lookup sidecars read the same `.env` (`env_file: [.env]` in
+`docker-compose.yml`) and call the same `load_config`. A typo in one of these
+settings therefore crash-loops all five containers, not only `tpot2cti`.
+Check the value with `docker compose -p tpot2cti logs --tail 20` after every
+change, and fix it before anything else.
 
 The five sites are the builder methods that mint an attacker-IP Indicator
 and call `build_dual_sighting`: `build_cowrie_session`,
@@ -92,13 +101,26 @@ aggregation carries a `terms` sub-aggregation on `type.keyword` (size 64), so
 a narrow later cycle cannot shrink a list that OpenCTI replaces on upsert.
 Time that query (M4) before switching the mode on.
 
+**Switch the grain at a UTC day boundary**, in either direction. The
+description is replaced on every upsert, so switching mid-day gives that day's
+Sightings a description that changes format part-way through the day. A
+Sighting the new mode never touches again keeps the old text.
+
 ## 4. Counters in `/health`
 
 `/health` gains `evidence_gate: {"last_cycle": {...}, "totals": {...}}`
 (`null` before the first cycle). `last_cycle` is also in the cycle summary.
-`totals` sums every cycle since `since` (the first cycle that wrote it) and
-lives in the state DB. Delete the `evidence_gate_totals` key to restart the
-count; DR-03's reset empties it too.
+`totals` sums the cycles since `since` and lives in the state DB.
+
+- **Totals restart**, with a new `since`, whenever `mode`,
+  `sightings_decoupled` or `sighting_grain` differ from the stored values. A
+  shadow window therefore never includes the off-mode cycles before it.
+  Delete the `evidence_gate_totals` key to restart by hand; DR-03's reset
+  empties it too.
+- **Totals count only cycles whose publish succeeded.** A failed cycle is
+  retried over the same window and would otherwise be counted twice.
+  `last_cycle` is written every cycle, successful or not, and describes the
+  latest attempt.
 
 | Key | Meaning | Healthy reading |
 |---|---|---|
@@ -115,6 +137,22 @@ count; DR-03's reset empties it too.
 
 For the DR-02 M3 measurement, sample `/health` hourly: differences between
 successive `totals` cover every cycle, not one in four.
+
+### When the bookkeeping itself fails
+
+`finalize_bundle` (the enforce cleanup plus the Sighting counters) and the
+counter persistence never abort a cycle:
+
+- **`off` and `shadow`:** the error is logged at ERROR and the unfiltered
+  bundle is published. Nothing was withheld, so that bundle is the correct
+  result. A persistence failure is logged at WARNING and the counters are
+  skipped for that cycle.
+- **`enforce`: fail closed.** A cleanup failure is logged at ERROR as
+  `evidence gate cleanup FAILED under enforce`, nothing is published, and the
+  cursor does not advance, so the next cycle retries the same window. An
+  unfiltered bundle could carry edges to withheld Indicators, and OpenCTI
+  never resolves those. A cleanup that keeps failing shows up as a cycle
+  that never succeeds, and `/health` turns stale on its no-success ceiling.
 
 ## 5. Counts index pattern and DR-07 phase 2
 
@@ -148,8 +186,12 @@ flood pairs a day. Every other pair keeps its count.
 3. **Deploy DR-01's `decide()` in shadow.** The 14-day shadow clock starts
    here, not at step 2. Over the window, collect the refusal lines (for the
    M2 join and the B-prime 5% trigger), `refused` by reason, and
-   `last_cycle_duration_s` hourly (M3).
-4. **Enforce** only when both hold over the 14 days:
+   `last_cycle_duration_s` hourly (M3). The `/health` totals restart whenever
+   the gate flags change (section 4). Deploying the predicate alone does not
+   restart them, so note the deploy time, or delete `evidence_gate_totals`
+   when the predicate goes live, so the totals cover exactly the window.
+4. **Enforce** only when the known gaps in section 8 marked as blocking are
+   closed, and both of these hold over the 14 days:
    - cycle p95 is at or under 450 s, and
    - no observable Sighting is lost: `totals.site_calls.none` stays 0 with
      decoupling on, and after the switch the per-cycle observable Sighting
@@ -196,8 +238,25 @@ diff the output.
   `object_max_state`.
 - **DR-07 phase 2 count summing** (section 5), after the transform is
   deployed.
-- **Under `enforce`, known gaps to close with DR-01:** the campaign ledger
-  marks members emitted even when their `indicates` edge was dropped, so it
-  is not re-emitted later. The Indicator decision is per session, so an
-  address refused in one session and accepted in another in the same bundle
-  is emitted, and its references stay.
+- **Under `enforce`, known gaps.** The cleanup in `finalize_bundle` sees one
+  bundle only. It removes references to an Indicator withheld in that bundle,
+  but it cannot know which Indicators OpenCTI already holds.
+  - **Blocking enforcement:** attacker-profile Notes
+    (`attacker_profile.py`, the live, daily and weekly emitters) put the
+    address's Indicator id in `object_refs` for every active address. The
+    daily and weekly Notes cover addresses from earlier cycles. An address
+    refused in an earlier cycle, whose Indicator was never created, is
+    therefore referenced from a later bundle that did not withhold it, and
+    the cleanup does not catch it. These Notes need an "Indicator exists"
+    check (state or OpenCTI) before `enforce`.
+  - **Closed in this change:** the campaign ledger used to mark every pending
+    member emitted even when the cleanup later dropped its `indicates` edge,
+    so that member was never attached. `emit_campaigns` now asks
+    `STIXBuilder.indicator_available()`, skips members whose Indicator was
+    withheld in this bundle, and marks only the members it kept. The skipped
+    ones stay pending and are attached in the cycle where their Indicator
+    exists. Members refused in an earlier cycle have the same cross-cycle
+    limit as the Notes above, because the predicate cannot see OpenCTI.
+  - **By design:** the Indicator decision is per session. An address refused
+    in one session and accepted in another in the same bundle is emitted, and
+    its references stay.

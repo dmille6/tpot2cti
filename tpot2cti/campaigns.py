@@ -267,6 +267,22 @@ def emit_campaigns(
         pending = [r for r in rows if not r["emitted"]]
         if not pending:
             continue  # threshold met but nothing new to attach
+        # DR-02 enforce: a member whose Indicator the evidence gate withheld
+        # in this bundle gets no edge now. It must NOT be marked emitted
+        # either: finalize_bundle would drop the edge after this ledger said
+        # it was sent, and the member would never be attached. Skipped
+        # members stay pending and are retried when their Indicator exists.
+        # Outside enforce indicator_available is always True.
+        deferred = [r for r in pending
+                    if not builder.indicator_available(
+                        attacker_ip_indicator_id(r["src_ip"]))]
+        if deferred:
+            pending = [r for r in pending if r not in deferred]
+            logger.info(
+                "campaigns: %s — %d member(s) deferred, Indicator withheld by "
+                "the evidence gate this cycle", key, len(deferred))
+        if not pending:
+            continue
 
         a_type = rows[0]["artifact_type"]
         defn = _CAMPAIGN_DEFS.get(a_type)

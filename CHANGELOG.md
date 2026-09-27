@@ -32,6 +32,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   refused decisions by reason, Indicators withheld, dual-sighting site
   outcomes (`with_indicator` / `observable_only` / `none`), observable
   Sightings with and without an Indicator, and references dropped.
+- **Review changes (both reviews: merge with changes):**
+  `TPOT2CTI_SIGHTINGS_DECOUPLED` is parsed strictly, so `ture` is a
+  `ConfigError`, not `false`. The `/health` totals restart when the gate flags
+  change and count only successfully published cycles. `emit_campaigns` skips
+  members whose Indicator was withheld and marks only the members it kept, so
+  a deferred member is attached later instead of being lost. A failure in the
+  gate bookkeeping never aborts a cycle: `off` and `shadow` publish the
+  unfiltered bundle, and `enforce` fails closed (no publish, cursor kept). The
+  cross-cycle gap in attacker-profile Notes is documented as blocking
+  enforcement.
 - **Evidence:** with every flag at its default, and in `shadow`, `enforce` and
   decoupled modes with the stub, the bundle is byte-identical to origin/main
   71e47ec for all 23 real fixtures through `run_cycle` and for one session per
