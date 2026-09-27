@@ -1,12 +1,15 @@
 # Evidence gate (DR-02)
 
-> **Status: scaffolding shipped, rules pending.** The gate, the decoupled
-> sightings, the sighting grain, the counters and the counts pattern exist in
-> code behind flags that default to today's output. The rules that decide
-> what is evidence (the evidence classes) come from DR-01. Until then
-> `tpot2cti/evidence.py:decide()` accepts every session, so `shadow` and
-> `enforce` change nothing yet. [`EVIDENCE.md`](EVIDENCE.md) is the design
-> contract these rules will implement.
+> **Status: scaffolding shipped; first rule (SIP_FRAUD) in.** The gate, the
+> decoupled sightings, the sighting grain, the counters and the counts pattern
+> exist in code behind flags that default to today's output. The rules that
+> decide what is evidence (the evidence classes) come from DR-01, one class at
+> a time. In so far: **SIP_FRAUD** (owner, 2026-09-27): a SentryPeer session is
+> accepted (`sip-fraud-intl-dial`) only when it dialled an international number
+> (`is_intl_dial`: `+`, `00`, `011` or `9011` then at least four digits), and
+> refused (`sip-no-intl-dial`) otherwise. Every other session is still accepted
+> by the stub (`stub-accept-all`). [`EVIDENCE.md`](EVIDENCE.md) is the design
+> contract these rules implement.
 
 ## 1. Flags
 
