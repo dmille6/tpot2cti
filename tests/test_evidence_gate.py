@@ -146,13 +146,18 @@ def test_counts_pattern_naming_the_transform_index_warns(caplog):
 # 2. Byte identity against origin/main (golden digests)
 # ---------------------------------------------------------------------------
 
-#: Flag states whose output must equal today's with the stub gate. The
-#: decoupled rows qualify only because every stub-gated site has an
-#: Indicator; the decoupling tests below cover what changes when one does not.
+#: Flag states whose output must equal today's. off and shadow run the REAL
+#: decide() (with DR-01's classes, which in shadow must change nothing). The
+#: enforce rows run with the stub (_stub_decide), because a real class
+#: withholds by design (tests/test_evidence_sip.py covers what it withholds);
+#: they prove the enforce plumbing alone changes nothing. The decoupled rows
+#: qualify only because every stub-gated site has an Indicator; the
+#: decoupling tests below cover what changes when one does not.
 IDENTICAL_STATES = {
     "unset": {},
     "off": {GATE: "off", DECOUPLED: "false", GRAIN: "legacy"},
     "shadow": {GATE: "shadow"},
+    "shadow+decoupled (the deployed state)": {GATE: "shadow", DECOUPLED: "true"},
     "enforce+decoupled (stub)": {GATE: "enforce", DECOUPLED: "true"},
     "enforce (stub)": {GATE: "enforce"},
     "decoupled only": {DECOUPLED: "true"},
@@ -160,8 +165,18 @@ IDENTICAL_STATES = {
 }
 
 
+def _stub_decide(session, *, site):
+    return evidence.GateDecision(True, evidence.REASON_STUB_ACCEPT)
+
+
+def _stub_if_enforce(env, monkeypatch):
+    if env.get(GATE) == "enforce":
+        monkeypatch.setattr(evidence, "decide", _stub_decide)
+
+
 @pytest.mark.parametrize("env", IDENTICAL_STATES.values(), ids=IDENTICAL_STATES.keys())
-def test_cycle_bundle_is_byte_identical_to_origin_main(env, tmp_path):
+def test_cycle_bundle_is_byte_identical_to_origin_main(env, tmp_path, monkeypatch):
+    _stub_if_enforce(env, monkeypatch)
     objs, summary, _, _ = H.cycle_bundle(tmp_path, env)
     assert H.digest(objs) == H.golden()["cycle"], (
         "the cycle bundle differs from origin/main 71e47ec for flag state "
@@ -172,7 +187,8 @@ def test_cycle_bundle_is_byte_identical_to_origin_main(env, tmp_path):
 
 
 @pytest.mark.parametrize("env", IDENTICAL_STATES.values(), ids=IDENTICAL_STATES.keys())
-def test_direct_bundle_is_byte_identical_to_origin_main(env):
+def test_direct_bundle_is_byte_identical_to_origin_main(env, monkeypatch):
+    _stub_if_enforce(env, monkeypatch)
     objs, b = H.direct_bundle(env)
     assert H.digest(objs) == H.golden()["direct"], (
         f"the direct five-site bundle differs from origin/main for {env}")

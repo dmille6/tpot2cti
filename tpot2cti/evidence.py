@@ -20,11 +20,20 @@ Suricata, Honeytrap, fallback, drive-by). It returns accept/refuse plus a
 reason, and knows nothing about STIX.
 
 What the gate accepts is DR-01's decision (the evidence classes), not this
-one's. Until DR-01 lands, :func:`decide` is a STUB that accepts every
-session that reaches an Indicator site, which is exactly what the code
-emitted before the gate existed. ``shadow`` and ``enforce`` therefore change
-nothing yet; they exist so the plumbing, counters and log line can be
-deployed, observed and reviewed before any real refusal is possible.
+one's. DR-01's classes land one at a time:
+
+  * SIP_FRAUD (owner decision 2026-09-27): a SentryPeer session is evidence
+    only when it dials an international number (``is_intl_dial``, set by
+    parsers/sentrypeer.py for "+", "00", "011" and "9011" prefixes). Any other
+    SentryPeer session (REGISTER, OPTIONS, an INVITE to a local number) is
+    refused: in ``enforce`` it keeps its observable and Sighting but mints no
+    Indicator.
+  * Every other session: a STUB that accepts, which is exactly what the code
+    emitted before the gate existed.
+
+The class's score, confidence and lifetime (DR-01: 70/60/21 days) are NOT
+applied here: scoring moves to the classes with the rest of DR-01 (the
+evidence ledger), and until then an accepted session scores as it does today.
 
 See docs/EVIDENCE_GATE.md for the flags, the counters in /health and the
 rollout plan.
@@ -51,6 +60,12 @@ SITES = ("cowrie", "suricata", "honeytrap", "fallback", "driveby")
 #: counter can never be mistaken for a real evidence decision.
 REASON_STUB_ACCEPT = "stub-accept-all"
 
+#: SIP_FRAUD (DR-01): the parser type whose sessions this class decides, and
+#: its two reasons (bounded tokens: they become /health counter keys).
+SIP_EVENT_TYPE = "Sentrypeer"
+REASON_SIP_FRAUD = "sip-fraud-intl-dial"
+REASON_SIP_NO_EVIDENCE = "sip-no-intl-dial"
+
 
 @dataclass(frozen=True)
 class GateDecision:
@@ -65,13 +80,28 @@ def decide(session, *, site: str) -> GateDecision:
 
     ``site`` is one of :data:`SITES`, the builder method asking.
 
-    STUB (DR-02 scaffolding; DR-01 supplies the rules): accepts every
-    session. The builder only reaches a site for a session that already
-    passed today's gates (``_is_bare_scan`` in main.py for the generic scan
-    paths, the dispatch table for the rest), so accepting all of them
-    reproduces today's output exactly.
+    SentryPeer sessions are decided by the SIP_FRAUD class
+    (:func:`_decide_sip`). Everything else is still the DR-02 STUB: accepted.
+    The builder only reaches a site for a session that already passed
+    today's gates (``_is_bare_scan`` in main.py for the generic scan paths,
+    the dispatch table for the rest), so accepting reproduces today's output.
     """
+    if getattr(session, "event_type", None) == SIP_EVENT_TYPE:
+        return _decide_sip(session)
     return GateDecision(accept=True, reason=REASON_STUB_ACCEPT)
+
+
+def _decide_sip(session) -> GateDecision:
+    """SIP_FRAUD: evidence when the session, or any event in it, dialled an
+    international number. The parser correlates one event per session and
+    mirrors the flag onto ``session.meta``; the events are checked too so a
+    future multi-event correlator cannot silently drop the evidence."""
+    if (getattr(session, "meta", None) or {}).get("is_intl_dial"):
+        return GateDecision(accept=True, reason=REASON_SIP_FRAUD)
+    for ev in getattr(session, "events", None) or ():
+        if (getattr(ev, "meta", None) or {}).get("is_intl_dial"):
+            return GateDecision(accept=True, reason=REASON_SIP_FRAUD)
+    return GateDecision(accept=False, reason=REASON_SIP_NO_EVIDENCE)
 
 
 @dataclass
@@ -106,9 +136,27 @@ class GateStats:
     #: References removed because they pointed at a withheld Indicator.
     relationships_dropped: int = 0
     object_refs_dropped: int = 0
+    #: Refusals grouped for the log (not persisted, not in /health):
+    #: (reason, site, src_ip, sensor, event_type) -> sessions, events,
+    #: first_seen, last_seen. One log line per group per bundle, written by
+    #: :func:`log_refusals` when the builder finalizes the bundle.
+    refusal_groups: dict = field(default_factory=dict)
 
     def record(self, decision: GateDecision) -> None:
         (self.accepted if decision.accept else self.refused)[decision.reason] += 1
+
+    def record_refusal(self, decision: GateDecision, session, *, site: str) -> None:
+        key = (decision.reason, site, getattr(session, "src_ip", None),
+               getattr(session, "sensor_hostname", None),
+               getattr(session, "event_type", None))
+        g = self.refusal_groups.setdefault(
+            key, {"sessions": 0, "events": 0, "first_seen": None, "last_seen": None})
+        g["sessions"] += 1
+        g["events"] += int(getattr(session, "event_count", 0) or 0)
+        for attr, pick in (("first_seen", min), ("last_seen", max)):
+            v = getattr(session, attr, None)
+            if v is not None:
+                g[attr] = v if g[attr] is None else pick(g[attr], v)
 
     def to_dict(self) -> dict:
         return {
@@ -131,29 +179,38 @@ class GateStats:
         }
 
 
-def log_decision(mode: str, decision: GateDecision, session, *, site: str) -> None:
-    """One structured line per REFUSAL (accepts are only counted: at hive
-    scale an accept line per session would be thousands of lines a cycle).
+def log_refusals(mode: str, stats: GateStats) -> int:
+    """One structured line per refusal GROUP of this bundle: (reason, site,
+    src_ip, sensor, event_type), with how many sessions and events it
+    covers. Accepts are only counted. Per-session lines were ~28k a day for
+    SentryPeer REGISTERs alone (DR-01 M7); a group keeps everything the
+    shadow analysis joins on (the address, sensor, reason) at a line per
+    address per cycle. Clears the groups, so a second call logs nothing.
 
     The message is ``evidence_gate `` followed by a JSON object, so the
     JSON log formatter's ``message`` field can be parsed with
     ``jq -r '.message | select(startswith("evidence_gate ")) | .[14:] | fromjson'``.
     ``action`` is ``would-refuse`` in shadow and ``refused`` in enforce.
+    Returns the number of lines written.
     """
-    first_seen = getattr(session, "first_seen", None)
-    payload = {
-        "action": "refused" if mode == GATE_ENFORCE else "would-refuse",
-        "mode": mode,
-        "reason": decision.reason,
-        "site": site,
-        "src_ip": getattr(session, "src_ip", None),
-        "sensor": getattr(session, "sensor_hostname", None),
-        "event_type": getattr(session, "event_type", None),
-        "session_id": getattr(session, "session_id", None),
-        "first_seen": first_seen.isoformat() if first_seen is not None else None,
-        "event_count": getattr(session, "event_count", None),
-    }
-    logger.info("evidence_gate %s", json.dumps(payload, sort_keys=True, default=str))
+    groups, stats.refusal_groups = stats.refusal_groups, {}
+    for (reason, site, src_ip, sensor, event_type), g in sorted(
+            groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+        payload = {
+            "action": "refused" if mode == GATE_ENFORCE else "would-refuse",
+            "mode": mode,
+            "reason": reason,
+            "site": site,
+            "src_ip": src_ip,
+            "sensor": sensor,
+            "event_type": event_type,
+            "sessions": g["sessions"],
+            "events": g["events"],
+            "first_seen": g["first_seen"].isoformat() if g["first_seen"] is not None else None,
+            "last_seen": g["last_seen"].isoformat() if g["last_seen"] is not None else None,
+        }
+        logger.info("evidence_gate %s", json.dumps(payload, sort_keys=True, default=str))
+    return len(groups)
 
 
 #: The flags whose combination defines one counting period.

@@ -33,12 +33,19 @@ _KNOWN_SIP_METHODS: frozenset[str] = frozenset({
     "UPDATE", "PRACK",
 })
 
-#: A "dialed number" that begins with "+", "00", or a country-code-shaped
-#: prefix is treated as an international call and flagged as a toll-fraud
-#: indicator on the event meta.  We deliberately keep this conservative —
-#: false positives are cheap (just an extra meta flag); the actual STIX
-#: shape is the same either way.
-_INTL_NUMBER_RE = re.compile(r"^\s*(?:\+|00)\d{4,}")
+#: A "dialed number" that is an international exit prefix followed by at
+#: least four ASCII digits (the whole stripped value, plus at most one
+#: trailing ";") is treated as an international call and flagged as a
+#: toll-fraud signal on the event meta. Prefixes: "+" and "00" (ITU), "011"
+#: (North American exit code) and "9011" (a PBX outside-line 9 before 011).
+#: DR-01 measurement M7 (2026-09-25) saw the same destinations dialled as
+#: "+", "00", "011", "9011", "900" and bare; "+"/"00" alone caught 78 of 89
+#: long-number dialers, and the owner approved adding 011/9011 (2026-09-27).
+#: Anything else after the digits is refused (the value is attacker
+#: controlled); on 2026-09-27, 40 of 149k matching docs in 14 d carried a
+#: suffix, mostly ";". This flag is the SIP_FRAUD evidence class
+#: (tpot2cti/evidence.py).
+_INTL_NUMBER_RE = re.compile(r"(?:\+|00|011|9011)[0-9]{4,};?")
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +122,7 @@ class SentryPeerParser(BaseParser):
         if (cn := doc.get("called_number")) is not None:
             cn_s = str(cn).strip()
             event.meta["called_number"] = cn_s
-            if _INTL_NUMBER_RE.match(cn_s):
+            if _INTL_NUMBER_RE.fullmatch(cn_s):
                 event.meta["is_intl_dial"] = True
         if (cr := doc.get("caller")) is not None:
             event.meta["caller"] = str(cr).strip()
