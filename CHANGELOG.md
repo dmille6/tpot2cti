@@ -10,8 +10,10 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 - `is_intl_dial` also covers `900` (PBX outside line 9, then `00`), the
   analogue of `9011`. On the hive over 14 days this adds 12,198 SentryPeer
   docs, all from addresses that also dial the `+`/`00`/`011`/`9011` forms, so
-  it accepts more of their sessions and adds no new address. A `900x`
-  extension (fewer than four digits after `900`) does not count.
+  it accepts more of their sessions and adds no new address. Values with fewer
+  than four digits after `900` do not count; `900` cannot be told apart from
+  a North American 900 premium number (itself a toll-fraud target), a long
+  extension starting `900` or `9000` + digits, which are accepted look-alikes.
 
 ### DR-01 SIP_FRAUD, the first evidence class behind the gate (owner decision 2026-09-27)
 

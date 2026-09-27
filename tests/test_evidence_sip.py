@@ -2,7 +2,8 @@
 
 Owner decision 2026-09-27: a SentryPeer session is evidence only when it
 dials an international number. parsers/sentrypeer.py sets ``is_intl_dial``
-for the "+", "00", "011" and "9011" exit prefixes (DR-01 measurement M7);
+for the "+", "00", "011", "9011" and "900" exit prefixes (DR-01 measurement
+M7; 900 added by the owner the same day);
 evidence.decide() accepts on it and refuses every other SentryPeer session.
 Every other parser type still gets the stub accept.
 """
@@ -60,6 +61,9 @@ def _session(doc):
     ("+４４２０３７６９９９３１", False),  # non-ASCII digits (attacker-controlled value)
     ("900442037699931", True),      # PBX outside line 9, then 00 (owner, 2026-09-27)
     ("9000442037699931", True),     # as dialled in real data: 9, 00, then 0...
+    ("9005551234", True),           # accepted look-alike: NANP 900 premium number (a toll-fraud target too)
+    ("9001234", True),              # accepted look-alike: a long extension starting 900
+    ("90001234", True),             # accepted look-alike: 9000 + digits
     ("9001", False),                # a 900x extension: fewer than four digits after 900
     ("900123", False),
     ("5551234", False),             # local

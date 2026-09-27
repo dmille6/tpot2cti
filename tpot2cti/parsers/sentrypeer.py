@@ -43,7 +43,9 @@ _KNOWN_SIP_METHODS: frozenset[str] = frozenset({
 #: "+", "00", "011", "9011", "900" and bare; "+"/"00" alone caught 78 of 89
 #: long-number dialers; the owner approved 011/9011 and then 900 (2026-09-27;
 #: 900 added 12,198 docs in 14 d, all from addresses that also dial the
-#: other forms).
+#: other forms). Known, accepted look-alikes of "9 then 00": a North American
+#: 900 premium-rate number (9005551234, itself a toll-fraud target), a long
+#: local extension starting 900 (9001234) and 9000 + digits.
 #: Anything else after the digits is refused (the value is attacker
 #: controlled); on 2026-09-27, 40 of 149k matching docs in 14 d carried a
 #: suffix, mostly ";". This flag is the SIP_FRAUD evidence class
