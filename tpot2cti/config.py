@@ -62,6 +62,17 @@ class ESConfig:
     verify_certs: bool = False
     index_pattern: str = "logstash-*"
     request_timeout: int = 30
+    #: Index pattern for the per-(src_ip, sensor, day) sighting COUNTS
+    #: aggregation only (``TpotESClient.daily_event_counts``). The event read
+    #: always uses ``index_pattern``. Empty/unset means "same as
+    #: index_pattern", which is today's behaviour. Separate so DR-07 phase 2
+    #: can point counts at more than the kept documents without the event
+    #: read re-ingesting suppressed events. See docs/EVIDENCE_GATE.md.
+    counts_index_pattern: Optional[str] = None
+
+    @property
+    def effective_counts_index_pattern(self) -> str:
+        return self.counts_index_pattern or self.index_pattern
 
 
 @dataclass(frozen=True)
@@ -124,6 +135,22 @@ class CycleConfig:
     #: fingerprint flood) from OpenCTI. Raw events stay in ES/Kibana; a
     #: single meaty command keeps the full transcript (added 2026-06-19).
     drop_recon_process: bool = True
+    #: DR-02 evidence gate: "off" | "shadow" | "enforce". See
+    #: tpot2cti/evidence.py and docs/EVIDENCE_GATE.md. "off" is today's
+    #: output, byte for byte.
+    evidence_gate: str = "off"
+    #: DR-02: emit the observable's (``:ipv4``) Sighting at every
+    #: dual-sighting site even when no IP Indicator was minted. False is
+    #: today's behaviour (no Indicator -> no Sighting at all).
+    sightings_decoupled: bool = False
+    #: DR-02 sighting grain: "legacy" (today) or "sensor-ip-day" (the
+    #: Sighting description leads with the honeypot types seen for that
+    #: sensor, address and UTC day). See docs/EVIDENCE_GATE.md section 3.
+    sighting_grain: str = "legacy"
+
+
+#: Accepted values for CycleConfig.sighting_grain.
+SIGHTING_GRAINS = ("legacy", "sensor-ip-day")
 
 
 @dataclass(frozen=True)
@@ -234,6 +261,22 @@ def _env_bool(env: dict, key: str, default: bool) -> bool:
     return truthy_str(env.get(key), default)
 
 
+def _env_choice(env: dict, key: str, default: str, choices: tuple) -> str:
+    """A small enum setting: case-insensitive, inline ``# comment`` stripped
+    (the docker --env-file footgun, see env.py), empty/unset -> default.
+    Anything else is a ConfigError rather than a silent fallback: a typo in
+    a safety switch must stop startup, not quietly mean "off"."""
+    raw = env.get(key)
+    if raw is None:
+        return default
+    val = str(raw).split("#", 1)[0].strip().lower()
+    if not val:
+        return default
+    if val not in choices:
+        raise ConfigError(f"{key} must be one of {', '.join(choices)}; got {raw!r}")
+    return val
+
+
 def _env_list(env: dict, key: str, default: Optional[list[str]] = None,
                sep: str = ",") -> list[str]:
     raw = env.get(key)
@@ -276,6 +319,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         verify_certs=_env_bool(env, "ES_VERIFY_CERTS", default=False),
         index_pattern=_env_str(env, "ES_INDEX_PATTERN", default="logstash-*") or "logstash-*",
         request_timeout=_env_int(env, "ES_REQUEST_TIMEOUT", default=30),
+        counts_index_pattern=(
+            _env_str(env, "TPOT2CTI_COUNTS_INDEX_PATTERN", default="") or None),
     )
 
     # --- OpenCTI ---
@@ -341,6 +386,11 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         fatt_cycle_multiplier=_env_int(env, "TPOT2CTI_FATT_CYCLE_MULTIPLIER", default=4),
         emit_generic_attack_pattern=_env_bool(env, "TPOT2CTI_EMIT_GENERIC_AP", default=False),
         drop_recon_process=_env_bool(env, "TPOT2CTI_DROP_RECON_PROCESS", default=True),
+        evidence_gate=_env_choice(env, "TPOT2CTI_EVIDENCE_GATE", "off",
+                                  ("off", "shadow", "enforce")),
+        sightings_decoupled=_env_bool(env, "TPOT2CTI_SIGHTINGS_DECOUPLED", default=False),
+        sighting_grain=_env_choice(env, "TPOT2CTI_SIGHTING_GRAIN", "legacy",
+                                   SIGHTING_GRAINS),
     )
 
     # --- Connector IDs ---
@@ -394,6 +444,29 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
         raise ConfigError(
             f"TPOT2CTI_DEFAULT_CONFIDENCE must be 0-100; "
             f"got {cfg.operator.default_confidence}"
+        )
+
+    if cfg.cycle.evidence_gate == "enforce" and not cfg.cycle.sightings_decoupled:
+        # Not a ConfigError: refusing to start would stop ALL publishing,
+        # which is worse than the loss this warns about. The loss is also
+        # counted every cycle (/health evidence_gate.site_calls.none).
+        logger.warning(
+            "TPOT2CTI_EVIDENCE_GATE=enforce with TPOT2CTI_SIGHTINGS_DECOUPLED "
+            "off: every refused session loses its observable Sighting too. "
+            "DR-02 requires decoupled sightings before enforcement."
+        )
+    if "tsec-counts" in cfg.es.effective_counts_index_pattern:
+        # daily_event_counts COUNTS DOCUMENTS, grouped on logstash fields
+        # (@timestamp, src_ip.keyword, t-pot_hostname.keyword). The DR-07
+        # transform index holds one row per (day, src_ip, type, sensor) with
+        # the total in a `suppressed` field and different field names, so
+        # its rows would be skipped or counted as 1 each -- never summed.
+        logger.warning(
+            "TPOT2CTI_COUNTS_INDEX_PATTERN=%r names a DR-07 transform index, "
+            "but the counts aggregation counts logstash documents and does "
+            "not sum its `suppressed` field yet; those rows will be skipped "
+            "or miscounted. See docs/EVIDENCE_GATE.md section 5.",
+            cfg.es.effective_counts_index_pattern,
         )
 
     logger.info(

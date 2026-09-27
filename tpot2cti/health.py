@@ -306,6 +306,10 @@ class HealthStatus:
             # self_or_internal / benign_scanner) so an operator can see WHY
             # events aren't landing without grepping logs. Best-effort.
             "last_cycle_drops": self._last_cycle_drops(),
+            # DR-02 evidence gate: mode, accepted/refused by reason, and
+            # dual-sighting outcomes -- last cycle, and summed since the
+            # counters were first written. docs/EVIDENCE_GATE.md section 4.
+            "evidence_gate": self._evidence_gate(),
         }
 
         # Freshness of the most recent *completed* successful cycle.
@@ -396,6 +400,22 @@ class HealthStatus:
             return json.loads(raw) if raw else None
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"health: last_cycle_drops read failed: {e}")
+            return None
+
+    def _evidence_gate(self) -> Optional[dict]:
+        """``{"last_cycle": ..., "totals": ...}`` from the state KV, or None
+        before the first cycle. Best-effort, never raises."""
+        try:
+            last = self._state.get("last_cycle_evidence_gate")
+            totals = self._state.get("evidence_gate_totals")
+            if not last and not totals:
+                return None
+            return {
+                "last_cycle": json.loads(last) if last else None,
+                "totals": json.loads(totals) if totals else None,
+            }
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: evidence_gate read failed: {e}")
             return None
 
     def _heartbeat_age(

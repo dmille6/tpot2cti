@@ -880,12 +880,22 @@ def run_cycle(
     # Best-effort: on failure the builder falls back to per-cycle counts,
     # which is the pre-existing behaviour. A cycle that publishes real
     # intel with imperfect counts beats a cycle that publishes nothing.
+    #
+    # The COUNTS pattern is its own setting (TPOT2CTI_COUNTS_INDEX_PATTERN,
+    # default ES_INDEX_PATTERN) so DR-07 phase 2 can widen what is counted
+    # without the event read above re-ingesting suppressed documents.
     try:
         _day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        _count_kwargs: dict = {}
+        if cfg.cycle.sighting_grain == "sensor-ip-day":
+            # Same aggregation plus a terms sub-agg: the day's honeypot types
+            # per (src_ip, sensor, day), listed in the Sighting description.
+            _count_kwargs["types_out"] = builder.daily_event_types
         builder.daily_event_counts = es.daily_event_counts(
             _day_start, window_end,
-            index_pattern=cfg.es.index_pattern,
+            index_pattern=cfg.es.effective_counts_index_pattern,
             ignore_types=effective_ignore_types,
+            **_count_kwargs,
         )
         logger.info(
             "[%s] authoritative daily counts: %d (src_ip, sensor, day) pair(s) "
@@ -1129,6 +1139,24 @@ def run_cycle(
             f"failed: {e}"
         )
 
+    # ── Step 5c: DR-02 evidence gate bookkeeping ──────────────────────
+    # finalize_bundle returns the SAME list unless enforce withheld an
+    # Indicator; then it drops every reference to it (docs/EVIDENCE_GATE.md).
+    all_objects = builder.finalize_bundle(all_objects)
+    evidence_gate_stats = builder.gate_stats.to_dict()
+    logger.info("evidence_gate_summary %s",
+                json.dumps(evidence_gate_stats, sort_keys=True))
+    try:
+        state.set("last_cycle_evidence_gate", json.dumps(evidence_gate_stats))
+        from tpot2cti.evidence import merge_totals
+        _prev = state.get("evidence_gate_totals")
+        _totals = merge_totals(json.loads(_prev) if _prev else None,
+                               evidence_gate_stats)
+        _totals.setdefault("since", now.isoformat())
+        state.set("evidence_gate_totals", json.dumps(_totals))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"cycle {cycle_id}: could not persist evidence gate stats: {e}")
+
     # ── Step 6: publish ───────────────────────────────────────────────
     sdos_by_type = _count_by_type(all_objects)
     publish_ok = True
@@ -1199,6 +1227,8 @@ def run_cycle(
         # outside any session and the graph is losing its time dimension.
         "untimed_relationships": builder.untimed_relationships,
         "rejected_domains": builder.rejected_domains,
+        # DR-02: gate decisions and dual-sighting outcomes (also in /health).
+        "evidence_gate": evidence_gate_stats,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),

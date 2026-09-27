@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### DR-02 evidence gate scaffolding (flags default to today's output)
+
+- **`TPOT2CTI_EVIDENCE_GATE`** = `off` (default) | `shadow` | `enforce`. The
+  builder asks `tpot2cti/evidence.py:decide()` before each of the five places
+  an attacker-IP Indicator is minted (Cowrie, Suricata, Honeytrap, fallback,
+  drive-by). `decide()` is a STUB that accepts everything until DR-01 supplies
+  the evidence classes, so no mode changes output yet. `shadow` counts every
+  decision and writes one `evidence_gate {json}` log line per refusal;
+  `enforce` withholds a refused Indicator and drops every relationship and
+  `object_refs` entry in the bundle that would point at it.
+- **`TPOT2CTI_SIGHTINGS_DECOUPLED`** (default off). All five dual-sighting
+  calls were nested under `if ip_ind_id:`, so a session with no Indicator
+  left no Sighting at all. On, the observable's `:ipv4` Sighting is emitted
+  regardless (same id, count and text as today's).
+- **`TPOT2CTI_SIGHTING_GRAIN`** = `legacy` (default) | `sensor-ip-day`. The id
+  grain was already one Sighting per (sensor, target, UTC day); the new mode
+  fixes the text, which named only the builders that write a line ("Cowrie
+  SSH") while the count covered every type. It now leads with the day's types,
+  from the bundle and from a terms sub-aggregation on the counts query.
+- **`TPOT2CTI_COUNTS_INDEX_PATTERN`** (default: `ES_INDEX_PATTERN`) is read only
+  by `daily_event_counts`, so DR-07 phase 2 can widen counts without the event
+  read re-ingesting suppressed documents. The core still skips nothing tagged
+  `throttled` at read time (guard test).
+- **`/health` `evidence_gate`**: last cycle and running totals of accepted and
+  refused decisions by reason, Indicators withheld, dual-sighting site
+  outcomes (`with_indicator` / `observable_only` / `none`), observable
+  Sightings with and without an Indicator, and references dropped.
+- **Evidence:** with every flag at its default, and in `shadow`, `enforce` and
+  decoupled modes with the stub, the bundle is byte-identical to origin/main
+  71e47ec for all 23 real fixtures through `run_cycle` and for one session per
+  dual-sighting site (SHA-256 digests taken on a clean origin/main worktree
+  before any DR-02 code existed; `tests/dr02_harness.py`). 17 mutations of the
+  new guards, each killed by the test aimed at it.
+
 ### Suricata read scope + drop attribution
 
 - CORE no longer fetches Suricata documents with no `alert` object. The parser

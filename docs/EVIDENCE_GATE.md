@@ -1,0 +1,203 @@
+# Evidence gate (DR-02)
+
+> **Status: scaffolding shipped, rules pending.** The gate, the decoupled
+> sightings, the sighting grain, the counters and the counts pattern exist in
+> code behind flags that default to today's output. The rules that decide
+> what is evidence (the evidence classes) come from DR-01. Until then
+> `tpot2cti/evidence.py:decide()` accepts every session, so `shadow` and
+> `enforce` change nothing yet. [`EVIDENCE.md`](EVIDENCE.md) is the design
+> contract these rules will implement.
+
+## 1. Flags
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `TPOT2CTI_EVIDENCE_GATE` | `off`, `shadow`, `enforce` | `off` | `off`: the gate is never consulted and output is byte-identical to the builder before the gate existed. `shadow`: every decision is counted and each refusal is logged; nothing emitted changes. `enforce`: a refused session mints no attacker-IP Indicator, and the bundle carries no relationship or `object_refs` entry pointing at an Indicator that was withheld and not emitted by another session. |
+| `TPOT2CTI_SIGHTINGS_DECOUPLED` | boolean | `false` | Emit the observable's `:ipv4` Sighting at all five dual-sighting sites even when no Indicator was minted, whether the gate refused it or it could not be built. Off keeps today's behaviour: no Indicator means no Sighting at all. |
+| `TPOT2CTI_SIGHTING_GRAIN` | `legacy`, `sensor-ip-day` | `legacy` | See section 3. |
+| `TPOT2CTI_COUNTS_INDEX_PATTERN` | index pattern | `ES_INDEX_PATTERN` | See section 5. |
+
+A value that is not in the list stops startup with a `ConfigError`, so a
+typo in a safety switch cannot quietly mean `off`. `enforce` without
+decoupled sightings is allowed but logs a warning at startup, and every
+refusal then shows up in `site_calls.none` (section 4).
+
+The five sites are the builder methods that mint an attacker-IP Indicator
+and call `build_dual_sighting`: `build_cowrie_session`,
+`build_suricata_alert`, `build_honeytrap_probe`, `build_fallback_event` and
+`build_driveby_session` (the drive-by site also serves the web, protocol,
+malware and fingerprint builders, which start from it). File Indicators (sample hashes)
+are not gated: the gate decides whether an address is promoted.
+
+## 2. What shadow logs
+
+Accepts are only counted, because one line per accepted session would be
+thousands of lines a cycle at hive scale. Each refusal writes one line whose
+message is `evidence_gate ` followed by a JSON object:
+
+```json
+{"action": "would-refuse", "event_count": 3, "event_type": "Cowrie",
+ "first_seen": "2026-10-01T10:00:00+00:00", "mode": "shadow",
+ "reason": "<DR-01 reason>", "sensor": "sensor01",
+ "session_id": "…", "site": "cowrie", "src_ip": "…"}
+```
+
+`action` is `refused` under `enforce`. To extract the lines from the JSON
+log:
+
+```bash
+jq -r '.message | select(startswith("evidence_gate ")) | .[14:]' tpot2cti.log
+```
+
+Once per cycle, `evidence_gate_summary {json}` logs the same counters that
+reach `/health`.
+
+## 3. Sighting grain
+
+**Today's grain (`legacy`), exactly.** A Sighting's id is
+`generate_sighting_id(sensor, "<target>:<YYYY-MM-DD>", discriminator)`
+(`STIXBuilder._sighting_id`), where the day is the UTC date of the
+session's `first_seen`. `target` is the attacker's IP Indicator (no
+discriminator) or its IP observable (discriminator `ipv4`, also used for
+IPv6 observables). So one address on one sensor on one UTC day has **at
+most two Sightings, whatever honeypot types it touched**. Within a bundle,
+later sessions fold into the one kept (`_merge_or_emit_sighting`):
+
+- `count` is the day's authoritative total from ES (`daily_event_counts`:
+  every document for that `src_ip`, `t-pot_hostname` and day, all types except
+  `TPOT2CTI_IGNORE_TYPES`), taking the maximum across sessions, when ES
+  returned one. Otherwise it is the sum over distinct sessions of each
+  builder's per-session count: `event_count`, or 1 for a Suricata alert.
+- `first_seen` and `last_seen` span every folded session.
+- `description` is up to five distinct per-session lines, then
+  `(+N further session(s) this day)`. Only the Cowrie, Honeytrap and
+  fallback builders write a line. Suricata and drive-by sessions add to the
+  count but not to the text, so a Sighting whose count covers Cowrie,
+  Suricata and Heralding reads only "Cowrie SSH …".
+
+A session that crosses midnight stays on the day it started. Across cycles,
+OpenCTI upserts by id and replaces `count` and `description`.
+
+**`sensor-ip-day`.** The ids, counts and windows stay the same (the id
+grain already is one per sensor, address and day, and DR-02 rejected
+per-type Sightings). The description starts with one line:
+
+```
+Types seen from this address on this sensor this UTC day: Cowrie, Heralding, Suricata
+```
+
+followed by today's per-session lines. The list joins the types seen in this
+bundle with the day's types from ES. In this mode only, the counts
+aggregation carries a `terms` sub-aggregation on `type.keyword` (size 64), so
+a narrow later cycle cannot shrink a list that OpenCTI replaces on upsert.
+Time that query (M4) before switching the mode on.
+
+## 4. Counters in `/health`
+
+`/health` gains `evidence_gate: {"last_cycle": {...}, "totals": {...}}`
+(`null` before the first cycle). `last_cycle` is also in the cycle summary.
+`totals` sums every cycle since `since` (the first cycle that wrote it) and
+lives in the state DB. Delete the `evidence_gate_totals` key to restart the
+count; DR-03's reset empties it too.
+
+| Key | Meaning | Healthy reading |
+|---|---|---|
+| `mode`, `sightings_decoupled`, `sighting_grain` | the flags in force | what you deployed |
+| `accepted`, `refused` | sessions by gate reason (empty when `off`) | `stub-accept-all` only, until DR-01 |
+| `accepted_total`, `refused_total` | sums of the above | refused share is the shadow's result |
+| `indicators_withheld` | refusals that withheld an Indicator (`enforce` only) | equals `refused_total` under `enforce` |
+| `site_calls.with_indicator` | site calls where both Sighting sides existed | most calls |
+| `site_calls.observable_only` | calls where only the observable Sighting was emitted (decoupled) | grows with refusals once decoupled |
+| `site_calls.none` | calls that left **no** Sighting (no Indicator, not decoupled) | **0**; anything else is an observable Sighting lost |
+| `observable_sightings.with_indicator` / `.without_indicator` | observable-side Sighting objects in the bundle after folding, by whether that sensor, address and day also has an Indicator Sighting | `without` is 0 today |
+| `relationships_dropped`, `object_refs_dropped` | references removed because they pointed at a withheld Indicator | 0 outside `enforce` |
+| `cycles` (totals only) | cycles summed | |
+
+For the DR-02 M3 measurement, sample `/health` hourly: differences between
+successive `totals` cover every cycle, not one in four.
+
+## 5. Counts index pattern and DR-07 phase 2
+
+`TPOT2CTI_COUNTS_INDEX_PATTERN` is read only by `daily_event_counts`. The
+event read, and its exclusion count, always use `ES_INDEX_PATTERN`. The core
+does not skip documents tagged `throttled` at read time, in the event read or
+the counts query (a guard test enforces this). A throttled document is still
+an event the source sent, and skipping it would take `AUTH_SUCCESS` and
+commands out of a flood source's later sessions.
+
+DR-07 phase 2 moves throttled documents out of `logstash-*` and publishes
+their totals in the transform index `tsec-counts-suppressed` (`day`,
+`src_ip`, `type`, `sensor`, `suppressed`). **Do not just add that index to
+this pattern.** The counts query groups `logstash` fields (`@timestamp`,
+`src_ip.keyword`, `t-pot_hostname.keyword`) and counts documents. It would
+skip the transform's rows or count each one as 1, never sum `suppressed`.
+Config loading warns if the pattern names a `tsec-counts` index. Phase 2
+still needs a second aggregation: the sum of `suppressed` per (`src_ip`,
+`sensor`, `day`) with `TPOT2CTI_IGNORE_TYPES` applied to `type`, added to the
+kept count. Measured on 2026-09-25, the drop is concentrated in about 78
+flood pairs a day. Every other pair keeps its count.
+
+## 6. Rollout
+
+1. **Deploy with every flag at its default.** Output is byte-identical
+   (section 7). Check that `/health` shows `evidence_gate.last_cycle.mode:
+   off` and `site_calls.none: 0`.
+2. **`TPOT2CTI_EVIDENCE_GATE=shadow` and `TPOT2CTI_SIGHTINGS_DECOUPLED=true`**
+   with the stub. This proves the plumbing only: output is still identical,
+   and `accepted` shows `stub-accept-all` for every site call.
+3. **Deploy DR-01's `decide()` in shadow.** The 14-day shadow clock starts
+   here, not at step 2. Over the window, collect the refusal lines (for the
+   M2 join and the B-prime 5% trigger), `refused` by reason, and
+   `last_cycle_duration_s` hourly (M3).
+4. **Enforce** only when both hold over the 14 days:
+   - cycle p95 is at or under 450 s, and
+   - no observable Sighting is lost: `totals.site_calls.none` stays 0 with
+     decoupling on, and after the switch the per-cycle observable Sighting
+     total (`with_indicator + without_indicator`) matches shadow's for
+     comparable windows. `test_enforce_refusing_everything_loses_no_observable_sighting`
+     checks the same property on fixtures.
+5. **`TPOT2CTI_SIGHTING_GRAIN=sensor-ip-day`** is independent of steps 2 to
+   4. Switch it on after timing the counts query with the types
+   sub-aggregation.
+
+**Reversal:** each flag is read at startup. Set it back and restart.
+Indicators refused while `enforce` was on are not backfilled. Their
+Sightings are not affected when decoupling was on.
+
+## 7. How "off is byte-identical" is proven
+
+`tests/dr02_harness.py` builds two bundles from fixed inputs, with a fixed
+clock and fixed builder timestamps:
+
+- one `run_cycle` over every real fixture under `tests/fixtures/real`,
+  where the fake ES returns one authoritative daily count;
+- one session per dual-sighting site, built directly (this covers Honeytrap
+  and the fallback, which `_is_bare_scan` would skip, plus a second day, a
+  multi-type day and an IPv6 address).
+
+Their SHA-256 digests (`tests/fixtures/dr02/golden_digests.json`) were
+taken on a clean origin/main 71e47ec worktree with only the harness added.
+`tests/test_evidence_gate.py` compares every default-equivalent flag state
+against those digests: unset, explicit `off`, `shadow`, `enforce` with the
+stub, decoupled, and a counts pattern equal to the event pattern. After a
+mismatch, run `python -m tests.dr02_harness --dump DIR` on both commits and
+diff the output.
+
+## 8. Deferred
+
+- **To DR-01:** the evidence classes, meaning the real `decide()` and its
+  reason tokens, which the builder, counters and log already carry. Also the
+  trace test on the canary harness: an evidence session yields an Indicator
+  plus both Sightings within two cycles, and a connect-only session yields
+  the observable and its `:ipv4` Sighting and no Indicator.
+- **B-prime cross-session promoter** (DR-02 decision 5): the design is fixed,
+  but it is built only if the shadow shows the 5% miss rate or DR-01
+  requires it. The promoter is the sole owner of demotions and the writer of
+  `object_max_state`.
+- **DR-07 phase 2 count summing** (section 5), after the transform is
+  deployed.
+- **Under `enforce`, known gaps to close with DR-01:** the campaign ledger
+  marks members emitted even when their `indicates` edge was dropped, so it
+  is not re-emitted later. The Indicator decision is per session, so an
+  address refused in one session and accepted in another in the same bundle
+  is emitted, and its references stay.
