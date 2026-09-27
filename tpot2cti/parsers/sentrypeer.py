@@ -33,12 +33,15 @@ _KNOWN_SIP_METHODS: frozenset[str] = frozenset({
     "UPDATE", "PRACK",
 })
 
-#: A "dialed number" that begins with "+", "00", or a country-code-shaped
-#: prefix is treated as an international call and flagged as a toll-fraud
-#: indicator on the event meta.  We deliberately keep this conservative —
-#: false positives are cheap (just an extra meta flag); the actual STIX
-#: shape is the same either way.
-_INTL_NUMBER_RE = re.compile(r"^\s*(?:\+|00)\d{4,}")
+#: A "dialed number" that begins with an international exit prefix and at
+#: least four more digits is treated as an international call and flagged as
+#: a toll-fraud signal on the event meta. Prefixes: "+" and "00" (ITU), "011"
+#: (North American exit code) and "9011" (a PBX outside-line 9 before 011).
+#: DR-01 measurement M7 (2026-09-25): the same destinations are dialled with
+#: all four spellings; "+"/"00" alone caught 78 of 89 long-number dialers.
+#: This flag is the SIP_FRAUD evidence class (tpot2cti/evidence.py, owner
+#: decision 2026-09-27).
+_INTL_NUMBER_RE = re.compile(r"^\s*(?:\+|00|011|9011)\d{4,}")
 
 
 # ---------------------------------------------------------------------------
