@@ -470,3 +470,6 @@ def _smoketest_env() -> None:
     os.environ.setdefault("TPOT_HOST", "test")
     os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
     os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
+    # Required since 2026-09-28 (fail-closed own surface). A placeholder root
+    # no fixture or test host falls under; never a real persona domain.
+    os.environ.setdefault("TPOT2CTI_OWN_DOMAINS", "own-surface-placeholder.example.com")

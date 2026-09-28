@@ -407,22 +407,13 @@ def _render_commands_section(rows: list[dict]) -> list[str]:
 
 
 def _own_surface_filter():
-    """`value -> True` when a sample URL/domain is our own surface, or None.
+    """`value -> True` when a sample URL/domain is our own surface.
 
-    Best-effort: a rendering helper must never fail a Note over a filter.
+    Fails closed: an unconfigured or invalid TPOT2CTI_OWN_DOMAINS raises
+    here rather than render samples unfiltered.
     """
-    try:
-        from tpot2cti.own_surface import default as _own_default
-        own = _own_default()
-    except Exception:          # pragma: no cover — never break rendering
-        return None
-
-    def _is_own(v) -> bool:
-        try:
-            return own.is_own_value(v)
-        except Exception:      # pragma: no cover
-            return False
-    return _is_own
+    from tpot2cti.own_surface import default as _own_default
+    return _own_default().is_own_value
 
 
 def _render_unique_section(

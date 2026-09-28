@@ -19,8 +19,10 @@ list of domain roots, read from the deployment's ``.env`` beside
 of the own-surface configuration). A root covers itself and every subdomain.
 The list is deliberately NOT shipped in this repository: this repository is
 public, and a list of persona domains in it would publish exactly what the
-guard exists to protect. An empty list is logged loudly at startup and shown
-as ``domains_configured: 0`` in ``/health``.
+guard exists to protect. The variable is REQUIRED and the guard fails
+closed: ``config.load_config()`` raises ``ConfigError`` when it is missing,
+blank, has no valid root, or has any entry that is not a valid domain root —
+so every tpot2cti process refuses to start rather than publish our surface.
 
 **Matching is exact-or-subdomain, after canonicalisation.** A host matches
 root ``r`` iff ``host == r`` or ``host.endswith("." + r)``, after both sides
@@ -34,6 +36,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
@@ -79,6 +82,60 @@ def canon_host(host: Optional[str]) -> str:
         except (UnicodeError, ValueError):
             pass
     return h
+
+
+#: A canonical (A-label) domain root: two or more LDH labels, each 1-63
+#: characters, no leading or trailing hyphen.
+_ROOT_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class OwnDomainsError(ValueError):
+    """TPOT2CTI_OWN_DOMAINS is missing, empty or holds an invalid entry."""
+
+
+def parse_roots_strict(value: Optional[str]) -> frozenset:
+    """Parse the TPOT2CTI_OWN_DOMAINS value, failing closed.
+
+    Empty tokens (``a.example,,b.example,``) are ignored. Raises
+    :class:`OwnDomainsError` when the value is missing or blank, when no
+    valid root remains, or when ANY entry is not a valid domain root — a
+    bare label (``com``), an address (addresses belong in
+    TPOT_HONEYPOT_IPS), a URL, or anything with characters a hostname
+    cannot carry. A typo must stop the process, not silently shrink the
+    guard.
+    """
+    if value is None or not str(value).strip():
+        raise OwnDomainsError(
+            f"{ENV_OWN_DOMAINS} is required (comma-separated persona domain "
+            f"roots); it is missing or blank")
+    roots: set[str] = set()
+    bad: list[str] = []
+    for raw in str(value).split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        r = canon_host(tok.lstrip("*").lstrip(".")) if not tok.startswith("[") else ""
+        is_ip = False
+        try:
+            ipaddress.ip_address(r)
+            is_ip = True
+        except ValueError:
+            pass
+        if (not r or is_ip or ":" in tok or "/" in tok
+                or not _ROOT_RE.match(r)):
+            bad.append(tok)
+            continue
+        roots.add(r)
+    if bad:
+        raise OwnDomainsError(
+            f"{ENV_OWN_DOMAINS}: {len(bad)} invalid entr(y/ies) {bad!r}; each "
+            f"entry must be a domain root such as example.com (no scheme, "
+            f"port, path, address or bare label)")
+    if not roots:
+        raise OwnDomainsError(f"{ENV_OWN_DOMAINS}: no valid domain root")
+    return frozenset(roots)
 
 
 def _parse_roots(values: Iterable[str]) -> tuple[frozenset, list]:
@@ -135,16 +192,12 @@ class OwnSurface:
         if self.domain_root(h) is not None:
             return REASON_PERSONA_DOMAIN
         red = self._redactor
-        if red is not None:
+        if red is not None and red.is_sensor_host(h):
             try:
-                if red.is_sensor_host(h):
-                    try:
-                        ipaddress.ip_address(h)
-                        return REASON_SENSOR_ADDRESS
-                    except ValueError:
-                        return REASON_SENSOR_HOSTNAME
-            except Exception:           # pragma: no cover — never break a caller
-                return None
+                ipaddress.ip_address(h)
+                return REASON_SENSOR_ADDRESS
+            except ValueError:
+                return REASON_SENSOR_HOSTNAME
         return None
 
     def is_own_host(self, host: Optional[str]) -> bool:
@@ -185,7 +238,8 @@ class OwnSurface:
 
 
 def from_env(env: Optional[Mapping[str, str]] = None, *, redactor=None) -> OwnSurface:
-    """Build the predicate from the deployment's configuration.
+    """Build the predicate from the deployment's configuration. Fails closed:
+    raises :class:`OwnDomainsError` exactly as :func:`parse_roots_strict`.
 
     `redactor` defaults to `redact.from_env(env)` so sensor addresses and
     hostnames come from the same variables the publisher redacts with.
@@ -193,23 +247,13 @@ def from_env(env: Optional[Mapping[str, str]] = None, *, redactor=None) -> OwnSu
     its own redactor the sensor half of the question).
     """
     e = env if env is not None else os.environ
-    raw = [x for x in (e.get(ENV_OWN_DOMAINS) or "").split(",") if x.strip()]
+    roots = parse_roots_strict(e.get(ENV_OWN_DOMAINS))
     if redactor is False:
         redactor = None
     elif redactor is None:
-        try:
-            from tpot2cti.redact import from_env as _redactor_from_env
-            redactor = _redactor_from_env(e)
-        except Exception:               # pragma: no cover — never break startup
-            redactor = None
-    own = OwnSurface(raw, redactor=redactor)
-    if own.invalid_entries:
-        logger.warning(
-            f"{ENV_OWN_DOMAINS}: ignored {len(own.invalid_entries)} entr(y/ies) "
-            f"that are not domain roots (bare labels or IP addresses; "
-            f"addresses belong in TPOT_HONEYPOT_IPS)"
-        )
-    return own
+        from tpot2cti.redact import from_env as _redactor_from_env
+        redactor = _redactor_from_env(e)
+    return OwnSurface(roots, redactor=redactor)
 
 
 #: Flags whose combination defines one counting period for the totals.
@@ -269,21 +313,12 @@ _DEFAULT: Optional[OwnSurface] = None
 
 
 def default() -> OwnSurface:
-    """Process-wide instance from the environment, built on first use."""
+    """Process-wide instance, built on first use from the environment
+    (fails closed, see :func:`from_env`). main() installs the one built from
+    the loaded Config at startup via :func:`set_default`."""
     global _DEFAULT
     if _DEFAULT is None:
         _DEFAULT = from_env()
-        if not _DEFAULT.roots:
-            logger.warning(
-                f"own-surface: {ENV_OWN_DOMAINS} is empty — persona-domain "
-                f"URLs and domains will NOT be refused. Set it in .env beside "
-                f"TPOT2CTI_SENSOR_HOSTNAMES."
-            )
-        else:
-            logger.info(
-                f"own-surface: {len(_DEFAULT.roots)} persona domain root(s) "
-                f"configured"
-            )
     return _DEFAULT
 
 
@@ -295,6 +330,7 @@ def set_default(own: Optional[OwnSurface]) -> None:
 
 __all__ = [
     "ENV_OWN_DOMAINS",
+    "OwnDomainsError",
     "OwnSurface",
     "REASON_PERSONA_DOMAIN",
     "REASON_SENSOR_ADDRESS",
@@ -304,5 +340,6 @@ __all__ = [
     "default",
     "from_env",
     "merge_totals",
+    "parse_roots_strict",
     "set_default",
 ]

@@ -49,6 +49,11 @@ class TPotConfig:
     #: src_ip is OUR public IP, not an attacker). Populate via
     #: `TPOT_HONEYPOT_IPS` env var (comma-separated).
     honeypot_ips: frozenset[str] = frozenset()
+    #: Persona domain roots (TPOT2CTI_OWN_DOMAINS), canonical A-labels. Each
+    #: covers itself and every subdomain; URLs/domains under one are refused
+    #: as our own surface (tpot2cti/own_surface.py). REQUIRED: load_config()
+    #: raises ConfigError when missing, blank or holding any invalid entry.
+    own_domains: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -336,11 +341,21 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
     honeypot_ips = frozenset(
         ip.strip() for ip in raw_honeypot_ips.split(",") if ip.strip()
     )
+    # own_domains: REQUIRED and fail-closed. A missing, blank or partly
+    # invalid list must stop every tpot2cti process at startup, never shrink
+    # the own-surface guard silently (Codex review of 25ce2b8).
+    from tpot2cti.own_surface import OwnDomainsError, parse_roots_strict
+    try:
+        own_domains = parse_roots_strict(env.get("TPOT2CTI_OWN_DOMAINS"))
+    except OwnDomainsError as e:
+        raise ConfigError(str(e)) from None
+
     tpot = TPotConfig(
         host=_env_str(env, "TPOT_HOST", required=True),
         ssh_user=_env_str(env, "TPOT_SSH_USER", default="tpot") or "tpot",
         ssh_port=_env_int(env, "TPOT_SSH_PORT", default=64295),
         honeypot_ips=honeypot_ips,
+        own_domains=own_domains,
     )
 
     # --- T-Pot Elasticsearch ---

@@ -153,7 +153,8 @@ def test_from_env_reads_one_variable_and_never_exposes_the_roots():
     own = OS.from_env({OS.ENV_OWN_DOMAINS: f" {ROOT_A} , {ROOT_B},"}, redactor=False)
     assert own.roots == frozenset({ROOT_A, ROOT_B})
     assert ROOT_A not in json.dumps(own.summary())
-    assert OS.from_env({}, redactor=False).roots == frozenset()
+    with pytest.raises(OS.OwnDomainsError):
+        OS.from_env({}, redactor=False)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +442,6 @@ def test_default_cycle_differs_from_legacy_only_by_inbound_targets(tmp_path, mon
     edges, with the only other change being the indicator prose that used to
     count a request path as a 'referenced URL'."""
     from tests import dr02_harness as H
-    monkeypatch.delenv(OS.ENV_OWN_DOMAINS, raising=False)
     legacy_objs, _, _, _ = H.cycle_bundle(tmp_path / "l")
     assert H.digest(legacy_objs) == H.golden()["cycle"]
     new_objs, summary, _, state = H.cycle_bundle(tmp_path / "n", {H.LEGACY_INBOUND: "false"})

@@ -1412,14 +1412,17 @@ def main() -> int:
         f"cfg_hash={_bits['cfg_hash']} "
         f"ignore_types={sorted(cfg.cycle.ignore_types)}"
     )
-    # Own-surface configuration, stated once at startup: an empty
-    # TPOT2CTI_OWN_DOMAINS is WARNed (persona URLs would not be refused),
-    # and the legacy inbound switch is named when it is on.
-    try:
-        from tpot2cti.own_surface import default as _own_default
-        _own_default()
-    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
-        logger.warning(f"own-surface: configuration could not be read: {e}")
+    # Own-surface configuration. load_config() already failed closed on a
+    # missing/invalid TPOT2CTI_OWN_DOMAINS; install the process-wide
+    # predicate (profile-Note rendering reads it) from that SAME validated
+    # value, with the publisher's sensor identity. No catch: a process that
+    # cannot hold the guard must not run.
+    from tpot2cti import own_surface as _own_surface
+    from tpot2cti.redact import from_env as _redactor_from_env
+    _own_surface.set_default(_own_surface.OwnSurface(
+        cfg.tpot.own_domains, redactor=_redactor_from_env()))
+    logger.info(f"own-surface: {len(cfg.tpot.own_domains)} persona domain "
+                f"root(s) configured")
     if cfg.cycle.inbound_request_observables:
         logger.warning(
             "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES=true: inbound request "

@@ -32,6 +32,12 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   `<root>.evil.example`, confusables) are kept. JNDI URLs are no longer
   exempt when their host is ours; the unattributed-payload salvage skips such
   a group before anchoring anything on it (no dangling reference).
+- **Fail closed** (review of the first cut): `TPOT2CTI_OWN_DOMAINS` is
+  required. `load_config()` raises `ConfigError` when it is missing or blank,
+  has no valid root, or has ANY invalid entry, so no tpot2cti process starts
+  without the guard. The builder takes the roots from the validated Config;
+  the catches that turned a configuration failure into "no guard" are gone
+  (builder, startup, profile rendering).
 - Attacker-profile Notes filter own-surface URLs/domains out of the stored
   samples at render time (rows written before this change still hold them).
 - Counters: cycle summary and `/health` gain `own_surface` (`last_cycle`,

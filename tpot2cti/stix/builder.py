@@ -841,15 +841,14 @@ class STIXBuilder:
             self._redactor = _redactor_from_env()
         except Exception:      # pragma: no cover — never break the builder
             self._redactor = None
-        # Persona domain roots (TPOT2CTI_OWN_DOMAINS). Held WITHOUT a
+        # Persona domain roots, from the validated Config (load_config fails
+        # closed on a missing/invalid TPOT2CTI_OWN_DOMAINS). Held WITHOUT a
         # redactor: the sensor half of the question is asked of
         # self._redactor at call time, so replacing the redactor (tests do)
-        # can never leave a stale copy behind in here.
-        try:
-            from tpot2cti.own_surface import from_env as _own_from_env
-            self._own_surface = _own_from_env(redactor=False)
-        except Exception:      # pragma: no cover — never break the builder
-            self._own_surface = None
+        # can never leave a stale copy behind in here. No catch: a builder
+        # that cannot hold the guard must not build.
+        from tpot2cti.own_surface import OwnSurface as _OwnSurface
+        self._own_surface = _OwnSurface(config.tpot.own_domains)
 
         # Stable IDs for the operator + TLP marking — referenced everywhere
         self.operator_identity_id = generate_identity_id(
