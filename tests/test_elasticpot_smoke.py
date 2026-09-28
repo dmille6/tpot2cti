@@ -76,7 +76,8 @@ def test_elasticpot_smoke():
     )
 
     # session.urls populated
-    assert ds.urls == ["/"]
-    assert cs.urls == ["/_search"]
+    assert ds.request_urls == ["/"]
+    assert ds.urls == []  # a request path is our surface, not an IoC
+    assert cs.request_urls == ["/_search"]
 
     print("OK")

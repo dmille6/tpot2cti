@@ -162,12 +162,12 @@ class NginxParser(BaseParser):
         return event
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — one event per session, with session.urls populated
+    # correlate() — one event per session, with session.request_urls populated
     # ──────────────────────────────────────────────────────────────────
 
     def correlate(self, events):
         """One-event-per-session, with the request_uri added to
-        `session.urls` so the substance filter and the STIX builder
+        `session.request_urls` so the substance filter and the STIX builder
         can both reach the URL directly off the session.
         """
         sessions: list[AttackSession] = []
@@ -175,7 +175,8 @@ class NginxParser(BaseParser):
             s = AttackSession.from_event(e)
             uri = e.meta.get("request_uri")
             if uri:
-                s.urls.append(str(uri))
+                # Inbound request target: our surface, not an IoC (AttackSession.request_urls).
+                s.request_urls.append(str(uri))
             sessions.append(s)
         return sessions
     # ──────────────────────────────────────────────────────────────────

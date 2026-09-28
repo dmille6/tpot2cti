@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+import pytest
+
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.stix_ids import (
     attacker_ip_indicator_id,
@@ -231,6 +233,7 @@ def test_suricata_second_alert_still_indicates_the_cve(builder):
     )
 
 
+@pytest.mark.legacy_inbound  # the opt-in inbound emission path
 def test_suricata_second_alert_still_links_the_requested_url(builder):
     """Found by sweeping for the pattern rather than from the review list —
     build_suricata_alert's http_url block had the same gate."""
@@ -244,6 +247,7 @@ def test_suricata_second_alert_still_links_the_requested_url(builder):
     )
 
 
+@pytest.mark.legacy_inbound  # the opt-in inbound emission path
 def test_suricata_domain_resolves_to_each_destination_it_was_seen_for(builder):
     """The SNI repeats across alerts; the address it resolved to does not.
     Gating on the Domain node kept only the first resolution."""
@@ -595,6 +599,7 @@ def test_a_second_attacker_in_the_same_asn_still_belongs_to_it(builder):
     )
 
 
+@pytest.mark.legacy_inbound  # the opt-in inbound emission path
 def test_a_second_domain_resolving_to_a_known_ip_keeps_its_resolves_to(builder):
     """Suricata SNI -> destination IP.
 
@@ -665,6 +670,7 @@ def test_the_same_ip_with_different_geo_still_gets_both_edges(builder):
         "the second ASN seen for this IP produced no belongs-to edge"
 
 
+@pytest.mark.legacy_inbound  # the opt-in inbound emission path
 def test_an_sni_never_resolves_to_the_attackers_own_address(builder):
     """A Suricata alert with SNI but no dst_ip must assert NOTHING.
 

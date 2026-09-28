@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 
 
@@ -98,6 +100,7 @@ def _suricata_sni_session(sni, ip="203.0.113.9", dst="198.51.100.7"):
     return AttackSession.from_event(ev)
 
 
+@pytest.mark.legacy_inbound  # the opt-in inbound emission path
 def test_suricata_sni_resolves_to_is_self_contained(builder):
     """A resolves-to edge must point at an ipv4-addr that is IN the bundle
     (regression for the dangling MISSING_REFERENCE on resolves-to→ipv4)."""

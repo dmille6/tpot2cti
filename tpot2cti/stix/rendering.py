@@ -406,14 +406,30 @@ def _render_commands_section(rows: list[dict]) -> list[str]:
     return out
 
 
+def _own_surface_filter():
+    """`value -> True` when a sample URL/domain is our own surface.
+
+    Fails closed: an unconfigured or invalid TPOT2CTI_OWN_DOMAINS raises
+    here rather than render samples unfiltered.
+    """
+    from tpot2cti.own_surface import default as _own_default
+    return _own_default().is_own_value
+
+
 def _render_unique_section(
     rows: list[dict], col: str, heading: str, fence: bool = False,
+    exclude=None,
 ) -> list[str]:
-    """Render a deduplicated list from one JSON column across parser rows."""
+    """Render a deduplicated list from one JSON column across parser rows.
+
+    `exclude(value) -> bool` drops values before they are counted or shown.
+    """
     seen: list = []
     seen_set: set = set()
     for row in rows:
         for v in row.get(col, []) or []:
+            if exclude is not None and exclude(v):
+                continue
             key = repr(v)
             if key in seen_set:
                 continue
@@ -528,10 +544,17 @@ def render_attacker_profile_body(
     lines.extend(_render_unique_section(rows, "sample_hashes_json", "Files dropped (sha256)"))
     if lines and lines[-1] != "":
         lines.append("")
-    lines.extend(_render_unique_section(rows, "sample_urls_json", "URLs referenced"))
+    # Own surface is filtered at RENDER time as well as at emission: the
+    # samples live in state.db, and rows written before 2026-09-28 still
+    # carry inbound Host-header URLs and persona (sub)domains, which would
+    # otherwise keep being republished inside every profile Note.
+    _own = _own_surface_filter()
+    lines.extend(_render_unique_section(rows, "sample_urls_json", "URLs referenced",
+                                        exclude=_own))
     if lines and lines[-1] != "":
         lines.append("")
-    lines.extend(_render_unique_section(rows, "sample_domains_json", "Domains referenced"))
+    lines.extend(_render_unique_section(rows, "sample_domains_json", "Domains referenced",
+                                        exclude=_own))
     if lines and lines[-1] != "":
         lines.append("")
     lines.extend(_render_unique_section(rows, "sample_signatures_json", "Suricata signatures"))

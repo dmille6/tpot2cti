@@ -127,8 +127,19 @@ class AttackSession:
     #: ConPot session either way.
     protocol_requests: list[str] = field(default_factory=list)
     malware_hashes: list[str] = field(default_factory=list)  # sha256s
+    #: URLs / domains the attacker REFERENCED: a dropper in a command, a
+    #: download source, a Log4Shell callback. These are IoC candidates.
     urls: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
+    #: The request the attacker sent TO our sensor: request line / Host
+    #: header + path (`request_urls`) and the Host name itself
+    #: (`request_hosts`). DELIBERATELY separate from `urls`/`domains`: an
+    #: inbound request target names OUR surface (a persona subdomain, a
+    #: sensor address), not the attacker's, and 158,128 v2 Url observables
+    #: (88.8%, 2026-09-28) were exactly these. Request metadata — the
+    #: builders emit them only under TPOT2CTI_INBOUND_REQUEST_OBSERVABLES.
+    request_urls: list[str] = field(default_factory=list)
+    request_hosts: list[str] = field(default_factory=list)
     credentials_tried: list[tuple[str, str]] = field(default_factory=list)
     #: The specific (username, password) the honeypot ACCEPTED, if any.
     #: Lets the per-IP credential Note flag which login worked. Populated
@@ -174,6 +185,19 @@ class AttackSession:
     @property
     def event_count(self) -> int:
         return len(self.events)
+
+    def fold_request_targets(self) -> None:
+        """Merge request_urls/request_hosts into urls/domains, request
+        targets FIRST (the order parsers produced before the split), and
+        clear them. Only for TPOT2CTI_INBOUND_REQUEST_OBSERVABLES=true."""
+        if self.request_urls:
+            self.urls = list(self.request_urls) + [
+                u for u in self.urls if u not in self.request_urls]
+            self.request_urls = []
+        if self.request_hosts:
+            self.domains = list(self.request_hosts) + [
+                d for d in self.domains if d not in self.request_hosts]
+            self.request_hosts = []
 
     @classmethod
     def from_event(cls, event: ParsedEvent) -> "AttackSession":
@@ -446,3 +470,6 @@ def _smoketest_env() -> None:
     os.environ.setdefault("TPOT_HOST", "test")
     os.environ.setdefault("OPENCTI_ADMIN_TOKEN", "00000000-0000-0000-0000-000000000000")
     os.environ.setdefault("TPOT2CTI_CONNECTOR_ID", "00000000-0000-0000-0000-000000000001")
+    # Required since 2026-09-28 (fail-closed own surface). A placeholder root
+    # no fixture or test host falls under; never a real persona domain.
+    os.environ.setdefault("TPOT2CTI_OWN_DOMAINS", "own-surface-placeholder.example.com")

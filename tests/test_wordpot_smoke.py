@@ -98,6 +98,7 @@ def test_wordpot_smoke():
     rs = parser.correlate([re_])[0]
 
     # URL mirrored onto the session
-    assert ls.urls == ["/wp-login.php"]
+    assert ls.request_urls == ["/wp-login.php"]
+    assert ls.urls == []  # a request path is our surface, not an IoC
 
     print("OK")

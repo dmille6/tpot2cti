@@ -116,13 +116,23 @@ class CapturingPublisher:
         return SimpleNamespace(cycle_id=cycle_id, pass_counts={}, errors=[])
 
 
+#: The goldens predate the own-surface provenance split (2026-09-28), which
+#: deliberately stops emitting inbound request targets. The harness pins the
+#: legacy switch ON so DR-02's byte-identity contract stays checkable
+#: against the same golden; tests/test_own_surface_personas.py compares
+#: the default (switch off) against this legacy bundle by subtraction. Pass
+#: {LEGACY_INBOUND: "false"} to get today's default.
+LEGACY_INBOUND = "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES"
+
+
 def make_cfg(env_overrides: dict | None = None):
     env = dict(os.environ)
     for k in list(env):
         # A stray flag in the developer's shell must not leak into a golden.
         if k.startswith("TPOT2CTI_EVIDENCE") or k.startswith("TPOT2CTI_SIGHTING") \
-                or k == "TPOT2CTI_COUNTS_INDEX_PATTERN":
+                or k == "TPOT2CTI_COUNTS_INDEX_PATTERN" or k == LEGACY_INBOUND:
             env.pop(k)
+    env[LEGACY_INBOUND] = "true"
     env.update(env_overrides or {})
     return load_config(env_dict=env)
 

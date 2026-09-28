@@ -95,6 +95,7 @@ def test_tanner_smoke():
     assert ce.meta.get("mitre_technique", {}).get("id") == "T1190"
 
     # URL mirrored onto the session
-    assert ss.urls == ["/index.php?id=1' OR '1'='1"]
+    assert ss.request_urls == ["/index.php?id=1' OR '1'='1"]
+    assert ss.urls == []  # a request path is our surface, not an IoC
 
     print("OK")

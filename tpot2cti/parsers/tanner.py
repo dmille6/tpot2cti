@@ -123,11 +123,11 @@ class TannerParser(BaseParser):
         return event
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — default one-event-per-session, plus session.urls
+    # correlate() — default one-event-per-session, plus session.request_urls
     # ──────────────────────────────────────────────────────────────────
 
     def correlate(self, events):
-        """One-event-per-session, copying url onto session.urls so the
+        """One-event-per-session, copying url onto session.request_urls so the
         substance filter and the STIX builder can reach it via the
         session directly.
         """
@@ -136,7 +136,8 @@ class TannerParser(BaseParser):
             s = AttackSession.from_event(e)
             url = e.meta.get("url")
             if url:
-                s.urls.append(str(url))
+                # Inbound request target: our surface, not an IoC (AttackSession.request_urls).
+                s.request_urls.append(str(url))
             sessions.append(s)
         return sessions
     # ──────────────────────────────────────────────────────────────────
