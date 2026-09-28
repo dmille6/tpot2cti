@@ -119,7 +119,7 @@ class CapturingPublisher:
 #: The goldens predate the own-surface provenance split (2026-09-28), which
 #: deliberately stops emitting inbound request targets. The harness pins the
 #: legacy switch ON so DR-02's byte-identity contract stays checkable
-#: against the same golden; tests/test_own_surface_provenance.py compares
+#: against the same golden; tests/test_own_surface_personas.py compares
 #: the default (switch off) against this legacy bundle by subtraction. Pass
 #: {LEGACY_INBOUND: "false"} to get today's default.
 LEGACY_INBOUND = "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES"

@@ -3413,14 +3413,22 @@ class STIXBuilder:
                     out.append(rel)
 
         # ── Domain-Name (TLS SNI or HTTP host) ────────────────────────
-        # INBOUND ONLY, so NOT EMITTED by default (2026-09-28). Every
-        # Suricata event reaching this builder has an external source (the
-        # source-address gate in main.run_cycle drops our own), so its SNI
-        # and Host name the thing the attacker asked OUR sensor for: a
-        # persona name, a scanner's guess, or a proxy-judge host. None of
-        # those is attacker infrastructure, and the resolves-to edge below
-        # would assert "<name> resolves to <our sensor address>" into the
-        # graph. Kept behind the legacy switch for a no-rebuild rollback.
+        # NOT EMITTED by default (2026-09-28). The SNI / Host here is the
+        # name a CLIENT asked a SERVER for, and on a sensor either the client
+        # or the server is us:
+        #   * inbound (the common case): an outside client asked OUR sensor
+        #     for a persona name, a scanner's guess or a proxy-judge host;
+        #   * to_client / sensor-initiated flows: the source-address gate in
+        #     main.run_cycle only drops events whose src_ip is ours, and
+        #     Suricata can report the REMOTE end as src_ip — e.g. a sensor's
+        #     own outbound TLS to a vendor update CDN arrives with the CDN's
+        #     address as the "attacker" and the CDN name as SNI.
+        # In neither case is the name attacker infrastructure, and the
+        # resolves-to edge below would tie it to whichever address happened
+        # to be dst_ip (often our own sensor). Kept behind the legacy switch
+        # for a no-rebuild rollback. (That such a to_client alert still mints
+        # an attacker IP for the remote end is a separate, pre-existing
+        # defect of the source attribution, not of this block.)
         domain_candidates: list[str] = []
         if sni := meta.get("tls_sni"):
             domain_candidates.append(sni)
