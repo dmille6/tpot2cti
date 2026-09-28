@@ -358,8 +358,10 @@ class H0neytr4pParser(BaseParser):
 
     def correlate(self, events: Iterable[ParsedEvent]) -> list[AttackSession]:
         """One :class:`AttackSession` per request, with the request's
-        reconstructed URL pushed to ``session.urls`` and the host_header
-        pushed to ``session.domains``.
+        reconstructed URL pushed to ``session.request_urls`` and the
+        host_header to ``session.request_hosts`` (inbound request metadata,
+        not IoCs); recovered Log4Shell C2 endpoints go to ``session.urls``
+        / ``session.domains``.
 
         Promotion at correlate time means the downstream STIX builder
         reads uniformly-populated session fields instead of having to
@@ -384,23 +386,27 @@ class H0neytr4pParser(BaseParser):
 
             # Reconstruct a full URL when we have both pieces.  We don't
             # try to be clever with scheme detection beyond port 443.
+            # The request the attacker sent TO us — Host + URI, or an
+            # absolute URI in the request line (a proxy probe) — is our own
+            # surface, not theirs: `request_urls` / `request_hosts`, never
+            # `urls` / `domains` (see AttackSession.request_urls).
             if host_header and uri:
                 scheme = "https" if e.dst_port in (443, 8443) else "http"
                 full_url = f"{scheme}://{host_header}{uri}" if uri.startswith("/") else f"{scheme}://{host_header}/{uri}"
-                if full_url not in session.urls:
-                    session.urls.append(full_url)
+                if full_url not in session.request_urls:
+                    session.request_urls.append(full_url)
             elif uri.startswith("http://") or uri.startswith("https://"):
                 # Absolute URI in the request line (HTTP/1.1 to proxies)
-                if uri not in session.urls:
-                    session.urls.append(uri)
+                if uri not in session.request_urls:
+                    session.request_urls.append(uri)
 
             if host_header:
-                # Only push real FQDN-shaped hosts as domains; bare IPv4
-                # literals are already attacker / dst observables.
+                # Only real FQDN-shaped hosts; bare IPv4 literals are
+                # already attacker / dst observables.
                 host_str = str(host_header).split(":", 1)[0]   # strip :port
                 if host_str and "." in host_str and not host_str.replace(".", "").isdigit():
-                    if host_str not in session.domains:
-                        session.domains.append(host_str)
+                    if host_str not in session.request_hosts:
+                        session.request_hosts.append(host_str)
 
             # Recovered Log4Shell C2 endpoints. Promoted to the same
             # session.urls / session.domains the builder already consumes,

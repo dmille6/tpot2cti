@@ -147,7 +147,7 @@ class ElasticPotParser(BaseParser):
     # extend it below with the URL.
 
     def correlate(self, events):
-        """One-event-per-session, with session.urls populated from the
+        """One-event-per-session, with session.request_urls populated from the
         single event's request_url so the substance filter and the STIX
         builder can both reach the URL via the session directly.
         """
@@ -156,7 +156,8 @@ class ElasticPotParser(BaseParser):
             s = AttackSession.from_event(e)
             url = e.meta.get("request_url")
             if url:
-                s.urls.append(str(url))
+                # Inbound request target: our surface, not an IoC (AttackSession.request_urls).
+                s.request_urls.append(str(url))
             sessions.append(s)
         return sessions
     # ──────────────────────────────────────────────────────────────────

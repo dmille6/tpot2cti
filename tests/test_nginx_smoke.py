@@ -83,7 +83,8 @@ def test_nginx_smoke():
     es = parser.correlate([ee])[0]
 
     # session.urls populated from request_uri
-    assert ds.urls == ["/"]
-    assert gs.urls == ["/.git/HEAD"]
+    assert ds.request_urls == ["/"]
+    assert ds.urls == []  # a request path is our surface, not an IoC
+    assert gs.request_urls == ["/.git/HEAD"]
 
     print("OK")

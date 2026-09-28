@@ -85,9 +85,19 @@ def test_suricata_smoke():
     assert "T1190" in ap_ext_ids, f"missing T1190 AttackPattern; got {ap_ext_ids}"
     print("\nVerified: CVE-2021-44228 Vulnerability + T1190 AttackPattern present.")
 
-    # Also assert a Domain-Name was emitted from the TLS SNI
+    # The TLS SNI of an INBOUND alert names what the attacker asked OUR
+    # sensor for — not emitted by default (2026-09-28), counted instead.
     domains = {o.get("value") for o in objects if o["type"] == "domain-name"}
+    assert domains == set(), f"inbound SNI emitted as a Domain-Name: {domains}"
+    assert builder.inbound_request_suppressed.get("domain") == 1
+
+    # ...and the legacy switch still emits it (the no-rebuild rollback).
+    import dataclasses
+    legacy = STIXBuilder(dataclasses.replace(
+        cfg, cycle=dataclasses.replace(cfg.cycle, inbound_request_observables=True)))
+    domains = {o.get("value") for o in legacy.build_suricata_alert(session)
+               if o["type"] == "domain-name"}
     assert "victim.example.com" in domains, f"missing SNI domain; got {domains}"
-    print(f"Verified: Domain-Name for TLS SNI present: {domains}")
+    print(f"Verified: Domain-Name for TLS SNI only under the legacy switch: {domains}")
 
     print("\nSmoke test passed.")

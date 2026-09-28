@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Own surface: persona domains refused, inbound request targets not emitted (2026-09-28)
+
+- Measured on the v2 corpus 2026-09-28: 158,128 of 178,022 Url observables
+  (88.8%) named a persona domain the sensors answer to, minted from the
+  inbound `Host` header (h0neytr4p 97%, Suricata the rest). Each one was an
+  enrichment lookup and a GTI Note (65,349 GTI Notes name one).
+- **Provenance.** `AttackSession.request_urls` / `request_hosts` now hold the
+  request the attacker sent TO the sensor (h0neytr4p Host + URI and
+  absolute-form URIs, Tanner, ElasticPot, NGINX, Wordpot, Honeyaml request
+  targets). They are request metadata, not `urls` / `domains`, and are not
+  emitted as observables. Suricata's inbound HTTP Host / TLS SNI Domain-Names
+  (and their `resolves-to` edge to our own sensor address) and its request
+  URL are no longer emitted either. Attacker-REFERENCED URLs are unchanged:
+  command droppers, download sources, Log4Shell callbacks.
+  `TPOT2CTI_INBOUND_REQUEST_OBSERVABLES=true` restores the old output
+  without a rebuild; with it on, the DR-02 cycle golden is still reproduced
+  byte for byte (the harness pins it on; `tests/test_own_surface_personas.py`
+  proves the default differs only by the removed inbound URLs, their edges,
+  and the indicator prose that counted a request path as a referenced URL).
+- **Refusal.** `own_surface.py`: `TPOT2CTI_OWN_DOMAINS` (comma-separated
+  roots, in `.env`, never in this repository) plus the redactor's sensor
+  addresses and hostnames. `build_url` and, new, `build_domain` refuse any
+  value whose host is our own surface — exact root or subdomain after case,
+  trailing-dot, port and IDNA folding; look-alikes (`<root>-evil`,
+  `<root>.evil.example`, confusables) are kept. JNDI URLs are no longer
+  exempt when their host is ours; the unattributed-payload salvage skips such
+  a group before anchoring anything on it (no dangling reference).
+- Attacker-profile Notes filter own-surface URLs/domains out of the stored
+  samples at render time (rows written before this change still hold them).
+- Counters: cycle summary and `/health` gain `own_surface` (`last_cycle`,
+  `totals` with `since`; reset when the root count or the legacy switch
+  changes): refusals by `url|domain:persona-domain|sensor-address|sensor-hostname`
+  and `inbound_suppressed` by `url|domain`. Counts only; roots are never shown.
+
 ### SIP_FRAUD: count the PBX `900` prefix (owner decision 2026-09-27)
 
 - `is_intl_dial` also covers `900` (PBX outside line 9, then `00`), the

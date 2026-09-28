@@ -100,11 +100,11 @@ class WordpotParser(BaseParser):
         return event
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — default one-event-per-session, plus session.urls
+    # correlate() — default one-event-per-session, plus session.request_urls
     # ──────────────────────────────────────────────────────────────────
 
     def correlate(self, events):
-        """One-event-per-session, copying request_path onto session.urls
+        """One-event-per-session, copying request_path onto session.request_urls
         so the substance filter and the STIX builder can reach the URL
         via the session directly.
         """
@@ -113,7 +113,8 @@ class WordpotParser(BaseParser):
             s = AttackSession.from_event(e)
             path = e.meta.get("request_path")
             if path:
-                s.urls.append(str(path))
+                # Inbound request target: our surface, not an IoC (AttackSession.request_urls).
+                s.request_urls.append(str(path))
             sessions.append(s)
         return sessions
     # ──────────────────────────────────────────────────────────────────

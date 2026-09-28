@@ -111,7 +111,7 @@ class HoneyamlParser(BaseParser):
 
     def correlate(self, events):
         """One-event-per-session, with `request_path` added to
-        `session.urls` so downstream consumers can reach the attempted
+        `session.request_urls` so downstream consumers can reach the attempted
         path off the session directly.
         """
         sessions: list[AttackSession] = []
@@ -119,7 +119,8 @@ class HoneyamlParser(BaseParser):
             s = AttackSession.from_event(e)
             path = e.meta.get("request_path")
             if path:
-                s.urls.append(str(path))
+                # Inbound request target: our surface, not an IoC (AttackSession.request_urls).
+                s.request_urls.append(str(path))
             sessions.append(s)
         return sessions
     # ──────────────────────────────────────────────────────────────────

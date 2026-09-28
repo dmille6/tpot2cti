@@ -147,6 +147,12 @@ class CycleConfig:
     #: Sighting description leads with the honeypot types seen for that
     #: sensor, address and UTC day). See docs/EVIDENCE_GATE.md section 3.
     sighting_grain: str = "legacy"
+    #: Emit INBOUND request targets as observables: the Host header + path
+    #: an attacker sent to a web honeypot, and Suricata's inbound HTTP Host /
+    #: TLS SNI / request URL. False (default since 2026-09-28): those name
+    #: OUR sensor, not the attacker, and are not IoCs. True restores the old
+    #: output for a no-rebuild rollback (own-surface refusal still applies).
+    inbound_request_observables: bool = False
 
 
 #: Accepted values for CycleConfig.sighting_grain.
@@ -420,6 +426,8 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
             env, "TPOT2CTI_SIGHTINGS_DECOUPLED", default=False),
         sighting_grain=_env_choice(env, "TPOT2CTI_SIGHTING_GRAIN", "legacy",
                                    SIGHTING_GRAINS),
+        inbound_request_observables=_env_bool_strict(
+            env, "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES", default=False),
     )
 
     # --- Connector IDs ---

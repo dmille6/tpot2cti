@@ -63,8 +63,9 @@ def test_honeyaml_smoke():
     bgs = parser.correlate([bg])[0]
 
     # request_path / urls
-    assert bs.urls == ["/config.yaml"]
-    assert bos.urls == ["/.kube/config"]
+    assert bs.request_urls == ["/config.yaml"]
+    assert bs.urls == []  # a request path is our surface, not an IoC
+    assert bos.request_urls == ["/.kube/config"]
 
     # truncation enforced
     assert len(bgs.events[0].meta["request_body"]) == REQUEST_BODY_CAP, (

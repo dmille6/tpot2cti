@@ -21,6 +21,12 @@ from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti import attack_mapping
 from tpot2cti import evidence
 from tpot2cti import port_intel
+from tpot2cti.own_surface import (
+    REASON_PERSONA_DOMAIN,
+    REASON_SENSOR_ADDRESS,
+    REASON_SENSOR_HOSTNAME,
+    canon_host,
+)
 from tpot2cti.stix.rendering import (
     render_cowrie_session_note_body,
     render_cowrie_sighting_description,
@@ -815,6 +821,15 @@ class STIXBuilder:
         #: "the extractor found nothing" and "we stopped publishing our own
         #: attack surface".
         self.rejected_own_surface_urls = 0
+        #: Own-surface refusals by "<object>:<reason>" — object is `url` or
+        #: `domain`, reason is own_surface.REASON_* (persona-domain,
+        #: sensor-address, sensor-hostname). Persona domains are a zone, not
+        #: a name, so this is the only place their refusal is visible.
+        self.own_surface_refused: dict[str, int] = {}
+        #: Inbound request targets (Host + path, SNI) NOT emitted because
+        #: they describe OUR sensor, not the attacker: "url" and "domain".
+        #: Nonzero only when TPOT2CTI_INBOUND_REQUEST_OBSERVABLES is off.
+        self.inbound_request_suppressed: dict[str, int] = {}
         #: Relationships emitted with no session in scope, so no start_time.
         #: 100% of edges carried the 1970 epoch sentinel before this existed.
         self.untimed_relationships = 0
@@ -826,6 +841,15 @@ class STIXBuilder:
             self._redactor = _redactor_from_env()
         except Exception:      # pragma: no cover — never break the builder
             self._redactor = None
+        # Persona domain roots (TPOT2CTI_OWN_DOMAINS). Held WITHOUT a
+        # redactor: the sensor half of the question is asked of
+        # self._redactor at call time, so replacing the redactor (tests do)
+        # can never leave a stale copy behind in here.
+        try:
+            from tpot2cti.own_surface import from_env as _own_from_env
+            self._own_surface = _own_from_env(redactor=False)
+        except Exception:      # pragma: no cover — never break the builder
+            self._own_surface = None
 
         # Stable IDs for the operator + TLP marking — referenced everywhere
         self.operator_identity_id = generate_identity_id(
@@ -1877,6 +1901,58 @@ class STIXBuilder:
             obj["external_references"] = refs
         return self._dedup(self._stamp(obj))
 
+    # ── own-surface predicate ─────────────────────────────────────────
+    def _own_host_reason(self, host: Optional[str]) -> Optional[str]:
+        """Why `host` is OUR surface (own_surface.REASON_*), or None.
+
+        Persona domains from self._own_surface; sensor addresses, networks
+        and hostnames from self._redactor, asked at call time.
+        """
+        h = canon_host(host)
+        if not h:
+            return None
+        own = self._own_surface
+        if own is not None and own.domain_root(h) is not None:
+            return REASON_PERSONA_DOMAIN
+        red = self._redactor
+        if red is not None and red.is_sensor_host(h):
+            try:
+                ipaddress.ip_address(h)
+                return REASON_SENSOR_ADDRESS
+            except ValueError:
+                return REASON_SENSOR_HOSTNAME
+        return None
+
+    def _own_url_reason(self, url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        try:
+            host = urlsplit(str(url).strip()).hostname
+        except ValueError:
+            return None
+        return self._own_host_reason(host)
+
+    def _count_own_refusal(self, kind: str, reason: str) -> None:
+        key = f"{kind}:{reason}"
+        self.own_surface_refused[key] = self.own_surface_refused.get(key, 0) + 1
+
+    def _count_inbound_suppressed(self, kind: str, n: int = 1) -> None:
+        if n:
+            self.inbound_request_suppressed[kind] = (
+                self.inbound_request_suppressed.get(kind, 0) + n)
+
+    @property
+    def _inbound_requests_enabled(self) -> bool:
+        """Legacy switch: emit inbound request targets as observables.
+
+        False (default): the attacker's request TO our sensor — Host header
+        plus path, TLS SNI — is request metadata, not an IoC, and is not
+        emitted. True restores the pre-2026-09-28 output (still subject to
+        the own-surface refusal). TPOT2CTI_INBOUND_REQUEST_OBSERVABLES.
+        """
+        cyc = getattr(self.config, "cycle", None)
+        return bool(getattr(cyc, "inbound_request_observables", False))
+
     def build_url(
         self,
         url: str,
@@ -1911,21 +1987,24 @@ class STIXBuilder:
         # `https://<sensor-address>/wp-login.php` asserts an attacker resource
         # that does not exist.
         #
-        # JNDI/Log4Shell URLs are EXEMPT: their host is frequently an
-        # unresolved template by design, the payload itself is the evidence,
-        # and build_unattributed_payload_objects anchors an entire
-        # Sighting/Note/CVE graph on the URL's id — rejecting one there would
-        # silently delete that graph, which is the dangling-anchor defect
-        # fixed in fix/output-syntactic-validation, reintroduced backwards.
-        if self._redactor is not None:
-            from urllib.parse import urlsplit
-            parts = urlsplit(url)
-            if parts.scheme.lower() not in _JNDI_SCHEMES:
-                host = (parts.hostname or "").strip().lower()
-                if host and self._redactor.is_sensor_host(host):
-                    self.rejected_urls += 1
-                    self.rejected_own_surface_urls += 1
-                    return None
+        # PERSONA DOMAINS ARE OUR SURFACE TOO (2026-09-28). The sensors
+        # answer to persona domains, and scanners enumerate their subdomains:
+        # 158,128 of 178,022 v2 Url observables named one, every one of them
+        # looked up at GTI. The zone is TPOT2CTI_OWN_DOMAINS (own_surface.py);
+        # a host matches its root exactly or as a subdomain, never by prefix.
+        #
+        # JNDI/Log4Shell URLs are no longer exempt when their host resolves
+        # to our own surface: a callback to our own sensor names no attacker
+        # endpoint. An UNRESOLVED template host (`${...}`) never matches a
+        # root, so the salvage graph of a real external C2 is untouched, and
+        # build_unattributed_payload_objects skips an own-host group BEFORE
+        # anchoring on its URL id, so no edge can dangle.
+        reason = self._own_url_reason(url)
+        if reason is not None:
+            self.rejected_urls += 1
+            self.rejected_own_surface_urls += 1
+            self._count_own_refusal("url", reason)
+            return None
 
         obj = {
             "type": "url",
@@ -1964,6 +2043,16 @@ class STIXBuilder:
         if fqdn_lc is None:
             logger.debug(f"build_domain: skipping malformed domain {fqdn!r}")
             self.rejected_domains += 1
+            return None
+        # Our own surface is not an indicator — a persona (sub)domain or a
+        # sensor hostname, whichever path brought it here (Suricata SNI,
+        # a Host header, a JNDI callback, a command naming our own name).
+        # Callers anchor through _emit_domain, which never references a
+        # domain that was not built, so refusing here cannot dangle an edge.
+        reason = self._own_host_reason(fqdn_lc)
+        if reason is not None:
+            self.rejected_domains += 1
+            self._count_own_refusal("domain", reason)
             return None
         obj = {
             "type": "domain-name",
@@ -3325,13 +3414,23 @@ class STIXBuilder:
                     out.append(rel)
 
         # ── Domain-Name (TLS SNI or HTTP host) ────────────────────────
-        # Collect candidate domains, dedup, build Domain-Name observables.
+        # INBOUND ONLY, so NOT EMITTED by default (2026-09-28). Every
+        # Suricata event reaching this builder has an external source (the
+        # source-address gate in main.run_cycle drops our own), so its SNI
+        # and Host name the thing the attacker asked OUR sensor for: a
+        # persona name, a scanner's guess, or a proxy-judge host. None of
+        # those is attacker infrastructure, and the resolves-to edge below
+        # would assert "<name> resolves to <our sensor address>" into the
+        # graph. Kept behind the legacy switch for a no-rebuild rollback.
         domain_candidates: list[str] = []
         if sni := meta.get("tls_sni"):
             domain_candidates.append(sni)
         if host := meta.get("http_host"):
             if host not in domain_candidates:
                 domain_candidates.append(host)
+        if not self._inbound_requests_enabled:
+            self._count_inbound_suppressed("domain", len(domain_candidates))
+            domain_candidates = []
 
         for fqdn in domain_candidates:
             # The SNI/host repeats across alerts while the destination it
@@ -3368,7 +3467,12 @@ class STIXBuilder:
                             out.append(rel)
 
         # ── URL observable (if HTTP request URL captured) ─────────────
-        if (url := meta.get("http_url")) and (host := meta.get("http_host")):
+        # The request line + Host of an inbound request: our own surface,
+        # not emitted by default (see the Domain-Name block above).
+        if (not self._inbound_requests_enabled
+                and meta.get("http_url") and meta.get("http_host")):
+            self._count_inbound_suppressed("url")
+        elif (url := meta.get("http_url")) and (host := meta.get("http_host")):
             full_url = url if url.startswith("http") else f"http://{host}{url}"
             # Scanners hit the same path on every sensor, so this URL is a
             # duplicate for all but the first alert naming it — and the edge
@@ -3721,9 +3825,19 @@ class STIXBuilder:
         ipv4_id = attacker_ip_observable_id(session.src_ip)
         ind_id = attacker_ip_indicator_id(session.src_ip)
 
-        # URL observables (parser-validated full URLs), capped.
+        # URL observables, capped. `session.urls` holds only what the
+        # attacker REFERENCED (JNDI/Log4Shell C2 endpoints, downloads); the
+        # request they sent TO us is `session.request_urls`, which is our
+        # own surface by construction (Host header + path on our sensor)
+        # and is emitted only under the legacy switch.
         seen: set[str] = set()
-        for url in session.urls:
+        web_urls = list(session.urls)
+        request_urls = list(getattr(session, "request_urls", None) or [])
+        if self._inbound_requests_enabled:
+            web_urls += [u for u in request_urls if u not in web_urls]
+        else:
+            self._count_inbound_suppressed("url", len(set(request_urls)))
+        for url in web_urls:
             if len(seen) >= _MAX_WEB_URLS:
                 break
             if url in seen:
@@ -3879,6 +3993,19 @@ class STIXBuilder:
                     "URL %r failed validation, so the Sighting/CVE/Note graph "
                     "has no anchor", key, url[:120],
                 )
+                continue
+            # A callback to OUR OWN surface names no attacker endpoint, and
+            # build_url will refuse it — so skip the group HERE, before any
+            # edge, Sighting or Note is anchored on an id that will never be
+            # published. Counted once, as the URL refusal it replaces.
+            own_reason = self._own_url_reason(canon_url)
+            if own_reason is not None:
+                self.rejected_urls += 1
+                self.rejected_own_surface_urls += 1
+                self._count_own_refusal("url", own_reason)
+                logger.info(
+                    "unattributed salvage: group skipped — its C2 host is "
+                    "our own surface (%s)", own_reason)
                 continue
             # Synthetic session purely as a carrier for the shared
             # build_* helpers (timestamps, sensor, deterministic ids).

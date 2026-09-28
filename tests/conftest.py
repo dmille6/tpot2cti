@@ -35,10 +35,31 @@ def cfg():
     return load_config()
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "legacy_inbound: build with TPOT2CTI_INBOUND_REQUEST_OBSERVABLES=true "
+        "(tests of the pre-2026-09-28 inbound request emission path)",
+    )
+
+
+def legacy_inbound_cfg(cfg):
+    """`cfg` with the legacy inbound-request switch on."""
+    import dataclasses
+    return dataclasses.replace(
+        cfg, cycle=dataclasses.replace(cfg.cycle, inbound_request_observables=True))
+
+
 @pytest.fixture()
-def builder(cfg):
-    """Fresh STIXBuilder per test — preserves per-bundle dedup semantics."""
+def builder(cfg, request):
+    """Fresh STIXBuilder per test — preserves per-bundle dedup semantics.
+
+    ``@pytest.mark.legacy_inbound`` builds with the legacy inbound-request
+    switch on, for tests whose subject is that (now opt-in) emission path.
+    """
     from tpot2cti.stix.builder import STIXBuilder
+    if request.node.get_closest_marker("legacy_inbound") is not None:
+        return STIXBuilder(legacy_inbound_cfg(cfg))
     return STIXBuilder(cfg)
 
 

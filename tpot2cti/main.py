@@ -947,6 +947,14 @@ def run_cycle(
             continue
         sessions_by_type[type_name] = len(sessions)
 
+        # Legacy switch: fold inbound request targets back into urls/domains
+        # ONCE, here, so every consumer (builder, attacker profile, prose)
+        # sees exactly the pre-2026-09-28 session. Off (the default), they
+        # stay request metadata and never become observables.
+        if cfg.cycle.inbound_request_observables:
+            for session in sessions:
+                session.fold_request_targets()
+
         for session in sessions:
             # Feed the attacker-profile aggregator BEFORE STIX build so
             # even a build-time exception doesn't cost us the activity
@@ -1227,6 +1235,20 @@ def run_cycle(
     except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
         logger.warning(f"cycle {cycle_id}: could not persist evidence gate stats: {e}")
 
+    # Own-surface counters for /health, same contract as the DR-02 ones
+    # above: last_cycle every cycle, totals only after a successful publish.
+    from tpot2cti import own_surface as _own_surface
+    own_surface_stats = _own_surface.cycle_stats(builder)
+    try:
+        state.set("last_cycle_own_surface", json.dumps(own_surface_stats))
+        if publish_ok and "error" not in own_surface_stats:
+            _prev = state.get("own_surface_totals")
+            state.set("own_surface_totals", json.dumps(_own_surface.merge_totals(
+                json.loads(_prev) if _prev else None,
+                own_surface_stats, now_iso=now.isoformat())))
+    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+        logger.warning(f"cycle {cycle_id}: could not persist own-surface stats: {e}")
+
     # ── Step 8: cycle summary ─────────────────────────────────────────
     duration_s = time.monotonic() - started_monotonic
     summary = {
@@ -1257,6 +1279,10 @@ def run_cycle(
         # because this number is the difference between "the extractor found
         # nothing" and "we stopped publishing our own attack surface".
         "rejected_own_surface_urls": builder.rejected_own_surface_urls,
+        # Own-surface refusals by object and reason (persona-domain,
+        # sensor-address, sensor-hostname) and inbound request targets not
+        # emitted. Also in /health as `own_surface`.
+        "own_surface": own_surface_stats,
         # Relationships emitted with no session in scope, hence no start_time.
         # Should be ~0; a rising number means a producer is emitting edges
         # outside any session and the graph is losing its time dimension.
@@ -1313,7 +1339,9 @@ def run_cycle(
         f"dedup={dedup_before}->{dedup_after} ({dedup_pct:.1f}%) "
         f"rejected_urls={builder.rejected_urls} "
         f"(own_surface={builder.rejected_own_surface_urls}) "
-        f"rejected_domains={builder.rejected_domains}"
+        f"rejected_domains={builder.rejected_domains} "
+        f"own_surface_refused={own_surface_stats.get('refused')} "
+        f"inbound_suppressed={own_surface_stats.get('inbound_suppressed')}"
     )
     return summary
 
@@ -1384,6 +1412,18 @@ def main() -> int:
         f"cfg_hash={_bits['cfg_hash']} "
         f"ignore_types={sorted(cfg.cycle.ignore_types)}"
     )
+    # Own-surface configuration, stated once at startup: an empty
+    # TPOT2CTI_OWN_DOMAINS is WARNed (persona URLs would not be refused),
+    # and the legacy inbound switch is named when it is on.
+    try:
+        from tpot2cti.own_surface import default as _own_default
+        _own_default()
+    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+        logger.warning(f"own-surface: configuration could not be read: {e}")
+    if cfg.cycle.inbound_request_observables:
+        logger.warning(
+            "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES=true: inbound request "
+            "targets (Host + path, SNI) are emitted as observables (legacy)")
 
     # 2.5) Parser-registry parity check (per 2026-05-22 audit #8).
     #

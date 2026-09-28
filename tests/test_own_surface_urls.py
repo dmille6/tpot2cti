@@ -56,16 +56,26 @@ def test_genuine_attacker_urls_are_untouched(b):
     assert b.rejected_own_surface_urls == 0
 
 
-def test_jndi_payloads_are_exempt(b):
-    """Log4Shell hosts are unresolved templates by design, the payload IS the
-    evidence, and build_unattributed_payload_objects anchors an entire
-    Sighting/Note/CVE graph on the URL id — refusing one would silently
-    delete that graph."""
+def test_jndi_payloads_to_external_hosts_are_kept(b):
+    """Log4Shell hosts are often unresolved templates by design, and the
+    payload IS the evidence: an external callback is always published."""
     exfil = "ldap://x-${sys:java.version}.c2.example/a"
     assert b.build_url(exfil) is not None
-    # even when the JNDI host IS ours, the payload is still the evidence
-    assert b.build_url(f"ldap://{SENSOR_IP}/Exploit") is not None
+    assert b.build_url("ldap://c2.example/Exploit") is not None
     assert b.rejected_own_surface_urls == 0
+
+
+def test_a_jndi_callback_to_our_own_surface_is_refused(b):
+    """Changed 2026-09-28 (was exempt): a callback to our OWN sensor names no
+    attacker endpoint. The salvage graph that anchors on JNDI URL ids now
+    skips such a group BEFORE anchoring (tests/test_own_surface_personas.py
+    asserts no dangling reference), which is what made the exemption
+    necessary in the first place."""
+    assert b.build_url(f"ldap://{SENSOR_IP}/Exploit") is None
+    assert b.build_url(f"rmi://{SENSOR_HOST}:1099/x") is None
+    assert b.rejected_own_surface_urls == 2
+    assert b.own_surface_refused == {"url:sensor-address": 1,
+                                     "url:sensor-hostname": 1}
 
 
 def test_the_refusal_is_counted_separately(b):

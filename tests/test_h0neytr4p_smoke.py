@@ -63,14 +63,16 @@ def test_h0neytr4p_smoke():
     drive_session = parser.correlate([drive_event])[0]
     subs_session = parser.correlate([subs_event])[0]
 
-    # The substantive session must carry the URL + domain in aggregates,
-    # and the matched_hints list in meta.
-    assert any("actuator/env" in u for u in subs_session.urls), (
-        f"expected /actuator/env URL in session.urls, got {subs_session.urls}"
+    # The substantive session must carry the request URL + Host as
+    # REQUEST metadata (never urls/domains: that is our own surface), and
+    # the matched_hints list in meta.
+    assert any("actuator/env" in u for u in subs_session.request_urls), (
+        f"expected /actuator/env URL in session.request_urls, got {subs_session.request_urls}"
     )
-    assert "target.example.com" in subs_session.domains, (
-        f"expected FQDN in session.domains, got {subs_session.domains}"
+    assert "target.example.com" in subs_session.request_hosts, (
+        f"expected FQDN in session.request_hosts, got {subs_session.request_hosts}"
     )
+    assert subs_session.urls == [] and subs_session.domains == []
     assert subs_session.meta.get("matched_hints"), (
         "expected at least one exploit hint to match"
     )

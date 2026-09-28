@@ -310,6 +310,10 @@ class HealthStatus:
             # dual-sighting outcomes -- last cycle, and summed since the
             # counters were first written. docs/EVIDENCE_GATE.md section 4.
             "evidence_gate": self._evidence_gate(),
+            # Own-surface refusals (persona domains, sensor addresses and
+            # hostnames) and inbound request targets not emitted -- last
+            # cycle and summed. Counts only; the roots are never shown.
+            "own_surface": self._own_surface(),
         }
 
         # Freshness of the most recent *completed* successful cycle.
@@ -416,6 +420,22 @@ class HealthStatus:
             }
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"health: evidence_gate read failed: {e}")
+            return None
+
+    def _own_surface(self) -> Optional[dict]:
+        """``{"last_cycle": ..., "totals": ...}`` from the state KV, or None
+        before the first cycle. Best-effort, never raises."""
+        try:
+            last = self._state.get("last_cycle_own_surface")
+            totals = self._state.get("own_surface_totals")
+            if not last and not totals:
+                return None
+            return {
+                "last_cycle": json.loads(last) if last else None,
+                "totals": json.loads(totals) if totals else None,
+            }
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: own_surface read failed: {e}")
             return None
 
     def _heartbeat_age(

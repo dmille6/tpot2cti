@@ -218,8 +218,10 @@ def test_correlate_reconstructs_the_request_url():
     parser = H0neytr4pParser()
     ev = parser.parse(_modern_doc())
     session = parser.correlate([ev])[0]
-    assert session.urls == ["https://victim.example.com/remote/logincheck"]
-    assert session.domains == ["victim.example.com"]
+    assert session.request_urls == ["https://victim.example.com/remote/logincheck"]
+    assert session.request_hosts == ["victim.example.com"]
+    # An inbound request target is request metadata, not an IoC candidate.
+    assert session.urls == [] and session.domains == []
 
 
 # ---------------------------------------------------------------------------
