@@ -20,6 +20,7 @@ from tpot2cti.config import Config
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti import attack_mapping
 from tpot2cti import evidence
+from tpot2cti import ics
 from tpot2cti import port_intel
 from tpot2cti.own_surface import (
     REASON_PERSONA_DOMAIN,
@@ -543,6 +544,34 @@ def parser_labels_for(event_type: Optional[str], sensor_hostname: Optional[str] 
     return ["honeypot", pair[0], pair[1]] + extra
 
 
+def session_labels_for(session: Optional["AttackSession"], *, with_sensor: bool = True) -> list[str]:
+    """parser_labels_for, plus the ICS labels of an ICS session.
+
+    Identical to ``parser_labels_for(session.event_type, sensor)`` for every
+    session that carries no ``meta["ics"]``, so non-ICS output is unchanged.
+    An ICS emulator session logged through Heralding is re-familied from
+    ``credential-capture`` to ``ics-scada``: its "password" is request bytes.
+    """
+    if session is None:
+        return parser_labels_for(None)
+    base = parser_labels_for(
+        session.event_type, session.sensor_hostname if with_sensor else None)
+    summary = evidence.ics_summary(session)
+    if summary is None:
+        return base
+    if session.event_type == "Heralding":
+        base = [("ics-scada" if lab == "credential-capture" else lab) for lab in base]
+    return base + [lab for lab in ics.session_labels(summary) if lab not in base]
+
+
+#: Indicator name for an ICS emulator session logged through Heralding.
+_ICS_FAKE_NAME = "ICS Emulator Probe - {ip} ({n} probe{s})"
+
+#: Score added to an attacker IP whose session issued an ICS write/control
+#: function (ics:write-control). Scores only ratchet up (publisher merge).
+ICS_WRITE_SCORE_BONUS = 30
+
+
 #: Indicator name templates. {ip} and {n} are substituted; {n} is the
 #: session count for IP indicators. Missing entries fall back to a
 #: generic template.
@@ -651,6 +680,9 @@ def _ip_score(session: Optional["AttackSession"]) -> int:
         score += 25
     elif "bad reputation" in rep:
         score += 12
+    _ics = evidence.ics_summary(session)
+    if _ics and _ics.get("write"):
+        score += ICS_WRITE_SCORE_BONUS
     # NOTE (2026-08-04): "mass scanner" / "scanner" / "bot" / "crawler" / "tor"
     # deliberately do NOT raise the score, and neither does broad port fan-out
     # (formerly +5 for >=5 dst_ports). Those describe COMMODITY MASS-SCANNING —
@@ -732,12 +764,35 @@ def _describe_ip(ip: str, session: "AttackSession") -> str:
         if sample:
             d += f" e.g. {sample[:220]}" + ("…" if len(session.commands) > 3 else "")
 
+    _ics = evidence.ics_summary(session)
+    if _ics:
+        d += _describe_ics(_ics)
+
     if session.last_seen > session.first_seen:
         d += (f" Activity window {session.first_seen.isoformat()} → "
               f"{session.last_seen.isoformat()} ({_humanize_span(session.last_seen - session.first_seen)}).")
     else:
         d += f" Seen {session.first_seen.isoformat()}."
     return d
+
+
+def _describe_ics(summary: dict) -> str:
+    """One sentence of ICS evidence for an observable/indicator description:
+    depth, the functions seen, writes, and the research-scanner basis."""
+    bits = [f" ICS depth: {summary.get('tier')}"]
+    funcs = summary.get("functions") or []
+    if funcs:
+        bits.append(" (" + "; ".join(str(f) for f in funcs[:6])
+                    + ("; …" if len(funcs) > 6 else "") + ")")
+    out = "".join(bits) + "."
+    if summary.get("write"):
+        out += (" WRITE/CONTROL function(s): "
+                + "; ".join(summary.get("write_functions") or []) + ".")
+    rs = summary.get("research_scanner")
+    if rs:
+        out += (f" Research scanner: {rs.get('vendor')} (basis {rs.get('basis')}, "
+                f"{rs.get('list')}); census traffic, not an attack by itself.")
+    return out
 
 
 
@@ -909,6 +964,17 @@ class STIXBuilder:
         #: drops every reference to one that no other session emitted, so a
         #: refused Indicator cannot come back as a dangling edge end.
         self._gate_withheld_ids: set[str] = set()
+        #: ICS refusals (TPOT2CTI_ICS_REFUSALS, default on): SNMP-only
+        #: sessions and allowlisted research scanners mint no Indicator in
+        #: ANY gate mode. reason -> sessions, reported in the cycle's `ics`.
+        self._ics_refusals: bool = bool(getattr(cycle, "ics_refusals", True))
+        self.ics_refused: dict[str, int] = {}
+        #: attacker IP -> {"labels": set, "industrial": set} over every ICS
+        #: session in this bundle. The attacker observable and Indicator are
+        #: deduplicated (the first session's copy is kept), so finalize_bundle
+        #: puts the UNION of the ICS labels on them, plus ics:multi-protocol
+        #: when one address used two or more industrial protocols.
+        self._ics_ip: dict[str, dict] = {}
         #: observable-side sighting id -> True once any session in this
         #: bundle also had an Indicator for that (sensor, IP, day).
         self._obs_sighting_has_indicator: dict[str, bool] = {}
@@ -1835,11 +1901,10 @@ class STIXBuilder:
         }
         # OpenCTI extensions — populated when we have session context.
         if session is not None:
+            self._note_ics_session(session)
             obj["x_opencti_description"] = _describe_ip(ip, session)
             obj["x_opencti_score"] = _ip_score(session)
-            obj["x_opencti_labels"] = sorted(
-                set(parser_labels_for(session.event_type, session.sensor_hostname))
-            )
+            obj["x_opencti_labels"] = sorted(set(session_labels_for(session)))
             obj["x_opencti_created_at"] = session.first_seen.isoformat()
         # Pivot menu — adds external_references; OpenCTI renders these as
         # buttons on the IP detail page.
@@ -2421,6 +2486,10 @@ class STIXBuilder:
                 sig_bits.append(
                     f"{len(session.credentials_tried)} credential attempt(s)"
                 )
+            _ics = evidence.ics_summary(session)
+            if _ics and _ics.get("write"):
+                sig_bits.append("ICS write/control: "
+                                + "; ".join(_ics.get("write_functions") or []))
             if sig_bits:
                 bits.append("Substance signals: " + ", ".join(sig_bits) + ".")
             # Severity blurb tuned to the score band.
@@ -2447,14 +2516,17 @@ class STIXBuilder:
         obj = {
             "type": "indicator",
             "id": generate_ip_indicator_id(ip),
-            "name": _format_indicator_name(event_type, ip, n),
+            "name": (_ICS_FAKE_NAME.format(ip=ip, n=n, s="s" if n != 1 else "")
+                     if event_type == "Heralding" and evidence.ics_summary(session)
+                     else _format_indicator_name(event_type, ip, n)),
             "pattern_type": "stix",
             "pattern": f"[ipv6-addr:value = '{ip}']" if is_v6
                        else f"[ipv4-addr:value = '{ip}']",
             "valid_from": first_seen.isoformat(),
             "valid_until": valid_until.isoformat(),
             "indicator_types": ["malicious-activity"],
-            "labels": sorted(set(parser_labels_for(event_type))),
+            "labels": sorted(set(session_labels_for(session, with_sensor=False)
+                                 if session is not None else parser_labels_for(event_type))),
             # OpenCTI custom properties (the dashboard widgets read these).
             "x_opencti_score": score,
             "x_opencti_main_observable_type": "IPv6-Addr" if is_v6 else "IPv4-Addr",
@@ -2923,6 +2995,13 @@ class STIXBuilder:
                     the Indicator id is remembered so finalize_bundle can
                     drop references to it.
         """
+        ics_reason = self._ics_hard_refusal(session)
+        if ics_reason:
+            self.ics_refused[ics_reason] = self.ics_refused.get(ics_reason, 0) + 1
+            ind_id = attacker_ip_indicator_id(session.src_ip)
+            if ind_id:
+                self._gate_withheld_ids.add(ind_id)
+            return False
         mode = self._gate_mode
         if mode == evidence.GATE_OFF:
             return True
@@ -2938,6 +3017,68 @@ class STIXBuilder:
         if ind_id:
             self._gate_withheld_ids.add(ind_id)
         return False
+
+    def _note_ics_session(self, session: AttackSession) -> None:
+        """Remember an ICS session's labels and valid industrial protocols
+        against its attacker address (see self._ics_ip)."""
+        s = evidence.ics_summary(session)
+        if not s or not session.src_ip:
+            return
+        rec = self._ics_ip.setdefault(session.src_ip, {"labels": set(), "industrial": set()})
+        rec["labels"].update(ics.session_labels(s))
+        rec["industrial"].update(
+            p for p in (s.get("valid_protocols") or ()) if p in ics.INDUSTRIAL)
+
+    def _apply_ics_label_union(self, objects: list[dict]) -> None:
+        """Put the union of an address's ICS labels on its observable and its
+        Indicator (in place). Touches only addresses with an ICS session."""
+        if not self._ics_ip:
+            return
+        want: dict[str, set] = {}
+        for ip, rec in self._ics_ip.items():
+            labels = set(rec["labels"])
+            if ics.multi_protocol(rec["industrial"]):
+                labels.add(ics.LABEL_MULTI)
+            if not labels:
+                continue
+            for oid in (attacker_ip_observable_id(ip), attacker_ip_indicator_id(ip)):
+                if oid:
+                    want[oid] = labels
+        for obj in objects:
+            labels = want.get(obj.get("id"))
+            if not labels:
+                continue
+            key = "labels" if obj.get("type") == "indicator" else "x_opencti_labels"
+            cur = set(obj.get(key) or ())
+            if not labels <= cur:
+                obj[key] = sorted(cur | labels)
+
+    def _ics_hard_refusal(self, session: AttackSession) -> Optional[str]:
+        """An ICS refusal that applies in EVERY gate mode, or None.
+
+        Not the DR-01 evidence class (that one is shadow-first, in
+        evidence._decide_ics): these stop harm now.
+          * ``ics-snmp-only``: SNMP without a Set. UDP, trivially spoofed,
+            and the population that put ~1,190 probable reflection victims
+            into the feed as "ConPot ICS Probe" indicators. GetBulk-only
+            sessions never get here (run_cycle drops them); Get/GetNext
+            ones keep their observable and Sighting.
+          * ``ics-research-scanner-allowlisted``: a source on the benign
+            allowlist, kept for ICS only so its requests are labelled
+            rather than dropped. It was never an Indicator before.
+        A write/control session is never refused here.
+        """
+        if not self._ics_refusals:
+            return None
+        s = evidence.ics_summary(session)
+        if not s or s.get("write"):
+            return None
+        if s.get("snmp_only"):
+            return "ics-snmp-only"
+        rs = s.get("research_scanner") or {}
+        if rs.get("list") == "benign-allowlist":
+            return "ics-research-scanner-allowlisted"
+        return None
 
     def indicator_available(self, indicator_id: Optional[str]) -> bool:
         """May a producer anchor an edge on this attacker-IP Indicator?
@@ -3001,6 +3142,7 @@ class STIXBuilder:
         Returns ``objects`` itself when there is nothing to withhold, so
         ``off`` and ``shadow`` hand the publisher the very same list.
         """
+        self._apply_ics_label_union(objects)
         stats = self.gate_stats
         evidence.log_refusals(self._gate_mode, stats)
         stats.observable_sightings_with_indicator = sum(
@@ -4466,6 +4608,9 @@ class STIXBuilder:
         return self._build_protocol_session(session, "Router/Telnet console interaction")
 
     def build_heralding_session(self, session: AttackSession) -> list[dict]:
+        if evidence.ics_summary(session) is not None:
+            # An ICS emulator row (DNP3/OPC UA/HART-IP/GE-SRTP), not a login.
+            return self._build_protocol_session(session, "ICS/SCADA protocol interaction")
         return self._build_protocol_session(session, "Credential brute-force attempt")
 
     def build_rdphoneypot_session(self, session: AttackSession) -> list[dict]:

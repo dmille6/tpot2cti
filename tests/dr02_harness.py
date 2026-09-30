@@ -26,6 +26,27 @@ To see WHAT differs after a mismatch, write both bundles out and diff:
 ``python -m tests.dr02_harness --dump DIR`` here and on origin/main.
 Regenerate the digests only when an intended output change lands, and say
 so in the commit.
+
+**Rebaselines.** The 71e47ec digests are never overwritten. An intended
+output change appends an entry to ``rebaselines`` in the golden file (what
+changed, why, from which commit, and the new digests); :func:`golden`
+returns the latest digests, :func:`golden_original` the 71e47ec ones. Each
+entry that names ``unchanged_without`` also records the digest of the cycle
+bundle built WITHOUT those fixture files, taken on the parent commit: the
+tests rebuild that bundle here and require it byte for byte, which proves
+the change touched nothing but the named parsers' output.
+
+  * 2026-09-30, ICS intelligence (branch ``ics-intel``): the ConPot parser
+    reads the protocol from ``data_type`` and groups documents by ConPot's
+    session ``id``; ICS sessions gain ``targeting:ics`` and per-protocol
+    labels. In the cycle bundle only the ConPot fixture's observable,
+    indicator and Sightings change (one 2-event session instead of two
+    1-event sessions; ``[guardian_ast]`` instead of ``[new_connection]``;
+    ``targeting:ics``). ``python -m tests.dr02_harness --rebaseline`` wrote
+    it after the diff against origin/main 430313e showed exactly that.
+  * 2026-09-30, ICS review fixes (``ics-intel`` after 171812e): v1's
+    generic ``ics`` label beside ``targeting:ics``. Diffed against 171812e:
+    only the ConPot fixture's observable and Indicator gain ``ics``.
 """
 from __future__ import annotations
 
@@ -65,11 +86,14 @@ def public_ip(n: int) -> str:
     return f"45.9.{(n // 254) % 254}.{(n % 254) + 1}"
 
 
-def load_cycle_docs() -> tuple[list[dict], dict[str, str]]:
-    """Every real fixture doc, src_ip remapped to a stable public address."""
+def load_cycle_docs(exclude: tuple = ()) -> tuple[list[dict], dict[str, str]]:
+    """Every real fixture doc, src_ip remapped to a stable public address.
+    ``exclude``: fixture file names to leave out (see :func:`golden`)."""
     ip_map: dict[str, str] = {}
     docs: list[dict] = []
     for path in sorted(REAL.glob("*.jsonl")):
+        if path.name in exclude:
+            continue
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -130,7 +154,8 @@ def make_cfg(env_overrides: dict | None = None):
     for k in list(env):
         # A stray flag in the developer's shell must not leak into a golden.
         if k.startswith("TPOT2CTI_EVIDENCE") or k.startswith("TPOT2CTI_SIGHTING") \
-                or k == "TPOT2CTI_COUNTS_INDEX_PATTERN" or k == LEGACY_INBOUND:
+                or k == "TPOT2CTI_COUNTS_INDEX_PATTERN" or k == LEGACY_INBOUND \
+                or k == "TPOT2CTI_ICS_REFUSALS":
             env.pop(k)
     env[LEGACY_INBOUND] = "true"
     env.update(env_overrides or {})
@@ -143,10 +168,11 @@ def _fixed_builder(cfg):
     return b
 
 
-def cycle_bundle(tmp_dir: Path, env_overrides: dict | None = None):
+def cycle_bundle(tmp_dir: Path, env_overrides: dict | None = None,
+                 exclude: tuple = ()):
     """Run one cycle; return (objects, summary, fake_es, state)."""
     cfg = make_cfg(env_overrides)
-    docs, ip_map = load_cycle_docs()
+    docs, ip_map = load_cycle_docs(exclude)
     daily = {(ip_map[AUTH_ORIG_IP], "sensor03", "2026-03-07"): AUTH_COUNT}
     es = FakeES(docs, daily)
     state = CycleState(db_path=Path(tmp_dir) / "state.db")
@@ -251,8 +277,20 @@ def digest(objs: list[dict]) -> dict:
             "bytes": len(raw)}
 
 
-def golden() -> dict:
+def golden_original() -> dict:
+    """The golden file as stored: 71e47ec digests plus ``rebaselines``."""
     return json.loads(GOLDEN_DIGESTS.read_text(encoding="utf-8"))
+
+
+def golden() -> dict:
+    """The digests the current code must reproduce: the 71e47ec ones with
+    every rebaseline applied in order (``generated_from`` is kept)."""
+    g = golden_original()
+    for rb in g.get("rebaselines") or ():
+        for k in ("cycle", "direct"):
+            if k in rb:
+                g[k] = rb[k]
+    return g
 
 
 def _default_bundles() -> tuple[list[dict], list[dict]]:
@@ -288,6 +326,15 @@ if __name__ == "__main__":
         src = sys.argv[sys.argv.index("--write") + 1] \
             if len(sys.argv) > sys.argv.index("--write") + 1 else "unspecified"
         _write_goldens(src)
+    elif "--rebaseline" in sys.argv:
+        # Appends one entry; the reason and scope are edited in by hand.
+        objs, d_objs = _default_bundles()
+        g = golden_original()
+        g.setdefault("rebaselines", []).append({
+            "when": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "reason": "EDIT ME", "cycle": digest(objs), "direct": digest(d_objs)})
+        GOLDEN_DIGESTS.write_text(json.dumps(g, indent=2) + "\n", encoding="utf-8")
+        print(GOLDEN_DIGESTS.read_text())
     elif "--dump" in sys.argv:
         _dump(sys.argv[sys.argv.index("--dump") + 1])
     else:

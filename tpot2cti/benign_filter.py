@@ -266,6 +266,36 @@ class BenignScannerFilter:
         # rented infrastructure — i.e. the ones the other two paths cannot see.
         return self._match_rdns(event)
 
+    def basis_for(self, event: ParsedEvent, vendor: str) -> str:
+        """Why ``event`` matched ``vendor``: ``asn:<n>``, ``as-org:<kw>`` or
+        ``rdns:<suffix>``, the same order :meth:`match` tries. For evidence
+        text only (the ICS path labels, rather than drops, these sources)."""
+        if event.src_asn is not None and self._asn_to_vendor.get(event.src_asn) == vendor:
+            return f"asn:{event.src_asn}"
+        org = (event.src_as_org or "").lower()
+        for rule in self._rules:
+            if rule.vendor == vendor:
+                for kw in rule.org_keywords:
+                    if kw in org:
+                        return f"as-org:{kw}"
+                name = self.cached_rdns_name(event.src_ip)
+                for suffix in rule.rdns_suffixes:
+                    if name and suffix_matches(name, suffix):
+                        return f"rdns:{suffix}"
+        return "allowlist"
+
+    def cached_rdns_name(self, ip: Optional[str]) -> Optional[str]:
+        """The forward-confirmed PTR name already resolved for ``ip`` this
+        process, or None. Never resolves and never spends budget."""
+        cached = getattr(self._resolver, "cached_name_for", None)
+        if not ip or cached is None:
+            return None
+        try:
+            name, known = cached(ip)
+        except Exception:
+            return None
+        return name if known else None
+
     def _match_rdns(self, event: ParsedEvent) -> Optional[str]:
         if self._resolver is None or not self._rdns_rules:
             return None

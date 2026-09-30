@@ -277,3 +277,50 @@ diff the output.
   - **By design:** the Indicator decision is per session. An address refused
     in one session and accepted in another in the same bundle is emitted, and
     its references stay.
+
+## 9. ICS (2026-09-30)
+
+**The class (shadow first).** `evidence._decide_ics` decides ConPot sessions
+and ICS emulator sessions from `session.meta["ics"]` (docs/parsers/conpot.md):
+
+| Reason | Decision | When |
+|---|---|---|
+| `ics-write-control` | accept | any write/control function, even from a research scanner |
+| `ics-interaction` | refuse | a valid industrial request beyond the handshake, but no write (decision 2026-09-30: 94.5% of such addresses are census fingerprint reads; reconnaissance keeps its observable and Sighting, only a write mints a malicious-activity Indicator) |
+| `ics-research-scanner` | refuse | the same, from a heuristically classified research scanner |
+| `ics-handshake-only` | refuse | only session-opening frames |
+| `ics-connect-only` | refuse | connection events or non-protocol bytes |
+| `ics-snmp-only` | refuse | SNMP without a Set (normally refused before the gate, below) |
+
+HTTP, FTP and IPMI sessions on the emulators get the stub accept. Like every
+class, this changes nothing until `enforce`.
+
+**The refusals (every gate mode).** `TPOT2CTI_ICS_REFUSALS` (strict boolean,
+default true) stops harm now, independently of the gate:
+
+- A session that only sent SNMP GetBulk (the spoofed-source reflection shape:
+  one repeated GetBulk from fixed source ports; the "sources" are probably
+  victims) is dropped in `run_cycle` before anything records it: no
+  observable, no Indicator, no Sighting, no activity row. Counted in
+  `ics.snmp_reflection_dropped` (sessions, events, distinct addresses, 25
+  samples). The raw documents stay in the hive.
+- Any other SNMP-only session (Get, GetNext) keeps its observable and
+  Sighting (with `TPOT2CTI_SIGHTINGS_DECOUPLED=true`) but mints no Indicator:
+  `ics.indicator_refused["ics-snmp-only"]`.
+- A source on the benign-scanner allowlist is **kept** for ICS sessions,
+  labelled `scanner:research` / `scanner:<vendor>` with its match basis in
+  the description, and never minted as an Indicator:
+  `ics.indicator_refused["ics-research-scanner-allowlisted"]`. Before, it was
+  dropped with every other event of that source. Heuristic scanners
+  (forward-confirmed PTR suffix or AS-organisation substring, `ics.py`) are
+  labelled the same way and refused by the class above in `enforce`.
+- A write/control session is never refused.
+
+`false` restores the previous behaviour (Indicators for SNMP-only sessions,
+allowlisted scanners dropped) without a rebuild. The parser fix itself is not
+switchable.
+
+**Counters.** The cycle summary and `/health` carry `ics.last_cycle`:
+sessions by tier and protocol, the reflection drop, refusals, research-scanner
+events and sessions, and write/control sessions (total and up to 25 with
+address, sensor, time and functions).
