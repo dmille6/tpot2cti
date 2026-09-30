@@ -314,6 +314,10 @@ class HealthStatus:
             # hostnames) and inbound request targets not emitted -- last
             # cycle and summed. Counts only; the roots are never shown.
             "own_surface": self._own_surface(),
+            # ICS: sessions by depth, SNMP reflection drop, research
+            # scanners kept, write/control sessions -- last cycle only.
+            # docs/EVIDENCE_GATE.md section 9.
+            "ics": self._ics(),
         }
 
         # Freshness of the most recent *completed* successful cycle.
@@ -436,6 +440,16 @@ class HealthStatus:
             }
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"health: own_surface read failed: {e}")
+            return None
+
+    def _ics(self) -> Optional[dict]:
+        """``{"last_cycle": ...}`` from the state KV, or None before the
+        first cycle. Best-effort, never raises."""
+        try:
+            last = self._state.get("last_cycle_ics")
+            return {"last_cycle": json.loads(last)} if last else None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"health: ics read failed: {e}")
             return None
 
     def _heartbeat_age(

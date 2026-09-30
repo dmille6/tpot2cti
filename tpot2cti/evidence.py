@@ -28,6 +28,27 @@ one's. DR-01's classes land one at a time:
     SentryPeer session (REGISTER, OPTIONS, an INVITE to a local number) is
     refused: in ``enforce`` it keeps its observable and Sighting but mints no
     Indicator.
+  * ICS (2026-09-30): a ConPot session, or an ICS emulator session logged as
+    Heralding, is decided from ``session.meta["ics"]`` (tpot2cti/ics.py):
+      - ``ics-write-control``   accept: a write or control function (Modbus
+                                FC 5/6/15/16/21/22/23, S7 write/download/
+                                stop, IEC-104 commands, SNMP Set, BACnet or
+                                CIP writes, DNP3 operate ...). Also scored
+                                higher and labelled ``ics:write-control``.
+      - ``ics-interaction``     accept: a valid industrial request beyond
+                                the handshake (identity, register or SZL
+                                reads, interrogation ...).
+      - ``ics-research-scanner`` refuse: the same, from a source classified
+                                as a research scanner (labelled, kept).
+      - ``ics-handshake-only``  refuse: only a session-opening frame.
+      - ``ics-connect-only``    refuse: connection events or non-protocol
+                                bytes only.
+      - ``ics-snmp-only``       refuse: SNMP without a Set (normally refused
+                                before the gate, see docs/EVIDENCE_GATE.md
+                                section 9; seen here only with
+                                TPOT2CTI_ICS_REFUSALS=false).
+    Non-industrial services on the ICS emulators (HTTP, FTP, IPMI) fall
+    through to the stub: other DR-01 classes own them.
   * Every other session: a STUB that accepts, which is exactly what the code
     emitted before the gate existed.
 
@@ -66,6 +87,14 @@ SIP_EVENT_TYPE = "Sentrypeer"
 REASON_SIP_FRAUD = "sip-fraud-intl-dial"
 REASON_SIP_NO_EVIDENCE = "sip-no-intl-dial"
 
+#: ICS (DR-01 extension, 2026-09-30): reasons, bounded tokens.
+REASON_ICS_WRITE = "ics-write-control"
+REASON_ICS_INTERACTION = "ics-interaction"
+REASON_ICS_SCANNER = "ics-research-scanner"
+REASON_ICS_HANDSHAKE = "ics-handshake-only"
+REASON_ICS_CONNECT = "ics-connect-only"
+REASON_ICS_SNMP = "ics-snmp-only"
+
 
 @dataclass(frozen=True)
 class GateDecision:
@@ -88,7 +117,42 @@ def decide(session, *, site: str) -> GateDecision:
     """
     if getattr(session, "event_type", None) == SIP_EVENT_TYPE:
         return _decide_sip(session)
+    summary = ics_summary(session)
+    if summary is not None:
+        return _decide_ics(summary)
     return GateDecision(accept=True, reason=REASON_STUB_ACCEPT)
+
+
+def ics_summary(session) -> Optional[dict]:
+    """``session.meta["ics"]`` for an ICS session (ConPot, or an emulator
+    row logged as Heralding), else None."""
+    meta = getattr(session, "meta", None) or {}
+    summary = meta.get("ics")
+    if not isinstance(summary, dict):
+        return None
+    if getattr(session, "event_type", None) in ("ConPot", "Heralding"):
+        return summary
+    return None
+
+
+def _decide_ics(s: dict) -> GateDecision:
+    """The ICS evidence class. A write/control function is evidence even
+    from a research scanner: writing to a controller is not census."""
+    if s.get("write"):
+        return GateDecision(accept=True, reason=REASON_ICS_WRITE)
+    if s.get("snmp_only"):
+        return GateDecision(accept=False, reason=REASON_ICS_SNMP)
+    tier = s.get("industrial_tier")
+    if tier is None:
+        # HTTP / FTP / IPMI on an ICS emulator: not an ICS decision.
+        return GateDecision(accept=True, reason=REASON_STUB_ACCEPT)
+    if tier == "interaction":
+        if s.get("research_scanner"):
+            return GateDecision(accept=False, reason=REASON_ICS_SCANNER)
+        return GateDecision(accept=True, reason=REASON_ICS_INTERACTION)
+    if tier == "handshake":
+        return GateDecision(accept=False, reason=REASON_ICS_HANDSHAKE)
+    return GateDecision(accept=False, reason=REASON_ICS_CONNECT)
 
 
 def _decide_sip(session) -> GateDecision:

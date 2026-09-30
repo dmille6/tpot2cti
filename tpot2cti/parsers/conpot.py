@@ -8,8 +8,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from tpot2cti import ics
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
+from tpot2cti.session.correlator import correlate_by_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,11 @@ _KNOWN_PROTOCOLS: frozenset[str] = frozenset({
 class ConPotParser(BaseParser):
     """Parser for T-Pot's ConPot ICS/SCADA honeypot.
 
-    Per V1_SPEC §5.6 every ConPot probe is substantive: even a bare
-    Modbus connection to TCP/502 from a stranger is signal.  We use
-    the default one-event-per-session correlator; every session is
-    substantive.
+    Documents are grouped into sessions by ConPot's session ``id``. Each
+    document is classified by tpot2cti/ics.py (protocol from ``data_type``,
+    depth tier, function), and the session carries the roll-up in
+    ``session.meta["ics"]``: the builder turns it into labels, the evidence
+    gate into an ICS evidence decision.
     """
 
     type_name = TYPE_NAME
@@ -88,9 +91,11 @@ class ConPotParser(BaseParser):
             logger.debug("conpot: doc missing/unparseable @timestamp; skipping")
             return None
 
-        # T-Pot's ConPot logstash mapping sometimes carries the protocol
-        # in `protocol`, sometimes in `app` or `event_type` depending on
-        # the ConPot version.  Prefer the explicit `protocol` field.
+        # ConPot names the protocol in `data_type` (modbus, s7comm, IEC104,
+        # snmp ...). `event_type` is the lifecycle or operation
+        # (NEW_CONNECTION, SNMPv2 Bulk) or null for a data document -- it
+        # was read as the protocol until 2026-09-30, so every session was
+        # "new_connection", "snmpv2 bulk" or nothing.
         protocol = self._derive_protocol(doc)
 
         event = ParsedEvent(
@@ -140,77 +145,57 @@ class ConPotParser(BaseParser):
         if protocol:
             event.meta["protocol"] = protocol
 
-        # The ConPot session id (when present) helps the publisher
-        # construct a deterministic STIX id; otherwise from_event() will
-        # synthesize one.
-        if (sid := doc.get("session") or doc.get("session_id")):
+        # ConPot's session id is `id`: one UUID shared by the connect, data
+        # and disconnect documents of one source on one protocol (30 s idle
+        # timeout, so it can span TCP connections). correlate() groups on
+        # it. `session`/`session_id` are kept for older builds.
+        if (sid := doc.get("id") or doc.get("session") or doc.get("session_id")):
             event.session_id = str(sid)
+
+        # What the document shows, protocol-wise (tpot2cti/ics.py): tier
+        # (connect / invalid / handshake / interaction / write) and a short
+        # function label. The raw lifecycle/operation stays in meta too.
+        if (et := doc.get("event_type")):
+            event.meta["conpot_event"] = str(et)[:64]
+        finding = ics.classify_conpot(doc)
+        event.meta["ics_finding"] = finding.to_dict()
 
         return event
 
     # ──────────────────────────────────────────────────────────────────
-    # correlate() — default one-event-per-session is correct
+    # correlate() — group by ConPot's session id
     # ──────────────────────────────────────────────────────────────────
-    # ConPot has no multi-event session abstraction at the T-Pot doc
-    # level: each ES doc is a discrete probe of a single ICS protocol.
-    # We inherit BaseParser.correlate which wraps each event in a
-    # one-event AttackSession.  Per V1_SPEC §5.6 — see also the parser-
-    # model overview in V1_SPEC §5 introduction.
+    # Until 2026-09-30 this was one event per session, and the session id
+    # was never read (ConPot calls it `id`), so a connect, a Modbus request
+    # and a disconnect were three unrelated "probes". Now the documents of
+    # one ConPot session are one AttackSession. Documents without an id
+    # still become one-event sessions.
     #
-    # We DO populate session-level aggregate fields here so the
-    # publisher doesn't have to reach into events[0]: the `request`
-    # blob goes onto `session.protocol_requests` — NOT `session.commands`,
-    # which means "commands the attacker RAN" and is read as such by the
-    # score, the prose, the ATT&CK mapping and the Process builder — and
-    # protocol/request meta is mirrored onto session.meta.
+    # The `request` blob goes onto `session.protocol_requests` — NOT
+    # `session.commands`, which means "commands the attacker RAN" and is
+    # read as such by the score, the prose, the ATT&CK mapping and the
+    # Process builder.
 
     def correlate(self, events):
-        """One-event-per-session, with session-level meta populated.
-
-        We keep the default 1:1 mapping but enrich each AttackSession
-        with `session.meta["protocol"]`, `session.meta["request"]`, and
-        push the request blob onto `session.protocol_requests` so
-        downstream consumers can render a Note without peeking into
-        `events[0]` — and without any of them mistaking a request the
-        sensor RECEIVED for a command someone RAN.
-        """
-        sessions: list[AttackSession] = []
-        for ev in events:
-            s = AttackSession.from_event(ev)
-            # Mirror per-event meta onto the session for publisher access.
-            if proto := ev.meta.get("protocol"):
-                s.meta.setdefault("protocol", proto)
-            if request := ev.meta.get("request"):
-                s.meta.setdefault("request", request)
-                # NOT `commands`. This is an HTTP request ConPot received, not
-                # a command anyone executed. It was appended to `commands` to
-                # reuse Note rendering, and every consumer then treated it as
-                # execution: +25 score, prose claiming shell activity, a
-                # Process SDO, T1059, and URLs harvested from the request
-                # line. Note reuse was not worth any of that.
-                s.protocol_requests.append(str(request))
-            if ev.meta.get("request_truncated"):
-                s.meta["request_truncated"] = True
-            sessions.append(s)
+        """Group by (id, sensor, src_ip); aggregate protocol, requests and
+        the ICS summary (``session.meta["ics"]``, see tpot2cti/ics.py)."""
+        sessions = correlate_by_session_id(events, aggregator=_aggregate_ics_session)
+        # One-event sessions (no id) bypass the aggregator; summarise them too.
+        for s in sessions:
+            if "ics" not in s.meta:
+                _aggregate_ics_session(s, s.events)
         return sessions
+
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _derive_protocol(doc: dict) -> Optional[str]:
-        """Pick the ICS protocol label from a ConPot doc.
-
-        T-Pot's ConPot mapping is inconsistent across versions: some
-        builds put the protocol under `protocol`, some under `app`,
-        some derive it from `event_type` ("MODBUS", "S7Comm", etc.).
-        We probe each in turn and lowercase the result.
-        """
-        for field in ("protocol", "app", "event_type"):
-            v = doc.get(field)
-            if v:
-                return str(v).lower()
-        return None
+        """The canonical protocol of a ConPot doc: `data_type` first, then
+        the historical `protocol`/`app`; `event_type` only when it is itself
+        a protocol name (see ics.conpot_protocol)."""
+        return ics.conpot_protocol(doc)
 
     @staticmethod
     def _safe_int(value) -> Optional[int]:
@@ -220,6 +205,44 @@ class ConPotParser(BaseParser):
             return int(value)
         except (TypeError, ValueError):
             return None
+
+
+def _aggregate_ics_session(session: AttackSession, events: list) -> None:
+    """Session-level meta for a ConPot (or ICS-emulator) session.
+
+    * ``session.meta["protocol"]``: the first protocol seen (one ConPot
+      session is one protocol in practice).
+    * ``session.meta["request"]`` / ``session.protocol_requests``: the
+      non-empty request blobs, in order, deduplicated (a 30-second SNMP
+      flood session repeats one request hundreds of times).
+    * ``session.meta["ics"]``: ics.summarize() over the events' findings,
+      plus ``research_scanner`` when the cycle classified the source as one.
+    """
+    findings = []
+    seen_requests: set = set()
+    for ev in events:
+        m = ev.meta
+        if (proto := m.get("protocol")):
+            session.meta.setdefault("protocol", proto)
+        if (request := m.get("request")):
+            session.meta.setdefault("request", request)
+            if request not in seen_requests and len(seen_requests) < _MAX_SESSION_REQUESTS:
+                seen_requests.add(request)
+                session.protocol_requests.append(str(request))
+        if m.get("request_truncated"):
+            session.meta["request_truncated"] = True
+        if (f := m.get("ics_finding")) is not None:
+            findings.append(f)
+        if (rs := m.get("research_scanner")) and "research_scanner" not in session.meta:
+            session.meta["research_scanner"] = rs
+    summary = ics.summarize(findings)
+    if (rs := session.meta.get("research_scanner")):
+        summary["research_scanner"] = rs
+    session.meta["ics"] = summary
+
+
+#: Distinct request blobs kept per session (the Note renders them).
+_MAX_SESSION_REQUESTS = 20
 
 
 # Register on import

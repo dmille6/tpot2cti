@@ -5,6 +5,35 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### ICS intelligence: ConPot parser fix, ICS evidence class, labels, SNMP refusals (2026-09-30)
+
+- **Parser defect fixed.** The ConPot parser took the protocol from
+  `protocol`/`app`/`event_type`; ConPot sends the protocol in `data_type`, so
+  every session was `new_connection`, `snmpv2 bulk` or nothing. It also
+  ignored ConPot's session `id` and correlated one document per session. Now:
+  protocol from `data_type`, sessions grouped on `id`, and every session
+  carries `meta["ics"]` from the new `tpot2cti/ics.py` (depth tier, functions,
+  write/control).
+- **ICS emulators logged as Heralding** (DNP3, OPC UA, HART-IP, GE-SRTP) are
+  classified as ICS, record no credentials (their "password" is request
+  bytes) and are built as "ICS Emulator Probe".
+- **Labels** in the v1 spellings: `targeting:ics`, `ics:<protocol>` for valid
+  requests only, `ics:protocol-interaction`, `ics:write-control` (+30 score),
+  `scanner:research` / `scanner:<vendor>`.
+- **ICS evidence class** in `evidence.decide` (shadow first):
+  `ics-write-control`, `ics-interaction` accept; `ics-research-scanner`,
+  `ics-handshake-only`, `ics-connect-only`, `ics-snmp-only` refuse.
+- **Refusals in every mode** (`TPOT2CTI_ICS_REFUSALS`, default true):
+  GetBulk-only SNMP sessions (the reflection shape) emit nothing; other
+  SNMP-only sessions mint no Indicator; allowlisted research scanners are kept
+  and labelled for ICS instead of dropped, never as Indicators.
+- **Counters:** `ics` in the cycle summary and `/health`.
+- **DR-02 golden rebaselined** (recorded as a `rebaselines` entry, the
+  71e47ec digests kept): only the ConPot fixture's objects change, and a test
+  rebuilds the cycle bundle without it and requires the parent commit's
+  digest byte for byte. Measured on 35 days of hive data: ~1,200 addresses
+  whose only ConPot activity was GetBulk were Indicators and now emit nothing.
+
 ### Own surface: persona domains refused, inbound request targets not emitted (2026-09-28)
 
 - Measured on the v2 corpus 2026-09-28: 158,128 of 178,022 Url observables

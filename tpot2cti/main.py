@@ -65,6 +65,7 @@ from tpot2cti.benign_filter import (
 )
 from tpot2cti.env import truthy_env
 from tpot2cti.rdns import ForwardConfirmedRDNS
+from tpot2cti import ics
 from tpot2cti.parsers import TYPE_RECOVERIES, dispatch, get_parser
 from tpot2cti.parsers.base import AttackSession, ParsedEvent
 from tpot2cti.state import CycleState
@@ -421,6 +422,82 @@ def _is_internal_src(ip: str) -> bool:
     return any(a in n for n in _EXCLUDED_SRC_NETS)
 
 
+# ---------------------------------------------------------------------------
+# ICS bookkeeping (tpot2cti/ics.py; docs/EVIDENCE_GATE.md section 9)
+# ---------------------------------------------------------------------------
+
+#: Bounded samples kept per cycle, so a drop or a write is inspectable.
+_ICS_MAX_SAMPLES = 25
+
+
+def _is_ics_event(event) -> bool:
+    """A ConPot document, or an ICS emulator row that logs as Heralding."""
+    return event.event_type == "ConPot" or bool(event.meta.get("ics_fake"))
+
+
+def _new_ics_stats(cfg) -> dict:
+    return {
+        "refusals": bool(cfg.cycle.ics_refusals),
+        "sessions_by_tier": Counter(),
+        "industrial_sessions_by_tier": Counter(),
+        "sessions_by_protocol": Counter(),
+        "snmp_reflection_dropped": {"sessions": 0, "events": 0, "ips": set(), "samples": []},
+        "research_scanner_events": Counter(),
+        "research_scanner_sessions": Counter(),
+        "write_sessions": [],
+        "write_sessions_total": 0,
+    }
+
+
+def _record_ics_session(stats: dict, session, summary: dict, cfg) -> bool:
+    """Count one ICS session. Returns True when the session must be DROPPED:
+    ICS refusals on and the session only sent SNMP GetBulk, the shape of the
+    spoofed-source reflection flood (the "sources" are probably victims,
+    ICS/OT review 2026-09-30). The raw documents stay in the hive."""
+    stats["sessions_by_tier"][summary.get("tier") or "connect"] += 1
+    if summary.get("industrial_tier"):
+        stats["industrial_sessions_by_tier"][summary["industrial_tier"]] += 1
+    for p in summary.get("protocols") or ():
+        stats["sessions_by_protocol"][p] += 1
+    if (rs := summary.get("research_scanner")):
+        stats["research_scanner_sessions"][str(rs.get("vendor"))] += 1
+    if summary.get("write"):
+        stats["write_sessions_total"] += 1
+        if len(stats["write_sessions"]) < _ICS_MAX_SAMPLES:
+            stats["write_sessions"].append({
+                "src_ip": session.src_ip, "sensor": session.sensor_hostname,
+                "first_seen": session.first_seen.isoformat(),
+                "functions": list(summary.get("write_functions") or [])})
+    if cfg.cycle.ics_refusals and summary.get("snmp_bulk_only"):
+        d = stats["snmp_reflection_dropped"]
+        d["sessions"] += 1
+        d["events"] += session.event_count
+        d["ips"].add(session.src_ip)
+        if len(d["samples"]) < _ICS_MAX_SAMPLES:
+            d["samples"].append({"src_ip": session.src_ip,
+                                 "sensor": session.sensor_hostname,
+                                 "events": session.event_count})
+        return True
+    return False
+
+
+def _finish_ics_stats(stats: dict, builder) -> dict:
+    d = stats["snmp_reflection_dropped"]
+    return {
+        "refusals": stats["refusals"],
+        "sessions_by_tier": dict(sorted(stats["sessions_by_tier"].items())),
+        "industrial_sessions_by_tier": dict(sorted(stats["industrial_sessions_by_tier"].items())),
+        "sessions_by_protocol": dict(sorted(stats["sessions_by_protocol"].items())),
+        "snmp_reflection_dropped": {"sessions": d["sessions"], "events": d["events"],
+                                    "ips": len(d["ips"]), "samples": d["samples"]},
+        "indicator_refused": dict(sorted(getattr(builder, "ics_refused", {}).items())),
+        "research_scanner_events": dict(sorted(stats["research_scanner_events"].items())),
+        "research_scanner_sessions": dict(sorted(stats["research_scanner_sessions"].items())),
+        "write_sessions_total": stats["write_sessions_total"],
+        "write_sessions": stats["write_sessions"],
+    }
+
+
 def run_cycle(
     cfg: Config,
     state: CycleState,
@@ -502,6 +579,8 @@ def run_cycle(
     unattributed_capped = False
     honeypot_ips = cfg.tpot.honeypot_ips  # local ref — frozenset
     benign_stats = FilterStats()  # populated by benign-scanner allowlist below
+    # ICS counters (tpot2cti/ics.py; docs/EVIDENCE_GATE.md section 9).
+    ics_stats = _new_ics_stats(cfg)
     if benign_filter is not None:
         # Fresh rDNS budget each cycle; exhaustion is reported, never silent.
         benign_filter.begin_cycle(DEFAULT_RDNS_BUDGET)
@@ -713,11 +792,31 @@ def run_cycle(
             # report google as malicious that's silly" — these aren't
             # attackers, they're internet-wide research scanners. See
             # tpot2cti/data/benign_scanners.yaml for the source list.
+            _is_ics = _is_ics_event(event)
             if benign_filter is not None:
                 benign_vendor = benign_filter.match(event)
                 if benign_vendor:
-                    benign_stats.record(benign_vendor)
-                    continue
+                    if not (_is_ics and cfg.cycle.ics_refusals):
+                        benign_stats.record(benign_vendor)
+                        continue
+                    # ICS: a research scanner is KEPT and labelled, never
+                    # minted as an Indicator (the builder refuses it). Its
+                    # requests are what the ICS census looks like, and
+                    # dropping them hid 69% of ICS-aware sources.
+                    event.meta["research_scanner"] = {
+                        "vendor": benign_vendor,
+                        "basis": benign_filter.basis_for(event, benign_vendor),
+                        "list": "benign-allowlist",
+                    }
+                    ics_stats["research_scanner_events"]["benign-allowlist"] += 1
+            if _is_ics and "research_scanner" not in event.meta:
+                _h = ics.heuristic_scanner(
+                    event.src_as_org,
+                    benign_filter.cached_rdns_name(event.src_ip)
+                    if benign_filter is not None else None)
+                if _h:
+                    event.meta["research_scanner"] = dict(_h, list="heuristic")
+                    ics_stats["research_scanner_events"]["heuristic"] += 1
             events_parsed += 1
             parsed_by_type[event.event_type].append(event)
     except Exception as e:
@@ -956,6 +1055,12 @@ def run_cycle(
                 session.fold_request_targets()
 
         for session in sessions:
+            # ICS: count every ICS session by depth, and drop the SNMP
+            # reflection shape (GetBulk only) before anything records it.
+            _ics_summary = session.meta.get("ics") if isinstance(session.meta, dict) else None
+            if _ics_summary:
+                if _record_ics_session(ics_stats, session, _ics_summary, cfg):
+                    continue
             # Feed the attacker-profile aggregator BEFORE STIX build so
             # even a build-time exception doesn't cost us the activity
             # signal (the per-cycle live-profile emitter runs after the
@@ -1249,6 +1354,14 @@ def run_cycle(
     except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
         logger.warning(f"cycle {cycle_id}: could not persist own-surface stats: {e}")
 
+    # ICS counters: the builder's refusals join the cycle's own counts.
+    ics_cycle = _finish_ics_stats(ics_stats, builder)
+    try:
+        logger.info("ics_summary %s", json.dumps(ics_cycle, sort_keys=True, default=str))
+        state.set("last_cycle_ics", json.dumps(ics_cycle, default=str))
+    except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+        logger.warning(f"cycle {cycle_id}: could not persist ICS stats: {e}")
+
     # ── Step 8: cycle summary ─────────────────────────────────────────
     duration_s = time.monotonic() - started_monotonic
     summary = {
@@ -1290,6 +1403,9 @@ def run_cycle(
         "rejected_domains": builder.rejected_domains,
         # DR-02: gate decisions and dual-sighting outcomes (also in /health).
         "evidence_gate": evidence_gate_stats,
+        # ICS: sessions by depth, the SNMP reflection drop, research
+        # scanners kept, write/control sessions (also in /health as `ics`).
+        "ics": ics_cycle,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),

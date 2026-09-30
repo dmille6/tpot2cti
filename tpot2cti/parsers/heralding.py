@@ -8,8 +8,10 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from tpot2cti import ics
 from tpot2cti.parsers import register
 from tpot2cti.parsers.base import AttackSession, BaseParser, ParsedEvent
+from tpot2cti.parsers.conpot import _aggregate_ics_session
 from tpot2cti.session import correlate_by_session_id
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,23 @@ class HeraldingParser(BaseParser):
         )
         self._populate_geoip(doc, event)
 
+        # ICS emulators that log through Heralding (DNP3, OPC UA, HART-IP,
+        # GE-SRTP): `username` is the protocol name and `password` is the
+        # first request bytes as hex (or "tcp-connect-only"). Neither is a
+        # credential, so none is recorded; the payload is classified like a
+        # ConPot request instead, and the session is built as ICS.
+        if (ics_proto := ics.fake_protocol(protocol)):
+            event.protocol = ics_proto
+            event.meta["protocol"] = ics_proto
+            event.meta["ics_fake"] = True
+            payload = doc.get("password")
+            if payload is not None and not str(payload).startswith("tcp-connect"):
+                event.meta["request"] = str(payload)[:_ICS_REQUEST_CAP]
+            finding = ics.classify_doc(dict(doc, type="Heralding"))
+            if finding is not None:
+                event.meta["ics_finding"] = finding.to_dict()
+            return event
+
         # Stash credentials + protocol in meta — the correlator
         # aggregator promotes them onto session.credentials_tried etc.
         # We preserve `None` distinctly from empty string in meta so
@@ -97,7 +116,15 @@ class HeraldingParser(BaseParser):
         installs `_aggregate_session` as the per-session callback that
         populates `credentials_tried`, `dst_ports`, and `protocols`.
         """
-        return correlate_by_session_id(events, aggregator=self._aggregate_session)
+        sessions = correlate_by_session_id(events, aggregator=self._aggregate_session)
+        # correlate_by_session_id does not run the aggregator on events
+        # without a session_id (one-event sessions). The ICS emulators log
+        # none, so their summary is built here; credential sessions are
+        # left exactly as before.
+        for s in sessions:
+            if "ics" not in s.meta and any(e.meta.get("ics_fake") for e in s.events):
+                _aggregate_ics_session(s, s.events)
+        return sessions
 
     def _aggregate_session(self, session: AttackSession, events: list[ParsedEvent]) -> None:
         """Walk per-event meta and roll up session-level substance signals.
@@ -110,6 +137,11 @@ class HeraldingParser(BaseParser):
         - `protocol` → `session.protocols` (likewise already populated
           from the event field).
         """
+        if any(e.meta.get("ics_fake") for e in events):
+            # An ICS emulator session: requests and the ICS summary, never
+            # credentials (see parse()).
+            _aggregate_ics_session(session, events)
+            return
         seen_creds: set[tuple[str, str]] = set()
         for e in events:
             meta = e.meta
@@ -142,6 +174,10 @@ class HeraldingParser(BaseParser):
             return int(value)
         except (TypeError, ValueError):
             return None
+
+
+#: Hex characters of an emulator payload kept (the emulators log 120 bytes).
+_ICS_REQUEST_CAP = 1024
 
 
 # Register on import

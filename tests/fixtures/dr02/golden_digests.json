@@ -9,5 +9,30 @@
     "sha256": "d25ff2881a9f28a831e9b09e5522c0264b56af607bfd21b69d24f3802a2016f3",
     "objects": 35,
     "bytes": 32028
-  }
+  },
+  "rebaselines": [
+    {
+      "when": "2026-09-30",
+      "parent": "origin/main 430313e",
+      "reason": "ICS intelligence: the ConPot parser reads the protocol from data_type and groups documents by ConPot's session id; ICS sessions gain targeting:ics and per-protocol labels. Only the ConPot fixture's observable, indicator and two Sightings change (one 2-event session instead of two 1-event sessions).",
+      "unchanged_without": [
+        "conpot.jsonl"
+      ],
+      "cycle_without": {
+        "sha256": "0b003cd7a3542ef925587092f26031d1ed07a6c4ea0647ec62ef8fe52f77e6a7",
+        "objects": 175,
+        "bytes": 162247
+      },
+      "cycle": {
+        "sha256": "2d82edfc4b6b5b08b7bfac74d771bf5f6f4ed925ad3075b69e573a13836f4a26",
+        "objects": 184,
+        "bytes": 170537
+      },
+      "direct": {
+        "sha256": "d25ff2881a9f28a831e9b09e5522c0264b56af607bfd21b69d24f3802a2016f3",
+        "objects": 35,
+        "bytes": 32028
+      }
+    }
+  ]
 }

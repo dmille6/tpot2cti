@@ -158,6 +158,14 @@ class CycleConfig:
     #: OUR sensor, not the attacker, and are not IoCs. True restores the old
     #: output for a no-rebuild rollback (own-surface refusal still applies).
     inbound_request_observables: bool = False
+    #: ICS refusals (2026-09-30, docs/EVIDENCE_GATE.md section 9). True
+    #: (default): a ConPot session that only sent SNMP GetBulk (the
+    #: spoofed-source reflection shape) emits nothing; any other SNMP-only
+    #: session keeps its observable and Sighting but mints no Indicator;
+    #: research scanners on the benign allowlist are KEPT for ICS sessions,
+    #: labelled and never minted as Indicators, instead of being dropped.
+    #: False restores the previous behaviour for a no-rebuild rollback.
+    ics_refusals: bool = True
 
 
 #: Accepted values for CycleConfig.sighting_grain.
@@ -443,6 +451,7 @@ def load_config(env_dict: Optional[dict] = None) -> Config:
                                    SIGHTING_GRAINS),
         inbound_request_observables=_env_bool_strict(
             env, "TPOT2CTI_INBOUND_REQUEST_OBSERVABLES", default=False),
+        ics_refusals=_env_bool_strict(env, "TPOT2CTI_ICS_REFUSALS", default=True),
     )
 
     # --- Connector IDs ---
