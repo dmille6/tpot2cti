@@ -206,6 +206,11 @@ def s7_job(fn, extra=b"", data=b"", tpkt_delta=0):
 
 S7_ITEM = bytes.fromhex("120a10020001000184000000")      # one S7ANY item, DB1.DBX0.0 byte
 S7_PI = b"\x00\x00\x00\x00\x00\x09P_PROGRAM"
+#: Request Download / Download Block parameters after the function byte.
+S7_BLOCK = b"\x00\x01\x00\x00\x00\x00\x00\x09_0A00001P"
+S7_DL_LEN = b"\x0d1000074000030"
+#: PI service (start): 7 unknown, parameter block (2 + 0 bytes), name.
+S7_PI_START = b"\x00\x00\x00\x00\x00\x00\xfd\x00\x00\x09P_PROGRAM"
 
 
 def dnp3_frame(link_fc, user=b"", prm=True):
@@ -268,7 +273,29 @@ SYNTHETIC = [
     ("s7 Write Var", ics.classify_s7, s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x04\x00\x08\x01"),
      "write", "Write Var"),
     ("s7 PLC Stop", ics.classify_s7, s7_job(0x29, S7_PI), "write", "PLC Stop"),
-    ("s7 Request Download", ics.classify_s7, s7_job(0x1A, b"\x00" * 9), "write", "Download"),
+    ("s7 Request Download", ics.classify_s7, s7_job(0x1A, S7_BLOCK + S7_DL_LEN), "write", "Download"),
+    ("s7 Download Block", ics.classify_s7, s7_job(0x1B, S7_BLOCK), "write", "Download Block"),
+    ("s7 PI service start", ics.classify_s7, s7_job(0x28, S7_PI_START), "write", "PI Service"),
+    ("s7 Request Download, 2-byte parameter (NEGATIVE)", ics.classify_s7, s7_job(0x1A, b"\x00"), "invalid", None),
+    ("s7 Request Download, bad block name (NEGATIVE)", ics.classify_s7,
+     s7_job(0x1A, S7_BLOCK[:8] + b"_0Z00001P" + S7_DL_LEN), "invalid", None),
+    ("s7 Request Download, length part does not fit (NEGATIVE)", ics.classify_s7,
+     s7_job(0x1A, S7_BLOCK + b"\x0e1000074000030"), "invalid", None),
+    ("s7 PI service, block length beyond parameter (NEGATIVE)", ics.classify_s7,
+     s7_job(0x28, S7_PI_START[:7] + b"\x00\x20\x09P_PROGRAM"), "invalid", None),
+    ("s7 Write Var, item not a var spec (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + b"\x11" + S7_ITEM[1:], b"\x00\x04\x00\x08\x01"), "invalid", None),
+    ("s7 Write Var, item count > items (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x02" + S7_ITEM, b"\x00\x04\x00\x08\x01"), "invalid", None),
+    ("s7 Write Var, data shorter than declared (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x04\x00\x20\x01"), "invalid", None),
+    ("s7 Write Var, bad transport size (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x0f\x00\x08\x01"), "invalid", None),
+    ("s7 Write Var, minimal fake data (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + S7_ITEM, b"\x00"), "invalid", None),
+    ("s7 Write Var, two items with padding", ics.classify_s7,
+     s7_job(0x05, b"\x02" + S7_ITEM + S7_ITEM, b"\x00\x04\x00\x08\x01\x00" + b"\x00\x04\x00\x08\x02"),
+     "write", "Write Var"),
     ("s7 Read Var", ics.classify_s7, s7_job(0x04, b"\x01" + S7_ITEM), "interaction", "Read Var"),
     ("s7 Upload is a read", ics.classify_s7, s7_job(0x1E, b"\x00" * 7), "interaction", "Upload"),
     ("s7 Start Upload is a read", ics.classify_s7, s7_job(0x1D, b"\x00" * 17), "interaction", "Start Upload"),
@@ -318,6 +345,10 @@ SYNTHETIC = [
      dnp3_frame(4, b"\xc0\xc0\x05\x0c\x01" + b"\x00" * 20)[:30], "invalid", None),
     ("dnp3 outstation frame (NEGATIVE)", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x05", prm=False),
      "invalid", "secondary"),
+    ("dnp3 operate, SECOND block CRC wrong (NEGATIVE)", ics.classify_dnp3,
+     dnp3_frame(4, b"\xc0\xc0\x05" + b"\x0c\x01" * 10)[:-2] + b"\x00\x00", "invalid", "CRC"),
+    ("dnp3 two-block operate", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x05" + b"\x0c\x01" * 10),
+     "write", "Direct Operate"),
     ("opcua WriteRequest", ics.classify_opcua, opcua_msg(673), "write", "WriteRequest"),
     ("opcua CallRequest", ics.classify_opcua, opcua_msg(712), "write", "CallRequest"),
     ("opcua ReadRequest", ics.classify_opcua, opcua_msg(631), "interaction", "631"),
@@ -342,6 +373,41 @@ def test_synthetic_frames(label, fn, payload, tier, sub):
     assert f.tier == tier, (label, f)
     if sub:
         assert sub in (f.function or ""), (label, f)
+
+
+def test_truncation_is_explicit():
+    long_op = dnp3_frame(4, b"\xc0\xc0\x05" + b"\x0c\x01" * 60)     # 125 user bytes
+    cut = long_op[:120]
+    assert ics.classify_dnp3(cut).tier == "invalid", "120 bytes are not assumed to be cut"
+    assert ics.classify_dnp3(cut, truncated=True).tier == "write"
+    bad = bytearray(cut)
+    bad[40] ^= 0xFF                                      # inside the 2nd complete block
+    assert ics.classify_dnp3(bytes(bad), truncated=True).tier == "invalid"
+    # the emulator marks a cut payload with a trailing ellipsis
+    row = {"type": "Heralding", "proto": "dnp3", "src_ip": "198.51.100.4", "@timestamp": "2026-09-30T00:00:00Z"}
+    assert ics.classify_doc(dict(row, password=cut.hex() + "\u2026")).tier == "write"
+    assert ics.classify_doc(dict(row, password=cut.hex())).tier == "invalid"
+
+
+def test_a_cut_frame_is_never_a_write():
+    big = opcua_msg(673, size_delta=400)
+    assert ics.classify_opcua(big).tier == "invalid"
+    f = ics.classify_opcua(big, truncated=True)
+    assert f.tier == "interaction" and "truncated" in f.function
+    row = {"type": "Heralding", "proto": "opcua", "src_ip": "198.51.100.4", "@timestamp": "2026-09-30T00:00:00Z"}
+    assert ics.classify_doc(dict(row, password=big.hex() + "\u2026")).tier == "interaction"
+    hart = hartip(3, bytes([0x02, 0x80, 6, 1, 0]), count_delta=50)
+    assert ics.classify_hartip(hart).tier == "invalid"
+    assert ics.classify_hartip(hart, truncated=True).tier == "interaction"
+
+
+def test_snmp_oid_must_be_numeric():
+    d = next(x for x in _scenario("snmp_set") if x.get("event_type") == "SNMPv2 Set")
+    for oid, tier in (("1.3.6.1.2.1.1.5.0", "write"), ("(1, 3, 6, 1, 2, 1, 1, 5, 0)", "write"),
+                      ("x", "invalid"), ("1", "invalid"), ("1.3.x.1", "invalid"), ("", "invalid"),
+                      ("1..3", "invalid"), ("(1, 3, a)", "invalid")):
+        req = json.dumps({"oid": oid, "val": ""})
+        assert ics.classify_conpot(dict(d, conpot_request=req)).tier == tier, oid
 
 
 def test_text_protocol_writes():

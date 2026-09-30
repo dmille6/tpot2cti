@@ -59,7 +59,14 @@ Validity is checked before a tier is given: declared lengths against the
 bytes and the minimum function-specific body (a header-only Modbus FC 6, a
 byte count that disagrees, an S7 frame whose TPKT/COTP/S7 lengths disagree,
 Write Var without data, PI service without its parameters are `invalid`);
-DNP3 link length, header and first-block CRCs, PRM and transport FIR; ENIP
+S7 Read/Write Var items (0x12 variable specifications filling the
+parameter) and Write Var data records (return code, transport size, length,
+padding), the download block name `_<type><number><dest>` and length part,
+PI service and PLC stop names; DNP3 link length, header CRC and the CRC of
+every captured data block, PRM and transport FIR; emulator truncation is
+explicit (a payload ending in an ellipsis), a frame declaring more bytes than
+it has is invalid unless cut, and a cut OPC UA or HART-IP frame is at most
+`interaction`; SNMP OIDs must be numeric (dotted or tuple); ENIP
 declared length and a CIP request inside SendRRData/SendUnitData; OPC UA
 message size and a namespace-0 service NodeId; HART-IP byte count; FTP
 verbs must be alphabetic.

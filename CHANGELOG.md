@@ -32,7 +32,12 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
   was a "write"); S7 upload is a read; DNP3 Assign Class is control; an SNMP
   Set needs a parsed OID; TLS on the FTP port is `invalid`; v1's `ics` and
   `ics:multi-protocol` labels; `targeting:ics` only for industrial
-  protocols.
+  protocols. Second pass: S7 Read/Write Var items and Write Var data, the
+  download block name and length part, PI service and PLC stop names are
+  parsed against their layouts; every captured DNP3 data block's CRC is
+  checked; emulator truncation is explicit (the trailing ellipsis), and a
+  frame declared larger than its bytes is invalid unless cut, and a cut
+  OPC UA or HART-IP frame is never a write; SNMP OIDs must be numeric.
 - **Refusals in every mode** (`TPOT2CTI_ICS_REFUSALS`, default true):
   GetBulk-only SNMP sessions (the reflection shape) emit nothing; other
   SNMP-only sessions mint no Indicator; allowlisted research scanners are kept

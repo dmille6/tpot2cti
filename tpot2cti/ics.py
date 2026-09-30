@@ -358,9 +358,80 @@ S7_JOB = {
 #: Write Var, the download sequence, PI service (start/copy), PLC stop. The
 #: upload sequence (0x1D-0x1F) READS the program from the PLC: interaction.
 WRITE_S7_JOB = frozenset({0x05, 0x1A, 0x1B, 0x1C, 0x28, 0x29})
-#: Minimum parameter length per job function (function byte included).
-_S7_MIN_PAR = {0x04: 2, 0x05: 2, 0x1A: 2, 0x1B: 2, 0x1C: 2, 0x1D: 2, 0x1E: 2,
-               0x1F: 2, 0x28: 8, 0x29: 8, 0xF0: 8}
+#: Minimum parameter length per job function (function byte included). The
+#: write functions are also checked against their full layout (_s7_layout_ok).
+_S7_MIN_PAR = {0x04: 2, 0x05: 2, 0x1A: 18, 0x1B: 18, 0x1C: 18, 0x1D: 2, 0x1E: 2,
+               0x1F: 2, 0x28: 11, 0x29: 8, 0xF0: 8}
+#: Transport sizes whose data length is given in BITS (bit, byte/word/dword,
+#: integer); the others (real, octet string) give it in bytes.
+_S7_TS_BITS = frozenset({0x03, 0x04, 0x05})
+_S7_TS_ALL = frozenset({0x03, 0x04, 0x05, 0x06, 0x07, 0x09})
+#: Block file name of the download sequence: "_", block type (2 hex digits),
+#: block number (5 digits), destination (P = passive/active file system, A, B).
+_S7_BLOCK_NAME = re.compile(rb"_[0-9A-F]{2}\d{5}[PAB]")
+
+
+def _s7_items(par: bytes) -> Optional[int]:
+    """Item count of a Read/Write Var parameter when every item is a
+    well-formed variable specification (0x12, length, spec) and the items
+    fill the parameter exactly; else None."""
+    if len(par) < 2 or par[1] < 1:
+        return None
+    j = 2
+    for _ in range(par[1]):
+        if j + 2 > len(par) or par[j] != 0x12 or par[j + 1] < 4:
+            return None
+        j += 2 + par[j + 1]
+    return par[1] if j == len(par) else None
+
+
+def _s7_write_data_ok(data: bytes, items: int) -> bool:
+    """Write Var data: one (return code 0, transport size, length, value)
+    record per item, byte lengths derived from the transport size, even
+    padding between records, consuming the data exactly."""
+    j = 0
+    for i in range(items):
+        if j + 4 > len(data) or data[j] != 0x00 or data[j + 1] not in _S7_TS_ALL:
+            return False
+        ln = _u16be(data, j + 2)
+        n = (ln + 7) // 8 if data[j + 1] in _S7_TS_BITS else ln
+        if n < 1:
+            return False
+        j += 4 + n
+        if i < items - 1 and n % 2:
+            j += 1
+    return j == len(data)
+
+
+def _s7_layout_ok(fn: int, par: bytes, data: bytes) -> bool:
+    """Function-specific parameter (and data) layout of the S7 jobs."""
+    if fn in (0x04, 0x05):
+        items = _s7_items(par)
+        if items is None:
+            return False
+        return _s7_write_data_ok(data, items) if fn == 0x05 else not data
+    if fn in (0x1A, 0x1B, 0x1C):
+        # fn, status, 2 + 4 unknown, name length 9, "_<type><number><dest>"
+        if par[8] != 9 or not _S7_BLOCK_NAME.fullmatch(par[9:18]):
+            return False
+        if fn == 0x1A:
+            # plus the length part: length byte, then ASCII digits
+            return len(par) >= 19 and len(par) == 19 + par[18] and par[19:].isdigit()
+        return len(par) == 18
+    if fn == 0x28:
+        # fn, 7 unknown, parameter block length (2), block, name length, name
+        n = _u16be(par, 8)
+        if 10 + n >= len(par):
+            return False
+        m = par[10 + n]
+        name = par[11 + n:]
+        return m >= 1 and len(name) == m and all(0x21 <= c < 0x7F for c in name)
+    if fn == 0x29:
+        # fn, 5 unknown, name length, name ("P_PROGRAM")
+        m = par[6]
+        name = par[7:]
+        return m >= 1 and len(name) == m and all(0x21 <= c < 0x7F for c in name)
+    return True
 S7_UD_GROUP = {1: "Programmer commands", 2: "Cyclic data", 3: "Block functions",
                4: "CPU functions", 5: "Security", 6: "PBC", 7: "Time functions"}
 
@@ -402,10 +473,8 @@ def classify_s7(b: bytes) -> Finding:
         name = S7_JOB.get(fn, f"job 0x{fn:02x}")
         if fn not in S7_JOB or plen < _S7_MIN_PAR.get(fn, 1):
             return _f("s7comm", "invalid", f"{name}: malformed")
-        if fn in (0x04, 0x05) and par[1] < 1:
-            return _f("s7comm", "invalid", f"{name}: no items")
-        if fn == 0x05 and dlen == 0:
-            return _f("s7comm", "invalid", "Write Var without data")
+        if not _s7_layout_ok(fn, par, s[hdr + plen:]):
+            return _f("s7comm", "invalid", f"{name}: parameters or data do not fit the layout")
         if fn == 0xF0:
             return _f("s7comm", "handshake", "Setup Communication")
         if fn in WRITE_S7_JOB:
@@ -651,11 +720,22 @@ def dnp3_crc(data: bytes) -> int:
     return (~crc) & 0xFFFF
 
 
-#: The emulators keep the first 120 bytes of a request.
-_TRUNCATED_AT = 120
+#: The emulators keep the first 120 bytes of a request and mark a cut
+#: payload with a trailing ellipsis; payload_truncated() reads that mark.
+#: Decoders take ``truncated`` explicitly: a payload that is merely 120 bytes
+#: long is NOT assumed to be cut.
+ELLIPSIS = "\u2026"
 
 
-def classify_dnp3(b: bytes) -> Finding:
+def payload_truncated(value) -> bool:
+    return isinstance(value, str) and value.rstrip().endswith(ELLIPSIS)
+
+
+def classify_dnp3(b: bytes, truncated: bool = False) -> Finding:
+    """A DNP3 link frame from a master. Every CAPTURED 16-byte user-data
+    block must carry a valid CRC; a frame shorter than its link length is
+    accepted only when the capture says it was cut (``truncated``), and then
+    only the complete blocks are checked."""
     if len(b) < 10 or b[0:2] != b"\x05\x64":
         return _f("dnp3", "invalid", "no 0x0564 link frame")
     ln, ctrl = b[2], b[3]
@@ -667,15 +747,20 @@ def classify_dnp3(b: bytes) -> Finding:
         return _f("dnp3", "invalid", "secondary (outstation) frame from a client")
     user = ln - 5
     expected = 10 + user + 2 * ((user + 15) // 16)
-    if len(b) < expected and len(b) < _TRUNCATED_AT:
+    if len(b) < expected and not truncated:
         return _f("dnp3", "invalid", "frame shorter than its link length")
+    pos, left = 10, user
+    while left > 0:
+        n = min(16, left)
+        if pos + n + 2 > len(b):
+            break                         # the cut, allowed only when truncated
+        if dnp3_crc(b[pos:pos + n]) != int.from_bytes(b[pos + n:pos + n + 2], "little"):
+            return _f("dnp3", "invalid", "user data CRC mismatch")
+        pos, left = pos + n + 2, left - n
     lfc = ctrl & 0x0F
     if lfc in (3, 4):
-        block = b[10:10 + min(16, user)]
-        crc_at = 10 + len(block)
-        if user < 3 or len(b) < crc_at + 2 \
-                or dnp3_crc(block) != int.from_bytes(b[crc_at:crc_at + 2], "little"):
-            return _f("dnp3", "invalid", "user data CRC mismatch")
+        if user < 3 or len(b) < 10 + min(16, user) + 2:
+            return _f("dnp3", "invalid", "no complete first user-data block")
         if not b[10] & 0x40:
             return _f("dnp3", "invalid", "transport segment without FIR")
         fc = b[12]
@@ -696,12 +781,16 @@ WRITE_OPCUA = {673: "WriteRequest", 712: "CallRequest", 488: "AddNodesRequest",
                506: "DeleteReferencesRequest", 700: "HistoryUpdateRequest"}
 
 
-def classify_opcua(b: bytes) -> Finding:
+def classify_opcua(b: bytes, truncated: bool = False) -> Finding:
+    """A declared size larger than the bytes is invalid, unless the capture
+    says it was cut; a cut MSG is at most ``interaction``, never a write:
+    the frame it declares was not seen whole."""
     head = b[:3]
     if head not in (b"HEL", b"OPN", b"CLO", b"RHE", b"MSG") or len(b) < 8:
         return _f("opcua", "invalid", "no OPC UA message header")
     size = int.from_bytes(b[4:8], "little")
-    if size < 8 or (size > len(b) and len(b) < _TRUNCATED_AT):
+    cut = size > len(b)
+    if size < 8 or (cut and not truncated):
         return _f("opcua", "invalid", "message size does not match the bytes")
     if head != b"MSG":
         return _f("opcua", "handshake", head.decode())
@@ -719,6 +808,8 @@ def classify_opcua(b: bytes) -> Finding:
     if node is None:
         return _f("opcua", "invalid", "service NodeId not in namespace 0")
     if node in WRITE_OPCUA:
+        if cut:
+            return _f("opcua", "interaction", f"MSG {WRITE_OPCUA[node]} (truncated capture)")
         return _f("opcua", "write", f"MSG {WRITE_OPCUA[node]}")
     return _f("opcua", "interaction", f"MSG service {node}")
 
@@ -734,11 +825,14 @@ _HARTIP_MSG = {0: "Session Initiate", 1: "Session Close", 2: "Keep Alive",
                3: "Token-Passing PDU", 4: "Direct PDU", 5: "Read Audit Log"}
 
 
-def classify_hartip(b: bytes) -> Finding:
+def classify_hartip(b: bytes, truncated: bool = False) -> Finding:
+    """Like OPC UA: a byte count larger than the bytes is invalid unless the
+    capture was cut, and a cut frame is never a write."""
     if len(b) < 8 or b[0] not in (1, 2):
         return _f("hartip", "invalid", "no HART-IP header")
     count = _u16be(b, 6)
-    if count < 8 or (count > len(b) and len(b) < _TRUNCATED_AT):
+    cut = count > len(b)
+    if count < 8 or (cut and not truncated):
         return _f("hartip", "invalid", "byte count does not match the bytes")
     mid = b[2]
     name = _HARTIP_MSG.get(mid, f"message {mid}")
@@ -750,8 +844,8 @@ def classify_hartip(b: bytes) -> Finding:
         k = 9 + addr + ((delim >> 5) & 0x03)
         if len(b) > k:
             cmd = b[k]
-            return _f("hartip", "write" if cmd in WRITE_HART else "interaction",
-                      f"{name} command {cmd}")
+            return _f("hartip", "write" if cmd in WRITE_HART and not cut else "interaction",
+                      f"{name} command {cmd}" + (" (truncated capture)" if cut else ""))
     if mid in (3, 4, 5):
         return _f("hartip", "interaction", name)
     return _f("hartip", "invalid", name)
@@ -854,18 +948,27 @@ def _snmp_op(event_type: str) -> Optional[str]:
     return None
 
 
+_OID_DOTTED = re.compile(r"\d+(?:\.\d+)+")
+_OID_TUPLE = re.compile(r"\(\s*\d+(?:\s*,\s*\d+)+\s*,?\s*\)")
+
+
 def _snmp_oid(request) -> Optional[str]:
+    """The request OID in dotted form, only when it is syntactically an OID:
+    dotted numeric (``1.3.6.1.2.1.1.1.0``) or ConPot's tuple form
+    (``(1, 3, 6, 1, ...)``); None for anything else (``"x"``, empty)."""
     try:
         j = json.loads(request) if isinstance(request, str) else (request or {})
     except (TypeError, ValueError):
         return None
     oid = j.get("oid") if isinstance(j, dict) else None
-    if not oid:
+    if not isinstance(oid, str):
         return None
-    oid = str(oid).strip()
-    if oid.startswith("("):
-        oid = oid.strip("() ").replace(", ", ".").replace(",", ".")
-    return oid[:64]
+    oid = oid.strip()
+    if _OID_TUPLE.fullmatch(oid):
+        oid = ".".join(x.strip() for x in oid.strip("() ").split(",") if x.strip())
+    elif not _OID_DOTTED.fullmatch(oid):
+        return None
+    return oid[:64] if len(oid) <= 64 else None
 
 
 def classify_conpot(doc: dict) -> Finding:
@@ -955,7 +1058,15 @@ def classify_fake(proto: str, payload) -> Finding:
     if b is None:
         return _f(p, "invalid", "undecodable payload")
     decoder = _DECODERS.get(p)
-    return decoder(b) if decoder else _f(p, "interaction")
+    if decoder is None:
+        return _f(p, "interaction")
+    if p in _TRUNCATION_AWARE:
+        return decoder(b, truncated=payload_truncated(payload))
+    return decoder(b)
+
+
+#: Decoders that take the capture's truncation status.
+_TRUNCATION_AWARE = frozenset({"dnp3", "opcua", "hartip"})
 
 
 def classify_doc(doc: dict) -> Optional[Finding]:
