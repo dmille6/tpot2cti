@@ -405,7 +405,9 @@ def test_snmp_oid_must_be_numeric():
     d = next(x for x in _scenario("snmp_set") if x.get("event_type") == "SNMPv2 Set")
     for oid, tier in (("1.3.6.1.2.1.1.5.0", "write"), ("(1, 3, 6, 1, 2, 1, 1, 5, 0)", "write"),
                       ("x", "invalid"), ("1", "invalid"), ("1.3.x.1", "invalid"), ("", "invalid"),
-                      ("1..3", "invalid"), ("(1, 3, a)", "invalid")):
+                      ("1..3", "invalid"), ("(1, 3, a)", "invalid"),
+                      # a valid numeric OID longer than 64 characters is still a write (stored truncated)
+                      ("1.3.6.1.4.1." + ".".join(["12345"] * 12), "write")):
         req = json.dumps({"oid": oid, "val": ""})
         assert ics.classify_conpot(dict(d, conpot_request=req)).tier == tier, oid
 

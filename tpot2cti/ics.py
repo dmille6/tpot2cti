@@ -968,7 +968,7 @@ def _snmp_oid(request) -> Optional[str]:
         oid = ".".join(x.strip() for x in oid.strip("() ").split(",") if x.strip())
     elif not _OID_DOTTED.fullmatch(oid):
         return None
-    return oid[:64] if len(oid) <= 64 else None
+    return oid[:64]
 
 
 def classify_conpot(doc: dict) -> Finding:
