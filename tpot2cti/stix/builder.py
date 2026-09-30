@@ -969,6 +969,12 @@ class STIXBuilder:
         #: ANY gate mode. reason -> sessions, reported in the cycle's `ics`.
         self._ics_refusals: bool = bool(getattr(cycle, "ics_refusals", True))
         self.ics_refused: dict[str, int] = {}
+        #: attacker IP -> {"labels": set, "industrial": set} over every ICS
+        #: session in this bundle. The attacker observable and Indicator are
+        #: deduplicated (the first session's copy is kept), so finalize_bundle
+        #: puts the UNION of the ICS labels on them, plus ics:multi-protocol
+        #: when one address used two or more industrial protocols.
+        self._ics_ip: dict[str, dict] = {}
         #: observable-side sighting id -> True once any session in this
         #: bundle also had an Indicator for that (sensor, IP, day).
         self._obs_sighting_has_indicator: dict[str, bool] = {}
@@ -1895,6 +1901,7 @@ class STIXBuilder:
         }
         # OpenCTI extensions — populated when we have session context.
         if session is not None:
+            self._note_ics_session(session)
             obj["x_opencti_description"] = _describe_ip(ip, session)
             obj["x_opencti_score"] = _ip_score(session)
             obj["x_opencti_labels"] = sorted(set(session_labels_for(session)))
@@ -3011,6 +3018,41 @@ class STIXBuilder:
             self._gate_withheld_ids.add(ind_id)
         return False
 
+    def _note_ics_session(self, session: AttackSession) -> None:
+        """Remember an ICS session's labels and valid industrial protocols
+        against its attacker address (see self._ics_ip)."""
+        s = evidence.ics_summary(session)
+        if not s or not session.src_ip:
+            return
+        rec = self._ics_ip.setdefault(session.src_ip, {"labels": set(), "industrial": set()})
+        rec["labels"].update(ics.session_labels(s))
+        rec["industrial"].update(
+            p for p in (s.get("valid_protocols") or ()) if p in ics.INDUSTRIAL)
+
+    def _apply_ics_label_union(self, objects: list[dict]) -> None:
+        """Put the union of an address's ICS labels on its observable and its
+        Indicator (in place). Touches only addresses with an ICS session."""
+        if not self._ics_ip:
+            return
+        want: dict[str, set] = {}
+        for ip, rec in self._ics_ip.items():
+            labels = set(rec["labels"])
+            if ics.multi_protocol(rec["industrial"]):
+                labels.add(ics.LABEL_MULTI)
+            if not labels:
+                continue
+            for oid in (attacker_ip_observable_id(ip), attacker_ip_indicator_id(ip)):
+                if oid:
+                    want[oid] = labels
+        for obj in objects:
+            labels = want.get(obj.get("id"))
+            if not labels:
+                continue
+            key = "labels" if obj.get("type") == "indicator" else "x_opencti_labels"
+            cur = set(obj.get(key) or ())
+            if not labels <= cur:
+                obj[key] = sorted(cur | labels)
+
     def _ics_hard_refusal(self, session: AttackSession) -> Optional[str]:
         """An ICS refusal that applies in EVERY gate mode, or None.
 
@@ -3100,6 +3142,7 @@ class STIXBuilder:
         Returns ``objects`` itself when there is nothing to withhold, so
         ``off`` and ``shadow`` hand the publisher the very same list.
         """
+        self._apply_ics_label_union(objects)
         stats = self.gate_stats
         evidence.log_refusals(self._gate_mode, stats)
         stats.observable_sightings_with_indicator = sum(

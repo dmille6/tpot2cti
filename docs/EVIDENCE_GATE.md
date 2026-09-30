@@ -286,7 +286,7 @@ and ICS emulator sessions from `session.meta["ics"]` (docs/parsers/conpot.md):
 | Reason | Decision | When |
 |---|---|---|
 | `ics-write-control` | accept | any write/control function, even from a research scanner |
-| `ics-interaction` | accept | a valid industrial request beyond the handshake |
+| `ics-interaction` | refuse | a valid industrial request beyond the handshake, but no write (decision 2026-09-30: 94.5% of such addresses are census fingerprint reads; reconnaissance keeps its observable and Sighting, only a write mints a malicious-activity Indicator) |
 | `ics-research-scanner` | refuse | the same, from a heuristically classified research scanner |
 | `ics-handshake-only` | refuse | only session-opening frames |
 | `ics-connect-only` | refuse | connection events or non-protocol bytes |

@@ -35,9 +35,15 @@ one's. DR-01's classes land one at a time:
                                 stop, IEC-104 commands, SNMP Set, BACnet or
                                 CIP writes, DNP3 operate ...). Also scored
                                 higher and labelled ``ics:write-control``.
-      - ``ics-interaction``     accept: a valid industrial request beyond
+      - ``ics-interaction``     REFUSE: a valid industrial request beyond
                                 the handshake (identity, register or SZL
-                                reads, interrogation ...).
+                                reads, interrogation ...) but no write.
+                                Decision 2026-09-30 (both reviews and the
+                                data: 94.5% of such addresses are census
+                                fingerprint reads): reconnaissance keeps its
+                                observable and Sighting, but only a write or
+                                control command mints a malicious-activity
+                                Indicator.
       - ``ics-research-scanner`` refuse: the same, from a source classified
                                 as a research scanner (labelled, kept).
       - ``ics-handshake-only``  refuse: only a session-opening frame.
@@ -147,9 +153,11 @@ def _decide_ics(s: dict) -> GateDecision:
         # HTTP / FTP / IPMI on an ICS emulator: not an ICS decision.
         return GateDecision(accept=True, reason=REASON_STUB_ACCEPT)
     if tier == "interaction":
+        # Only a write/control command is evidence enough for a
+        # malicious-activity Indicator (decision 2026-09-30).
         if s.get("research_scanner"):
             return GateDecision(accept=False, reason=REASON_ICS_SCANNER)
-        return GateDecision(accept=True, reason=REASON_ICS_INTERACTION)
+        return GateDecision(accept=False, reason=REASON_ICS_INTERACTION)
     if tier == "handshake":
         return GateDecision(accept=False, reason=REASON_ICS_HANDSHAKE)
     return GateDecision(accept=False, reason=REASON_ICS_CONNECT)

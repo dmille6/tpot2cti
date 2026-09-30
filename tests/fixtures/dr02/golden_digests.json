@@ -33,6 +33,29 @@
         "objects": 35,
         "bytes": 32028
       }
+    },
+    {
+      "when": "2026-09-30",
+      "parent": "ics-intel 171812e",
+      "reason": "ICS review fixes: v1's generic `ics` label restored beside targeting:ics. Only the ConPot fixture's observable and indicator labels change (+ 'ics'); nothing else in either bundle.",
+      "unchanged_without": [
+        "conpot.jsonl"
+      ],
+      "cycle_without": {
+        "sha256": "0b003cd7a3542ef925587092f26031d1ed07a6c4ea0647ec62ef8fe52f77e6a7",
+        "objects": 175,
+        "bytes": 162247
+      },
+      "cycle": {
+        "sha256": "2b885191523be08a604a23f474ddb01799faca235835ee705db899f55cfa6a4f",
+        "objects": 184,
+        "bytes": 170551
+      },
+      "direct": {
+        "sha256": "d25ff2881a9f28a831e9b09e5522c0264b56af607bfd21b69d24f3802a2016f3",
+        "objects": 35,
+        "bytes": 32028
+      }
     }
   ]
 }

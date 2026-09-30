@@ -17,12 +17,22 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 - **ICS emulators logged as Heralding** (DNP3, OPC UA, HART-IP, GE-SRTP) are
   classified as ICS, record no credentials (their "password" is request
   bytes) and are built as "ICS Emulator Probe".
-- **Labels** in the v1 spellings: `targeting:ics`, `ics:<protocol>` for valid
+- **Labels** in the v1 spellings: `targeting:ics`, `ics`, `ics:<protocol>` for valid
   requests only, `ics:protocol-interaction`, `ics:write-control` (+30 score),
   `scanner:research` / `scanner:<vendor>`.
-- **ICS evidence class** in `evidence.decide` (shadow first):
-  `ics-write-control`, `ics-interaction` accept; `ics-research-scanner`,
-  `ics-handshake-only`, `ics-connect-only`, `ics-snmp-only` refuse.
+- **ICS evidence class** in `evidence.decide` (shadow first): only
+  `ics-write-control` accepts (decision 2026-09-30: at enforce, only a write
+  or control command mints a malicious-activity Indicator);
+  `ics-interaction`, `ics-research-scanner`, `ics-handshake-only`,
+  `ics-connect-only`, `ics-snmp-only` refuse and keep the observable and
+  Sighting.
+- **Review fixes (same day):** decoders check declared lengths and minimum
+  bodies (Modbus, S7, ENIP, OPC UA, HART-IP), DNP3 link length, CRCs and
+  transport FIR; Guardian AST writes need `S` + five digits (an SSH banner
+  was a "write"); S7 upload is a read; DNP3 Assign Class is control; an SNMP
+  Set needs a parsed OID; TLS on the FTP port is `invalid`; v1's `ics` and
+  `ics:multi-protocol` labels; `targeting:ics` only for industrial
+  protocols.
 - **Refusals in every mode** (`TPOT2CTI_ICS_REFUSALS`, default true):
   GetBulk-only SNMP sessions (the reflection shape) emit nothing; other
   SNMP-only sessions mint no Indicator; allowlisted research scanners are kept

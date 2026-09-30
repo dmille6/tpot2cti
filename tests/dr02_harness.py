@@ -44,6 +44,9 @@ the change touched nothing but the named parsers' output.
     1-event sessions; ``[guardian_ast]`` instead of ``[new_connection]``;
     ``targeting:ics``). ``python -m tests.dr02_harness --rebaseline`` wrote
     it after the diff against origin/main 430313e showed exactly that.
+  * 2026-09-30, ICS review fixes (``ics-intel`` after 171812e): v1's
+    generic ``ics`` label beside ``targeting:ics``. Diffed against 171812e:
+    only the ConPot fixture's observable and Indicator gain ``ics``.
 """
 from __future__ import annotations
 

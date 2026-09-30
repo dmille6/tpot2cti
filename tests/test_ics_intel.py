@@ -197,11 +197,26 @@ def mbap(unit, pdu, tid=1):
     return struct.pack(">HHHB", tid, 0, len(pdu) + 1, unit) + pdu
 
 
-def s7_job(fn, extra=b""):
+def s7_job(fn, extra=b"", data=b"", tpkt_delta=0):
     par = bytes([fn]) + extra
-    s7 = b"\x32\x01\x00\x00\x00\x01" + struct.pack(">HH", len(par), 0) + par
+    s7 = b"\x32\x01\x00\x00\x00\x01" + struct.pack(">HH", len(par), len(data)) + par + data
     cotp = b"\x02\xf0\x80"
-    return b"\x03\x00" + struct.pack(">H", 4 + len(cotp) + len(s7)) + cotp + s7
+    return b"\x03\x00" + struct.pack(">H", 4 + len(cotp) + len(s7) + tpkt_delta) + cotp + s7
+
+
+S7_ITEM = bytes.fromhex("120a10020001000184000000")      # one S7ANY item, DB1.DBX0.0 byte
+S7_PI = b"\x00\x00\x00\x00\x00\x09P_PROGRAM"
+
+
+def dnp3_frame(link_fc, user=b"", prm=True):
+    """A DNP3 link frame with correct CRCs (link header, then 16-byte blocks)."""
+    ctrl = 0x80 | (0x40 if prm else 0) | link_fc
+    head = bytes([0x05, 0x64, 5 + len(user), ctrl, 0x01, 0x00, 0x04, 0x00])
+    out = head + ics.dnp3_crc(head).to_bytes(2, "little")
+    for i in range(0, len(user), 16):
+        blk = user[i:i + 16]
+        out += blk + ics.dnp3_crc(blk).to_bytes(2, "little")
+    return out
 
 
 def iec_i(typeid, cot=6):
@@ -223,25 +238,46 @@ def bacnet_confirmed(svc):
     return b"\x81\x0a\x00\x11\x01\x04" + bytes([0x00, 0x05, 0x01, svc]) + b"\x0c\x02\x00\x00\x01\x19\x4d"
 
 
-def opcua_msg(node):
-    return b"MSGF" + struct.pack("<IIIII", 40, 1, 1, 1, 1) + b"\x01\x00" + struct.pack("<H", node) + b"\x00" * 8
+def opcua_msg(node, ns=0, size_delta=0):
+    body = struct.pack("<IIII", 1, 1, 1, 1) + bytes([0x01, ns]) + struct.pack("<H", node) + b"\x00" * 8
+    return b"MSGF" + struct.pack("<I", 8 + len(body) + size_delta) + body
+
+
+def hartip(msg_id, pdu=b"", count_delta=0):
+    return bytes([1, 0, msg_id, 0]) + struct.pack(">HH", 1, 8 + len(pdu) + count_delta) + pdu
 
 
 SYNTHETIC = [
     # (label, classifier, payload, tier, function substring)
     ("modbus FC6", ics.classify_modbus, mbap(1, b"\x06\x00\x01\x00\x2a"), "write", "FC6"),
     ("modbus FC16", ics.classify_modbus, mbap(1, b"\x10\x00\x00\x00\x01\x02\x00\x07"), "write", "FC16"),
-    ("modbus FC23", ics.classify_modbus, mbap(1, b"\x17" + b"\x00" * 9), "write", "FC23"),
+    ("modbus FC23", ics.classify_modbus,
+     mbap(1, b"\x17\x00\x00\x00\x01\x00\x05\x00\x01\x02\x00\x07"), "write", "FC23"),
+    ("modbus FC6 header only (NEGATIVE)", ics.classify_modbus, mbap(1, b"\x06"), "invalid", "malformed"),
+    ("modbus FC6 short body (NEGATIVE)", ics.classify_modbus, mbap(1, b"\x06\x00\x01"), "invalid", None),
+    ("modbus FC16 byte count wrong (NEGATIVE)", ics.classify_modbus,
+     mbap(1, b"\x10\x00\x00\x00\x02\x02\x00\x07"), "invalid", None),
+    ("modbus FC5 bad value (NEGATIVE)", ics.classify_modbus, mbap(1, b"\x05\x00\x01\x12\x34"), "invalid", None),
+    ("modbus FC3 zero quantity (NEGATIVE)", ics.classify_modbus, mbap(1, b"\x03\x00\x00\x00\x00"), "invalid", None),
     ("modbus FC8 restart", ics.classify_modbus, mbap(1, b"\x08\x00\x01\x00\x00"), "write", "sub 1"),
     ("modbus FC8 echo", ics.classify_modbus, mbap(1, b"\x08\x00\x00\x12\x34"), "interaction", "FC8"),
     ("modbus UMAS stop", ics.classify_modbus, mbap(0, b"\x5a\x00\x41"), "write", "UMAS 0x41"),
     ("modbus read then write", ics.classify_modbus,
      mbap(1, b"\x03\x00\x00\x00\x01") + mbap(1, b"\x05\x00\x01\xff\x00", tid=2), "write", "FC5"),
     ("modbus FC0 (LDAP bytes)", ics.classify_modbus, bytes.fromhex("30840000000602000000"), "invalid", None),
-    ("s7 Write Var", ics.classify_s7, s7_job(0x05, b"\x01"), "write", "Write Var"),
-    ("s7 PLC Stop", ics.classify_s7, s7_job(0x29), "write", "PLC Stop"),
-    ("s7 Request Download", ics.classify_s7, s7_job(0x1A), "write", "Download"),
-    ("s7 Read Var", ics.classify_s7, s7_job(0x04, b"\x01"), "interaction", "Read Var"),
+    ("s7 Write Var", ics.classify_s7, s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x04\x00\x08\x01"),
+     "write", "Write Var"),
+    ("s7 PLC Stop", ics.classify_s7, s7_job(0x29, S7_PI), "write", "PLC Stop"),
+    ("s7 Request Download", ics.classify_s7, s7_job(0x1A, b"\x00" * 9), "write", "Download"),
+    ("s7 Read Var", ics.classify_s7, s7_job(0x04, b"\x01" + S7_ITEM), "interaction", "Read Var"),
+    ("s7 Upload is a read", ics.classify_s7, s7_job(0x1E, b"\x00" * 7), "interaction", "Upload"),
+    ("s7 Start Upload is a read", ics.classify_s7, s7_job(0x1D, b"\x00" * 17), "interaction", "Start Upload"),
+    ("s7 Write Var bad TPKT length (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x04\x00\x08\x01", tpkt_delta=5), "invalid", None),
+    ("s7 Write Var lengths disagree (NEGATIVE)", ics.classify_s7,
+     s7_job(0x05, b"\x01" + S7_ITEM, b"\x00\x04\x00\x08\x01")[:-2] + b"\x00\x00"[:0], "invalid", None),
+    ("s7 Write Var without data (NEGATIVE)", ics.classify_s7, s7_job(0x05, b"\x01" + S7_ITEM), "invalid", None),
+    ("s7 PLC Stop header only (NEGATIVE)", ics.classify_s7, s7_job(0x29), "invalid", None),
     ("s7 HTTP on 102", ics.classify_s7, b"GET / HTTP/1.1\r\n\r\n", "invalid", None),
     ("iec104 single command act", ics.classify_iec104, iec_i(45), "write", "C_SC_NA_1"),
     ("iec104 double command act", ics.classify_iec104, iec_i(46), "write", "C_DC_NA_1"),
@@ -268,16 +304,33 @@ SYNTHETIC = [
     ("bacnet ReinitializeDevice", ics.classify_bacnet, bacnet_confirmed(20), "write", "Reinitialize"),
     ("bacnet ReadProperty", ics.classify_bacnet, bacnet_confirmed(12), "interaction", "ReadProperty"),
     ("bacnet Who-Is", ics.classify_bacnet, b"\x81\x0b\x00\x08\x01\x00\x10\x08", "interaction", "Who-Is"),
-    ("dnp3 Direct Operate", ics.classify_dnp3,
-     bytes.fromhex("056414c4010000040000") + b"\xc0\xc0\x05" + b"\x0c\x01", "write", "Direct Operate"),
-    ("dnp3 Read", ics.classify_dnp3, bytes.fromhex("05640bc4010000040000") + b"\xc0\xc0\x01", "interaction", "Read"),
+    ("dnp3 Direct Operate", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x05\x0c\x01"), "write", "Direct Operate"),
+    ("dnp3 Assign Class", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x16\x3c\x02\x06"), "write", "Assign Class"),
+    ("dnp3 Read", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x01\x3c\x02\x06"), "interaction", "Read"),
+    ("dnp3 link status", ics.classify_dnp3, dnp3_frame(9), "handshake", "Request Link Status"),
+    ("dnp3 operate, header CRC wrong (NEGATIVE)", ics.classify_dnp3,
+     bytes.fromhex("056410c4010000040000") + b"\xc0\xc0\x05\x0c\x01", "invalid", "CRC"),
+    ("dnp3 operate, data CRC wrong (NEGATIVE)", ics.classify_dnp3,
+     dnp3_frame(4, b"\xc0\xc0\x05\x0c\x01")[:-2] + b"\x00\x00", "invalid", "CRC"),
+    ("dnp3 operate without transport FIR (NEGATIVE)", ics.classify_dnp3,
+     dnp3_frame(4, b"\x80\xc0\x05\x0c\x01"), "invalid", "FIR"),
+    ("dnp3 operate, frame shorter than its length (NEGATIVE)", ics.classify_dnp3,
+     dnp3_frame(4, b"\xc0\xc0\x05\x0c\x01" + b"\x00" * 20)[:30], "invalid", None),
+    ("dnp3 outstation frame (NEGATIVE)", ics.classify_dnp3, dnp3_frame(4, b"\xc0\xc0\x05", prm=False),
+     "invalid", "secondary"),
     ("opcua WriteRequest", ics.classify_opcua, opcua_msg(673), "write", "WriteRequest"),
     ("opcua CallRequest", ics.classify_opcua, opcua_msg(712), "write", "CallRequest"),
     ("opcua ReadRequest", ics.classify_opcua, opcua_msg(631), "interaction", "631"),
-    ("hartip write polling address", ics.classify_hartip,
-     bytes([1, 0, 3, 0, 0, 1, 0, 14]) + bytes([0x02, 0x80, 6, 1, 0]), "write", "command 6"),
-    ("hartip read unique id", ics.classify_hartip,
-     bytes([1, 0, 3, 0, 0, 1, 0, 13]) + bytes([0x02, 0x80, 0, 0]), "interaction", "command 0"),
+    ("opcua MSG, size larger than the bytes (NEGATIVE)", ics.classify_opcua,
+     opcua_msg(673, size_delta=40), "invalid", "size"),
+    ("opcua MSG, truncated below a request (NEGATIVE)", ics.classify_opcua, opcua_msg(673)[:20], "invalid", None),
+    ("opcua MSG, namespace 1 (NEGATIVE)", ics.classify_opcua, opcua_msg(673, ns=1), "invalid", "namespace"),
+    ("hartip write polling address", ics.classify_hartip, hartip(3, bytes([0x02, 0x80, 6, 1, 0])),
+     "write", "command 6"),
+    ("hartip read unique id", ics.classify_hartip, hartip(3, bytes([0x02, 0x80, 0, 0])),
+     "interaction", "command 0"),
+    ("hartip byte count wrong (NEGATIVE)", ics.classify_hartip,
+     hartip(3, bytes([0x02, 0x80, 6, 1, 0]), count_delta=9), "invalid", None),
     ("srtp write system memory", ics.classify_srtp, bytes([0x02]) + b"\x00" * 41 + b"\x07" + b"\x00" * 13, "write", "Write System"),
     ("srtp short status", ics.classify_srtp, bytes([0x02]) + b"\x00" * 41 + b"\x00" + b"\x00" * 13, "interaction", None),
 ]
@@ -299,6 +352,10 @@ def test_text_protocol_writes():
     assert ics.classify_kamstrup_mgmt("GET / HTTP/1.1").tier == "invalid"
     assert ics.classify_guardian("AST S60200", None).tier == "write"
     assert ics.classify_guardian("AST I20100", None).tier == "interaction"
+    # ConPot logs AST <request[1:7]> for ANY input: an SSH banner or HTTP is
+    # not a set command (NEGATIVE)
+    for junk in ("AST SH-2.0", "AST ET / H", "AST S6020", "AST Sabcde", "AST i2010x"):
+        assert ics.classify_guardian(junk, None).tier == "invalid", junk
 
 
 def test_capture_shim_forms():
@@ -317,6 +374,31 @@ def test_capture_shim_forms():
         assert ics.classify_conpot(dict(enip_doc, conpot_request=req)).tier == tier, req
     bac = dict(_scenario("bacnet_connect")[0], event_type=None)
     assert ics.classify_conpot(dict(bac, conpot_request=bacnet_confirmed(15).hex())).tier == "write"
+
+
+def test_snmp_set_needs_a_parsed_oid():
+    d = dict(_scenario("snmp_set")[0])
+    d = next(x for x in _scenario("snmp_set") if x.get("event_type") == "SNMPv2 Set")
+    assert ics.classify_conpot(d).tier == "write"
+    for req in ('{"val": "x"}', "not json", None):
+        assert ics.classify_conpot(dict(d, conpot_request=req)).tier == "invalid", req
+
+
+def test_tls_on_the_ftp_port_is_not_an_ftp_command():
+    d = next(x for x in _scenario("ftp_cmd") if x.get("conpot_request"))
+    assert ics.classify_conpot(d).tier == "interaction"
+    assert ics.classify_conpot(dict(d, conpot_request="b'160301020001'")).tier == "invalid"
+    assert ics.classify_conpot(dict(d, conpot_request="b'\\x16\\x03\\x01\\x02\\x00'")).tier == "invalid"
+
+
+def test_empty_enip_sendrrdata_is_not_interaction():
+    assert ics.classify_enip(enip(0x6F)).tier == "invalid"
+    assert ics.classify_enip(enip(0x6F, struct.pack("<IHH", 0, 0, 0))).tier == "invalid"
+    assert ics.classify_enip(enip(0x63)[:-2] + b"\x05\x00").tier in ("interaction", "invalid")
+    bad = struct.pack("<HHII8sI", 0x6F, 200, 0, 0, b"\x00" * 8, 0)    # declares 200 bytes, has 0
+    assert ics.classify_enip(bad).tier == "invalid"
+    d = dict(_scenario("enip_connect")[0], event_type=None)
+    assert ics.classify_conpot(dict(d, conpot_request="cmd=111 len=0 sctx=00")).tier == "invalid"
 
 
 def test_the_structured_field_contract_wins():
@@ -371,8 +453,8 @@ DRIFTNET = {"vendor": "driftnet", "basis": "rdns:internet-measurement.com", "lis
 def test_ics_decisions(session, reason):
     d = evidence.decide(session(), site="driveby")
     assert d.reason == reason
-    assert d.accept is (reason in (evidence.REASON_ICS_INTERACTION, evidence.REASON_ICS_WRITE,
-                                   evidence.REASON_STUB_ACCEPT))
+    # decision 2026-09-30: only a write/control command mints an Indicator
+    assert d.accept is (reason in (evidence.REASON_ICS_WRITE, evidence.REASON_STUB_ACCEPT))
 
 
 def test_a_scanner_that_writes_is_still_write_evidence():
@@ -422,10 +504,32 @@ def test_labels_follow_v1_spellings_and_valid_requests_only():
         assert "ics:write-control" not in labels
     assert "ICS depth: interaction" in obs["x_opencti_description"]
     # a port touch gets targeting:ics but no protocol label
+    assert "ics" in obs["x_opencti_labels"] and "ics" in ind["labels"]
     s2 = _conpot_session("enip_connect")
     objs2, _ = _build({}, [s2])
     labels2 = _by_id(objs2, attacker_ip_observable_id(s2.src_ip))["x_opencti_labels"]
     assert "targeting:ics" in labels2 and "ics:ethernet-ip" not in labels2
+    # HTTP / FTP on the emulator is not ICS targeting
+    for name in ("http_get", "ftp_cmd"):
+        s3 = _conpot_session(name)
+        objs3, _ = _build({}, [s3])
+        labels3 = _by_id(objs3, attacker_ip_observable_id(s3.src_ip))["x_opencti_labels"]
+        assert "targeting:ics" not in labels3 and "ics" not in labels3, name
+
+
+def test_one_address_on_two_industrial_protocols_gets_the_union_and_multi_protocol():
+    a = _conpot_session("modbus_fc43")
+    b_ = _conpot_session("s7_szl")
+    b_.src_ip = a.src_ip
+    for e in b_.events:
+        e.src_ip = a.src_ip
+    objs, _ = _build({}, [a, b_])
+    for oid, key in ((attacker_ip_observable_id(a.src_ip), "x_opencti_labels"),
+                     (attacker_ip_indicator_id(a.src_ip), "labels")):
+        labels = set(_by_id(objs, oid)[key])
+        assert {"ics:modbus", "ics:s7", "ics:multi-protocol", "ics", "targeting:ics"} <= labels
+    single, _ = _build({}, [_conpot_session("modbus_fc43")])
+    assert "ics:multi-protocol" not in _by_id(single, attacker_ip_observable_id(a.src_ip))["x_opencti_labels"]
 
 
 def test_a_write_scores_higher_and_says_so():
@@ -487,8 +591,25 @@ def test_shadow_output_equals_off_for_ics_sessions():
     off, _ = _build({DECOUPLED: "true"}, [_conpot_session(n) for n in names])
     shadow, b = _build({GATE: "shadow", DECOUPLED: "true"}, [_conpot_session(n) for n in names])
     assert H.serialize(off) == H.serialize(shadow)
-    assert b.gate_stats.accepted[evidence.REASON_ICS_INTERACTION] == 2
-    assert b.gate_stats.refused == {evidence.REASON_ICS_CONNECT: 1}
+    assert b.gate_stats.accepted == {evidence.REASON_ICS_WRITE: 1, evidence.REASON_STUB_ACCEPT: 1}
+    assert b.gate_stats.refused == {evidence.REASON_ICS_INTERACTION: 2, evidence.REASON_ICS_CONNECT: 1}
+
+
+def test_enforce_mints_only_the_write_and_keeps_the_rest_as_observables():
+    names = ["modbus_fc43", "s7_szl", "iec104_connect", "snmp_set"]
+    sessions = [_conpot_session(n) for n in names]
+    for i, s in enumerate(sessions):           # one address each
+        s.src_ip = f"45.32.0.{i + 1}"
+        for e in s.events:
+            e.src_ip = s.src_ip
+    objs, b = _build({GATE: "enforce", DECOUPLED: "true"}, sessions)
+    ind = {o["id"] for o in objs if o.get("type") == "indicator"}
+    sighted = {o["sighting_of_ref"] for o in objs if o.get("type") == "sighting"}
+    for s in sessions:
+        has = attacker_ip_indicator_id(s.src_ip) in ind
+        assert has is bool(s.meta["ics"]["write"]), s.meta["ics"]["functions"]
+        assert _by_id(objs, attacker_ip_observable_id(s.src_ip)) is not None
+        assert attacker_ip_observable_id(s.src_ip) in sighted
 
 
 def test_emulator_rows_are_ics_not_credentials():

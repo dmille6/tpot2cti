@@ -110,6 +110,10 @@ INDUSTRIAL = frozenset({
 })
 
 LABEL_TARGETING = "targeting:ics"
+#: v1's generic label, beside targeting:ics.
+LABEL_GENERIC = "ics"
+#: v1: more than one industrial protocol from one address.
+LABEL_MULTI = "ics:multi-protocol"
 LABEL_INTERACTION = "ics:protocol-interaction"
 LABEL_WRITE = "ics:write-control"
 LABEL_SCANNER = "scanner:research"
@@ -273,6 +277,39 @@ CONTROL_MODBUS_DIAG = frozenset({0x01, 0x04, 0x0A})
 WRITE_UMAS = frozenset({0x23, 0x25, 0x33, 0x34, 0x35, 0x40, 0x41})
 
 
+#: PDU body length (bytes after the function code) per request function:
+#: exact for the fixed-length requests, a minimum for the variable ones.
+_MB_EXACT = {1: 4, 2: 4, 3: 4, 4: 4, 5: 4, 6: 4, 7: 0, 11: 0, 12: 0, 17: 0,
+             22: 6, 24: 2}
+_MB_MIN = {8: 4, 15: 6, 16: 7, 20: 8, 21: 8, 23: 11, 43: 3, 90: 2}
+
+
+def _modbus_body_ok(fc: int, pdu: bytes) -> bool:
+    """The request body is well formed for its function code: the declared
+    counts agree with the bytes (a header-only FC 6 is not a write)."""
+    n = len(pdu)
+    if fc in _MB_EXACT:
+        if n != _MB_EXACT[fc]:
+            return False
+        if fc == 5:
+            return _u16be(pdu, 2) in (0x0000, 0xFF00)
+        if fc in (1, 2, 3, 4):
+            return _u16be(pdu, 2) >= 1
+        return True
+    if fc not in _MB_MIN or n < _MB_MIN[fc]:
+        return False
+    if fc in (15, 16):
+        qty, count = _u16be(pdu, 2), pdu[4]
+        want = (qty + 7) // 8 if fc == 15 else 2 * qty
+        return qty >= 1 and count == n - 5 and count == want
+    if fc == 23:
+        wqty, count = _u16be(pdu, 6), pdu[8]
+        return wqty >= 1 and count == n - 9 and count == 2 * wqty
+    if fc in (20, 21):
+        return pdu[0] == n - 1
+    return True
+
+
 def classify_modbus(b: bytes) -> Finding:
     best = None
     i = 0
@@ -286,12 +323,18 @@ def classify_modbus(b: bytes) -> Finding:
         pdu = b[i + 8:i + 6 + ln]
         name = f"FC{fc} {MODBUS_FC.get(fc, 'function %d' % fc)}"
         tier = "interaction"
+        if not _modbus_body_ok(fc, pdu):
+            f = _f("modbus", "invalid", f"{name}: malformed body")
+            if best is None:
+                best = f
+            i += 6 + ln
+            continue
         if fc in WRITE_MODBUS_FC:
             tier = "write"
-        elif fc == 8 and len(pdu) >= 2 and _u16be(pdu, 0) in CONTROL_MODBUS_DIAG:
+        elif fc == 8 and _u16be(pdu, 0) in CONTROL_MODBUS_DIAG:
             tier = "write"
             name = f"FC8 Diagnostics sub {_u16be(pdu, 0)}"
-        elif fc == 90 and len(pdu) >= 2:
+        elif fc == 90:
             name = f"FC90 UMAS 0x{pdu[1]:02x}"
             if pdu[1] in WRITE_UMAS:
                 tier = "write"
@@ -312,7 +355,12 @@ S7_JOB = {
     0x1D: "Start Upload", 0x1E: "Upload", 0x1F: "End Upload",
     0x28: "PI Service", 0x29: "PLC Stop", 0xF0: "Setup Communication",
 }
-WRITE_S7_JOB = frozenset({0x05, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x28, 0x29})
+#: Write Var, the download sequence, PI service (start/copy), PLC stop. The
+#: upload sequence (0x1D-0x1F) READS the program from the PLC: interaction.
+WRITE_S7_JOB = frozenset({0x05, 0x1A, 0x1B, 0x1C, 0x28, 0x29})
+#: Minimum parameter length per job function (function byte included).
+_S7_MIN_PAR = {0x04: 2, 0x05: 2, 0x1A: 2, 0x1B: 2, 0x1C: 2, 0x1D: 2, 0x1E: 2,
+               0x1F: 2, 0x28: 8, 0x29: 8, 0xF0: 8}
 S7_UD_GROUP = {1: "Programmer commands", 2: "Cyclic data", 3: "Block functions",
                4: "CPU functions", 5: "Security", 6: "PBC", 7: "Time functions"}
 
@@ -320,12 +368,22 @@ S7_UD_GROUP = {1: "Programmer commands", 2: "Cyclic data", 3: "Block functions",
 def classify_s7(b: bytes) -> Finding:
     if len(b) < 7 or b[0] != 0x03:
         return _f("s7comm", "invalid", "not TPKT")
+    tpkt = _u16be(b, 2)
+    if not 7 <= tpkt <= len(b):
+        return _f("s7comm", "invalid", "bad TPKT length")
+    b = b[:tpkt]
     cotp_len = b[4]
     pdu_type = b[5] & 0xF0
+    if 5 + cotp_len > len(b):
+        return _f("s7comm", "invalid", "bad COTP length")
     if pdu_type == 0xE0:
+        if cotp_len < 6 or 5 + cotp_len != len(b):
+            return _f("s7comm", "invalid", "bad COTP CR length")
         return _f("s7comm", "handshake", "COTP Connect Request")
     if pdu_type != 0xF0:
         return _f("s7comm", "invalid", f"COTP type 0x{pdu_type:02x}")
+    if cotp_len != 2:
+        return _f("s7comm", "invalid", "bad COTP DT length")
     s = b[5 + cotp_len:]
     if not s:
         return _f("s7comm", "handshake", "COTP DT empty")
@@ -334,12 +392,20 @@ def classify_s7(b: bytes) -> Finding:
     if s[0] != 0x32 or len(s) < 10:
         return _f("s7comm", "invalid", "COTP DT non-S7")
     rosctr = s[1]
-    plen = _u16be(s, 6)
+    plen, dlen = _u16be(s, 6), _u16be(s, 8)
     hdr = 10 if rosctr in (1, 7) else 12
+    if hdr + plen + dlen != len(s):
+        return _f("s7comm", "invalid", "S7 lengths do not match the frame")
     par = s[hdr:hdr + plen]
     if rosctr == 1 and par:
         fn = par[0]
         name = S7_JOB.get(fn, f"job 0x{fn:02x}")
+        if fn not in S7_JOB or plen < _S7_MIN_PAR.get(fn, 1):
+            return _f("s7comm", "invalid", f"{name}: malformed")
+        if fn in (0x04, 0x05) and par[1] < 1:
+            return _f("s7comm", "invalid", f"{name}: no items")
+        if fn == 0x05 and dlen == 0:
+            return _f("s7comm", "invalid", "Write Var without data")
         if fn == 0xF0:
             return _f("s7comm", "handshake", "Setup Communication")
         if fn in WRITE_S7_JOB:
@@ -442,9 +508,12 @@ def classify_enip(b: bytes) -> Finding:
         return _f("enip", "invalid", f"command 0x{cmd:04x}")
     if cmd in (0x0000, 0x0065, 0x0066):
         return _f("enip", "handshake", name)
+    declared = _u16le(b, 2)
+    if 24 + declared > len(b):
+        return _f("enip", "invalid", "encapsulation length exceeds the frame")
     if cmd in (0x0004, 0x0063, 0x0064):
         return _f("enip", "interaction", name)
-    data = b[24:24 + _u16le(b, 2)]
+    data = b[24:24 + declared]
     if len(data) >= 8:
         count = _u16le(data, 6)
         j = 8
@@ -456,12 +525,13 @@ def classify_enip(b: bytes) -> Finding:
             if itype in (0x00B2, 0x00B1):
                 msg = item[2:] if itype == 0x00B1 else item
                 svc = _cip_service(msg)
-                if svc is not None:
+                if svc is not None and len(msg) >= 2:
                     if svc in WRITE_CIP:
                         return _f("enip", "write", f"{name} CIP {WRITE_CIP[svc]}")
                     return _f("enip", "interaction", f"{name} CIP 0x{svc:02x}")
             j += 4 + ilen
-    return _f("enip", "interaction", name)
+    # SendRRData / SendUnitData with no CIP request inside: nothing was asked.
+    return _f("enip", "invalid", f"{name} without a CIP request")
 
 
 _ENIP_TEXT = re.compile(r"cmd=(0x[0-9a-fA-F]+|\d+)")
@@ -481,6 +551,11 @@ def classify_enip_text(text: str) -> Finding:
         return _f("enip", "invalid", f"command 0x{cmd:04x}")
     if cmd in (0x0000, 0x0065, 0x0066):
         return _f("enip", "handshake", name)
+    ln = re.search(r"len=(\d+)", text)
+    if cmd in (0x006F, 0x0070) and (ln is None or int(ln.group(1)) < 10):
+        # interface handle, timeout, item count and two item headers: an
+        # encapsulation shorter than that carries no CIP request
+        return _f("enip", "invalid", f"{name} without a CIP request")
     h = _ENIP_CIP_HINT.search(text)
     if h:
         svc = int(h.group(1), 0) & 0x7F
@@ -559,19 +634,56 @@ DNP3_APP_FC = {0: "Confirm", 1: "Read", 2: "Write", 3: "Select", 4: "Operate",
                20: "Enable Unsolicited", 21: "Disable Unsolicited",
                22: "Assign Class", 23: "Delay Measurement", 27: "Delete File",
                31: "Activate Configuration"}
-WRITE_DNP3 = frozenset({2, 3, 4, 5, 6, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 31})
+#: Write, select/operate, restarts, initialise/start/stop application,
+#: save configuration, (dis)able unsolicited, assign class, delete file,
+#: activate configuration.
+WRITE_DNP3 = frozenset({2, 3, 4, 5, 6, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 31})
 _DNP3_LINK = {0: "Reset Link States", 2: "Test Link States", 9: "Request Link Status"}
+
+
+def dnp3_crc(data: bytes) -> int:
+    """DNP3 link-layer CRC-16 (polynomial 0x3D65, reflected, complemented)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA6BC if crc & 1 else crc >> 1
+    return (~crc) & 0xFFFF
+
+
+#: The emulators keep the first 120 bytes of a request.
+_TRUNCATED_AT = 120
 
 
 def classify_dnp3(b: bytes) -> Finding:
     if len(b) < 10 or b[0:2] != b"\x05\x64":
         return _f("dnp3", "invalid", "no 0x0564 link frame")
-    lfc = b[3] & 0x0F
-    if lfc in (3, 4) and len(b) > 12:
+    ln, ctrl = b[2], b[3]
+    if ln < 5:
+        return _f("dnp3", "invalid", "link length below 5")
+    if dnp3_crc(b[0:8]) != int.from_bytes(b[8:10], "little"):
+        return _f("dnp3", "invalid", "link header CRC mismatch")
+    if not ctrl & 0x40:
+        return _f("dnp3", "invalid", "secondary (outstation) frame from a client")
+    user = ln - 5
+    expected = 10 + user + 2 * ((user + 15) // 16)
+    if len(b) < expected and len(b) < _TRUNCATED_AT:
+        return _f("dnp3", "invalid", "frame shorter than its link length")
+    lfc = ctrl & 0x0F
+    if lfc in (3, 4):
+        block = b[10:10 + min(16, user)]
+        crc_at = 10 + len(block)
+        if user < 3 or len(b) < crc_at + 2 \
+                or dnp3_crc(block) != int.from_bytes(b[crc_at:crc_at + 2], "little"):
+            return _f("dnp3", "invalid", "user data CRC mismatch")
+        if not b[10] & 0x40:
+            return _f("dnp3", "invalid", "transport segment without FIR")
         fc = b[12]
         name = f"app FC{fc} {DNP3_APP_FC.get(fc, '')}".rstrip()
         return _f("dnp3", "write" if fc in WRITE_DNP3 else "interaction", name)
-    return _f("dnp3", "handshake", f"link {_DNP3_LINK.get(lfc, 'function %d' % lfc)}")
+    if lfc in _DNP3_LINK and user == 0:
+        return _f("dnp3", "handshake", f"link {_DNP3_LINK[lfc]}")
+    return _f("dnp3", "invalid", f"link function {lfc}")
 
 
 # ---------------------------------------------------------------------------
@@ -586,20 +698,26 @@ WRITE_OPCUA = {673: "WriteRequest", 712: "CallRequest", 488: "AddNodesRequest",
 
 def classify_opcua(b: bytes) -> Finding:
     head = b[:3]
-    if head in (b"HEL", b"OPN", b"CLO", b"RHE"):
-        return _f("opcua", "handshake", head.decode())
-    if head != b"MSG":
+    if head not in (b"HEL", b"OPN", b"CLO", b"RHE", b"MSG") or len(b) < 8:
         return _f("opcua", "invalid", "no OPC UA message header")
-    if len(b) < 27:
-        return _f("opcua", "interaction", "MSG")
-    enc = b[24]
+    size = int.from_bytes(b[4:8], "little")
+    if size < 8 or (size > len(b) and len(b) < _TRUNCATED_AT):
+        return _f("opcua", "invalid", "message size does not match the bytes")
+    if head != b"MSG":
+        return _f("opcua", "handshake", head.decode())
+    m = b[:size]
+    if size < 27 or len(m) < 27:
+        return _f("opcua", "invalid", "MSG too short for a service request")
+    enc = m[24]
     node = None
     if enc == 0x00:
-        node = b[25]
-    elif enc == 0x01 and len(b) >= 28:
-        node = _u16le(b, 26)
-    elif enc == 0x02 and len(b) >= 31:
-        node = int.from_bytes(b[27:31], "little")
+        node = m[25]
+    elif enc == 0x01 and len(m) >= 28 and m[25] == 0:
+        node = _u16le(m, 26)
+    elif enc == 0x02 and len(m) >= 31 and _u16le(m, 25) == 0:
+        node = int.from_bytes(m[27:31], "little")
+    if node is None:
+        return _f("opcua", "invalid", "service NodeId not in namespace 0")
     if node in WRITE_OPCUA:
         return _f("opcua", "write", f"MSG {WRITE_OPCUA[node]}")
     return _f("opcua", "interaction", f"MSG service {node}")
@@ -619,6 +737,9 @@ _HARTIP_MSG = {0: "Session Initiate", 1: "Session Close", 2: "Keep Alive",
 def classify_hartip(b: bytes) -> Finding:
     if len(b) < 8 or b[0] not in (1, 2):
         return _f("hartip", "invalid", "no HART-IP header")
+    count = _u16be(b, 6)
+    if count < 8 or (count > len(b) and len(b) < _TRUNCATED_AT):
+        return _f("hartip", "invalid", "byte count does not match the bytes")
     mid = b[2]
     name = _HARTIP_MSG.get(mid, f"message {mid}")
     if mid in (0, 1, 2):
@@ -690,6 +811,9 @@ def classify_kamstrup_mgmt(text: str) -> Finding:
 
 
 def classify_guardian(event_type: str, request) -> Finding:
+    """ConPot logs ``AST <request[1:7]>`` for ANY input on the port, so an SSH
+    banner reads ``AST SH-2.0``: only ``S`` + five digits is a set command
+    and ``I`` + five digits an inquiry; anything else is not ATG."""
     code = ""
     if event_type and str(event_type).startswith("AST "):
         code = str(event_type)[4:].strip()
@@ -697,9 +821,9 @@ def classify_guardian(event_type: str, request) -> Finding:
         code = str(request).strip().lstrip("\x01").strip()
     if not code:
         return _f("guardian_ast", "connect")
-    if code[:1] in ("S", "s"):
+    if re.fullmatch(r"[Ss]\d{5}", code[:6]):
         return _f("guardian_ast", "write", f"ATG {code[:6]}")
-    if code[:1] in ("I", "i"):
+    if re.fullmatch(r"[Ii]\d{5}", code[:6]):
         return _f("guardian_ast", "interaction", f"ATG {code[:6]}")
     return _f("guardian_ast", "invalid", "not an ATG command")
 
@@ -761,6 +885,8 @@ def classify_conpot(doc: dict) -> Finding:
             return _f("snmp", "connect")
         oid = _snmp_oid(request)
         name = f"SNMP {op}" + (f" {oid}" if oid else "")
+        if op == "set" and not oid:
+            return _f("snmp", "invalid", "SNMP set without a parsed OID")
         return _f("snmp", "write" if op == "set" else "interaction", name)
     if proto == "guardian_ast":
         return classify_guardian(event_type, request)
@@ -782,10 +908,10 @@ def classify_conpot(doc: dict) -> Finding:
         return _f("http", "interaction", f"HTTP {m.group(1) if m else ''}".strip())
     if proto == "ftp":
         b = payload_bytes(request)
-        if b:
-            return _f("ftp", "interaction",
-                      "FTP " + b.split(b" ", 1)[0].strip().decode("latin-1")[:12].upper())
-        return _f("ftp", "invalid", "not FTP")
+        verb = b.split(b" ", 1)[0].strip().decode("latin-1") if b else ""
+        if verb.isascii() and verb.isalpha():
+            return _f("ftp", "interaction", "FTP " + verb[:12].upper())
+        return _f("ftp", "invalid", "not an FTP command")
     if proto == "enip" and isinstance(request, str) and "cmd=" in request:
         return classify_enip_text(request)
     if proto == "kamstrup-management":
@@ -890,19 +1016,34 @@ def summarize(findings: Iterable[Finding]) -> dict:
     }
 
 
+def multi_protocol(protocols: Iterable[str]) -> bool:
+    """Two or more distinct INDUSTRIAL protocols (kamstrup meter and
+    management count once)."""
+    fam = {("kamstrup" if p.startswith("kamstrup") else p) for p in protocols if p in INDUSTRIAL}
+    return len(fam) >= 2
+
+
 def session_labels(summary: Optional[dict]) -> list[str]:
-    """ICS labels for a session summary: ``targeting:ics`` for any touch,
-    ``ics:<protocol>`` only for protocols with a VALID request (never for a
-    port touch), ``ics:protocol-interaction`` for an industrial request
-    beyond the handshake, ``ics:write-control`` for a write, and the
-    research-scanner labels when the source was classified as one."""
+    """ICS labels for a session summary: ``targeting:ics`` and ``ics`` for
+    any touch of an industrial protocol (v1's pair), ``ics:<protocol>`` only
+    for protocols with a VALID request (never for a port touch),
+    ``ics:multi-protocol`` for two or more valid industrial protocols,
+    ``ics:protocol-interaction`` for an industrial request beyond the
+    handshake, ``ics:write-control`` for a write, and the research-scanner
+    labels when the source was classified as one. One ConPot session is one
+    protocol; the builder adds ``ics:multi-protocol`` per ADDRESS across the
+    bundle (multi_protocol())."""
     if not summary:
         return []
-    out = [LABEL_TARGETING]
+    # targeting:ics / ics only when an INDUSTRIAL protocol was touched: an
+    # HTTP .env scanner or an FTP brute-forcer on the emulator is not ICS.
+    out = [LABEL_TARGETING, LABEL_GENERIC] if summary.get("industrial_tier") else []
     for p in summary.get("valid_protocols") or ():
         lab = PROTOCOL_LABELS.get(p)
         if lab and lab not in out:
             out.append(lab)
+    if multi_protocol(summary.get("valid_protocols") or ()):
+        out.append(LABEL_MULTI)
     if summary.get("industrial_tier") in ("interaction", "write"):
         out.append(LABEL_INTERACTION)
     if summary.get("write"):

@@ -42,14 +42,27 @@ to `session.commands`.
 
 See the module docstring and tables in `tpot2cti/ics.py`. Write/control:
 Modbus FC 5/6/15/16/21/22/23, FC 8 restart/listen-only/clear, UMAS write,
-download, start, stop; S7 Write Var, download/upload, PI service, PLC stop;
+download, start, stop; S7 Write Var, the download sequence, PI service, PLC
+stop (the upload sequence reads the program: interaction);
 IEC-104 command ASDUs 45-51 and 58-64, reset process, parameter loading, with
 activation/deactivation cause and a valid APCI (bytes that are HTTP or TLS are
 `invalid`, never a command); SNMP Set; BACnet WriteProperty(Multiple), file and
 list writes, object create/delete, DeviceCommunicationControl,
 ReinitializeDevice, WriteGroup; CIP Set_Attribute*, Write_Tag*, Reset, Start,
 Stop, Create, Delete (including inside Unconnected_Send); Kamstrup management
-set/restart/connect commands; Guardian AST `S` codes.
+set/restart/connect commands; Guardian AST `S` + five digits (ConPot logs
+`AST <request[1:7]>` for any input, so anything else is `invalid`); DNP3
+write, select/operate, restarts, application start/stop, assign class;
+SNMP Set with a parsed OID.
+
+Validity is checked before a tier is given: declared lengths against the
+bytes and the minimum function-specific body (a header-only Modbus FC 6, a
+byte count that disagrees, an S7 frame whose TPKT/COTP/S7 lengths disagree,
+Write Var without data, PI service without its parameters are `invalid`);
+DNP3 link length, header and first-block CRCs, PRM and transport FIR; ENIP
+declared length and a CIP request inside SendRRData/SendUnitData; OPC UA
+message size and a namespace-0 service NodeId; HART-IP byte count; FTP
+verbs must be alphabetic.
 
 ## ICS emulators logged as Heralding
 
@@ -67,11 +80,15 @@ and the builder emits them as ICS sessions ("ICS Emulator Probe", family label
 As every protocol session (`_build_protocol_session`): the attacker graph,
 a Note with the raw requests, the "ICS/SCADA protocol interaction"
 AttackPattern. ICS labels on the observable and the Indicator (v1 spellings):
-`targeting:ics` for any session; `ics:modbus`, `ics:s7`, `ics:iec104`,
+`targeting:ics` and `ics` for any session that touched an industrial protocol
+(not for HTTP/FTP/SNMP/IPMI alone); `ics:modbus`, `ics:s7`, `ics:iec104`,
 `ics:ethernet-ip`, `ics:bacnet`, `ics:dnp3`, `ics:opc-ua`, `ics:hart-ip`,
 `ics:ge-srtp`, `ics:veeder-root`, `ics:kamstrup`, `ics:snmp` only for a
 protocol with a valid request (never for a port touch);
-`ics:protocol-interaction` for an industrial request beyond the handshake;
+`ics:multi-protocol` when one address used two or more industrial protocols
+(across the bundle: the builder puts the union of an address's ICS labels on
+its observable and Indicator); `ics:protocol-interaction` for an industrial
+request beyond the handshake;
 `ics:write-control` (and +30 score) for a write; `scanner:research` and
 `scanner:<vendor>` for a research scanner. The descriptions state the depth,
 the functions, the writes and the scanner basis.
