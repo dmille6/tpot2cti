@@ -170,3 +170,39 @@ def test_publisher_ceiling_is_on_by_default_and_can_be_opted_out():
     c = _Client()
     Publisher(c, state=None, redactor=False, score_ceiling=False).publish([_ind(CF, 80)], cycle_id="x")
     assert _sent(c, _ind(CF)["id"])["x_opencti_score"] == 80
+
+
+def test_stateful_duplicate_records_the_capped_score_not_a_variant(tmp_path):
+    """Codex review 2026-10-03: object_max_state was staged per variant
+    BEFORE the dedup, so a duplicate whose last variant had no scanner label
+    recorded its uncapped 85, and the next cycle's max(score) merge restored
+    85. Staged after the final cap, the state holds 25 and the union labels."""
+    from tpot2cti.state import CycleState
+    state = CycleState(db_path=tmp_path / "state.db")
+    c = _Client()
+    pub = Publisher(c, state=state, redactor=False)
+    oid = _ind(PLAIN)["id"]
+    pub.publish([_ind(PLAIN, 60, labels=["scanner:research"]), _ind(PLAIN, 85)], cycle_id="1")
+    assert _sent(c, oid)["x_opencti_score"] == 25
+    row = state.get_max_state_bulk([oid])[oid]
+    assert row["max_score"] == 25
+    assert "scanner:research" in row["labels"]
+
+    pub.publish([_ind(PLAIN, 90)], cycle_id="2")          # no label this time
+    out = _sent(c, oid)
+    assert out["x_opencti_score"] == 25 and "scanner:research" in out["labels"]
+    assert state.get_max_state_bulk([oid])[oid]["max_score"] == 25
+
+
+def test_stateful_non_capped_duplicates_keep_todays_merge(tmp_path):
+    """Objects the ceiling does not touch: the recorded score is still the
+    max of the emission and the persisted one."""
+    from tpot2cti.state import CycleState
+    state = CycleState(db_path=tmp_path / "state.db")
+    c = _Client()
+    pub = Publisher(c, state=state, redactor=False)
+    oid = _ind(PLAIN)["id"]
+    pub.publish([_ind(PLAIN, 70)], cycle_id="1")
+    pub.publish([_ind(PLAIN, 40), _ind(PLAIN, 55)], cycle_id="2")
+    assert _sent(c, oid)["x_opencti_score"] == 70
+    assert state.get_max_state_bulk([oid])[oid]["max_score"] == 70

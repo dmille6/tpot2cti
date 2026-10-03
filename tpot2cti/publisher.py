@@ -371,20 +371,10 @@ class Publisher:
                         obj["x_opencti_labels"] = merged_labels
                 # Ceiling AFTER the merge (scanners, CDN edges): the merge
                 # just restored any higher persisted score and unioned the
-                # persisted labels, so this is the last word, and the capped
-                # value is what object_max_state records.
+                # persisted labels. Applied again after the bundle dedup
+                # below, which is where object_max_state is staged.
                 if self.score_ceiling is not None:
                     self.score_ceiling.apply(obj)
-                # Stage the new persisted state with the merged values.
-                # The score we record is the max(current, persisted).
-                final_score = obj.get("x_opencti_score")
-                merged_state_updates.append((
-                    oid,
-                    final_score if isinstance(final_score, int) else None,
-                    list(obj.get("labels") or obj.get("x_opencti_labels") or []),
-                    obj.get("name"),
-                    obj.get("description"),
-                ))
             if n_promoted:
                 logger.info(
                     f"[{cycle_id}] Cross-cycle merge: restored {n_promoted} "
@@ -409,6 +399,25 @@ class Publisher:
                     "[%s] score ceiling %d applied: %s", cycle_id,
                     self.score_ceiling.ceiling,
                     dict(sorted(self.score_ceiling.counts.items())))
+
+        # Stage the persisted state from the FINAL objects: after the merge,
+        # the bundle dedup and the last ceiling pass. Staged per variant
+        # before the dedup, a duplicate id recorded whichever variant came
+        # last -- possibly with its uncapped score, which the next cycle's
+        # max(score) merge would then restore.
+        if self.state is not None and objects:
+            for obj in deduped:
+                oid = obj.get("id")
+                if not oid:
+                    continue
+                final_score = obj.get("x_opencti_score")
+                merged_state_updates.append((
+                    oid,
+                    final_score if isinstance(final_score, int) else None,
+                    list(obj.get("labels") or obj.get("x_opencti_labels") or []),
+                    obj.get("name"),
+                    obj.get("description"),
+                ))
         after = len(deduped)
         if before > 0:
             reduction_pct = 100.0 * (before - after) / before
