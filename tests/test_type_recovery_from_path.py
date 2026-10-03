@@ -111,7 +111,7 @@ def test_the_counter_reaches_the_cycle_summary():
     costume."""
     import inspect
     from tpot2cti import main
-    src = inspect.getsource(main.run_cycle)
+    src = inspect.getsource(main._run_cycle_locked)  # run_cycle is the lease wrapper
     assert "TYPE_RECOVERIES.clear()" in src, "counter is never reset per cycle"
     assert "type_recoveries" in src, "recoveries are absent from the cycle summary"
 

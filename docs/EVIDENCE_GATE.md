@@ -69,42 +69,81 @@ reach `/health`.
 
 ## 3. Sighting grain
 
-**Today's grain (`legacy`), exactly.** A Sighting's id is
-`generate_sighting_id(sensor, "<target>:<YYYY-MM-DD>", discriminator)`
-(`STIXBuilder._sighting_id`), where the day is the UTC date of the
-session's `first_seen`. `target` is the attacker's IP Indicator (no
-discriminator) or its IP observable (discriminator `ipv4`, also used for
-IPv6 observables). So one address on one sensor on one UTC day has **at
-most two Sightings, whatever honeypot types it touched**. Within a bundle,
-later sessions fold into the one kept (`_merge_or_emit_sighting`):
+**Today's grain (`legacy`), exactly (since 2026-10-03).** A Sighting's id is
+`generate_sighting_id(sensor, "<target>", discriminator)`
+(`STIXBuilder._sighting_id`): **one per sensor and target, with no day**.
+`target` is the attacker's IP Indicator (no discriminator) or its IP
+observable (discriminator `ipv4`, also used for IPv6 observables). So one
+address on one sensor has **at most two Sightings, whatever honeypot types it
+touched**. Within a bundle, later sessions fold into the one kept
+(`_merge_or_emit_sighting`):
 
-- `count` is the day's authoritative total from ES (`daily_event_counts`:
-  every document for that `src_ip`, `t-pot_hostname` and day, all types except
-  `TPOT2CTI_IGNORE_TYPES`), taking the maximum across sessions, when ES
+- `count` is **this window's events** (a delta): ES's count for that
+  `src_ip` and `t-pot_hostname` over `[window_start, window_end)`, all types
+  except `TPOT2CTI_IGNORE_TYPES`, taking the maximum across sessions, when ES
   returned one. Otherwise it is the sum over distinct sessions of each
   builder's per-session count: `event_count`, or 1 for a Suricata alert.
-- `first_seen` and `last_seen` span every folded session.
+- `first_seen` and `last_seen` span every folded session; `last_seen` is then
+  floored strictly after `window_start` and after the latest `last_seen`
+  ever written for that id (`finalize_sighting_counts`).
 - `description` is up to five distinct per-session lines, then
-  `(+N further session(s) this day)`. Only the Cowrie, Honeytrap and
-  fallback builders write a line. Suricata and drive-by sessions add to the
-  count but not to the text, so a Sighting whose count covers Cowrie,
-  Suricata and Heralding reads only "Cowrie SSH …".
+  `(+N further session(s) in this window)`. Only the Cowrie, Honeytrap and
+  fallback builders write a line.
 
-A session that crosses midnight stays on the day it started. Across cycles,
-OpenCTI upserts by id and replaces `count` and `description`.
+**Why deltas (OpenCTI's sighting upsert, read from the 7.260609.0 source and
+confirmed live on 2026-10-03).** An incoming Sighting matches a stored one by
+id, or by the same `(sighting_of, where_sighted)` pair with `first_seen` and
+`last_seen` each within ±30 days (`relations_deduplication`). If the write
+widens the stored `first_seen`/`last_seen`, OpenCTI **adds** its count to the
+stored one; otherwise it **replaces** it. Until 2026-10-03 the id carried the
+UTC day and the count was the day's running total: every day's id merged onto
+one stored object per pair, and every cycle widened `last_seen`, so OpenCTI
+summed the running totals (one Sighting reached 205,973,057 against 11.6M
+events). Now every write widens (the floor) and carries only events no clean
+cycle has counted (the cursor advances only on a clean publish).
 
-**`sensor-ip-day`.** The ids, counts and windows stay the same (the id
-grain already is one per sensor, address and day, and DR-02 rejected
-per-type Sightings). The description starts with one line:
+**Retries, rewinds, backfills (state.db ledger).**
+- `sighting_counted` holds the time ranges of windows that published
+  **cleanly** (kept for ever, merged). A cycle counts only the parts of its
+  window outside them (`main.sighting_count_scope`): a re-run or a rewind
+  inside published windows writes no count; a rewind off a window boundary
+  counts only the uncounted tail; a skipped window read later (below the
+  counted frontier) is counted, with `last_seen` floored after what OpenCTI
+  stores (read back by id), so it still adds. If that read-back fails,
+  nothing is written.
+- `sighting_sent` rows are written before publishing (`status='sent'`) and
+  deleted when the window publishes cleanly. A retry over the same
+  `window_start` subtracts what the unclean attempt landed (OpenCTI's
+  stored `last_seen` says whether it did). While such rows exist, a cycle
+  over **any other** window is **rejected**: logged at ERROR, publish
+  withheld, cursor kept, nothing written. Set `last_run` back to the logged
+  `window_start` to resolve it.
+- `sighting_last_sent` keeps the latest `last_seen` ever written per id.
+- `cycle_lease`: `run_cycle` holds a single-writer lease (renewed on every
+  heartbeat, checked before the ledger write and before the cursor moves).
+  A second process raises `CycleLeaseHeld` and touches nothing.
+
+**Before the first cycle of this code**, every existing Sighting needs the
+new stable id (`stix_ids.stable_sighting_id`) as an alias: OpenCTI's ±30-day
+match fails for objects whose `first_seen` is older than 30 days, and the
+first new write would otherwise mint a second Sighting. The ops migration
+(`migrate_sighting_ids.py`) does that with the core stopped.
+
+Counters: `sightings` in the cycle summary and the `sighting_counts` log line.
+
+**`sensor-ip-day`.** The ids, counts and windows stay the same (DR-02
+rejected per-type Sightings). The description starts with one line:
 
 ```
 Types seen from this address on this sensor this UTC day: Cowrie, Heralding, Suricata
 ```
 
 followed by today's per-session lines. The list joins the types seen in this
-bundle with the day's types from ES. In this mode only, the counts
-aggregation carries a `terms` sub-aggregation on `type.keyword` (size 64), so
-a narrow later cycle cannot shrink a list that OpenCTI replaces on upsert.
+bundle with the day's types from ES. In this mode only, a second
+aggregation over `[UTC day start, window_end)` carries a `terms`
+sub-aggregation on `type.keyword` (size 64), so a narrow later cycle cannot
+shrink a list that OpenCTI replaces on upsert. It feeds the description only,
+never the count.
 Time that query (M4) before switching the mode on.
 
 **Switch the grain at a UTC day boundary**, in either direction. The

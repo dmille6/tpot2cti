@@ -257,7 +257,7 @@ def direct_bundle(env_overrides: dict | None = None, *, builder=None):
     """Build every direct session through its dual-sighting site."""
     cfg = make_cfg(env_overrides)
     b = builder or _fixed_builder(cfg)
-    b.daily_event_counts = {(DIRECT_IP_HT, DIRECT_SENSOR, DIRECT_DAY): 77}
+    b.window_event_counts = {(DIRECT_IP_HT, DIRECT_SENSOR): 77}
     objs: list[dict] = []
     for method, session in direct_sessions():
         with b.session_context(session):

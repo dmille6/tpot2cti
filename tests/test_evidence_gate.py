@@ -419,21 +419,18 @@ def test_grain_keeps_todays_ids_and_counts_and_lists_the_types():
     assert [(s["first_seen"], s["last_seen"]) for s in ls] == \
         [(s["first_seen"], s["last_seen"]) for s in gs]
 
+    # Since 2026-10-03 a Sighting is one per (sensor, target), no day: the
+    # 03-07 and 03-08 sessions of DIRECT_IP fold into ONE per side.
     obs = attacker_ip_observable_id(H.DIRECT_IP)
-    day1 = [s for s in gs if s["sighting_of_ref"] == obs
-            and s["first_seen"].startswith(H.DIRECT_DAY)]
-    assert len(day1) == 1, "Cowrie, Suricata and Heralding: ONE sighting per side"
-    lines = day1[0]["description"].splitlines()
+    side = [s for s in gs if s["sighting_of_ref"] == obs]
+    assert len(side) == 1, "Cowrie, Suricata and Heralding: ONE sighting per side"
+    lines = side[0]["description"].splitlines()
     assert lines[0].endswith(": Cowrie, Heralding, Suricata")
     # Today's per-session lines follow unchanged.
-    legacy_day1 = [s for s in ls if s["id"] == day1[0]["id"]][0]
-    assert lines[1:] == legacy_day1["description"].splitlines()
+    legacy_side = [s for s in ls if s["id"] == side[0]["id"]][0]
+    assert lines[1:] == legacy_side["description"].splitlines()
     # ...and today's text named Cowrie alone, which is the defect.
-    assert "Suricata" not in legacy_day1["description"]
-
-    day2 = [s for s in gs if s["sighting_of_ref"] == obs
-            and s["first_seen"].startswith("2026-03-08")]
-    assert day2[0]["description"].splitlines()[0].endswith(": Cowrie")
+    assert "Suricata" not in legacy_side["description"]
 
 
 def test_grain_gives_a_description_to_sightings_that_had_none():
@@ -450,8 +447,7 @@ def test_grain_folds_in_the_days_types_from_es():
     b.daily_event_types = {(H.DIRECT_IP, H.DIRECT_SENSOR, H.DIRECT_DAY): ["Ciscoasa", "Cowrie"]}
     objs, _ = H.direct_bundle({GRAIN: "sensor-ip-day"}, builder=b)
     obs = attacker_ip_observable_id(H.DIRECT_IP)
-    s = [x for x in _sightings(objs) if x["sighting_of_ref"] == obs
-         and x["first_seen"].startswith(H.DIRECT_DAY)][0]
+    s = [x for x in _sightings(objs) if x["sighting_of_ref"] == obs][0]
     assert s["description"].splitlines()[0].endswith(
         ": Ciscoasa, Cowrie, Heralding, Suricata")
 
@@ -491,9 +487,11 @@ class _TypesES(H.FakeES):
 
 def test_only_grain_mode_widens_the_counts_query(tmp_path):
     es, _, _ = _cycle_with_es(tmp_path / "a", {}, _TypesES)
-    assert es.types_kw == [False], "legacy grain must send today's query"
+    assert es.types_kw == [False], "legacy grain must send only the count query"
+    # Grain mode: the window COUNT query is unchanged, and a separate
+    # day-range query collects the types for the description.
     es, _, _ = _cycle_with_es(tmp_path / "b", {GRAIN: "sensor-ip-day"}, _TypesES)
-    assert es.types_kw == [True]
+    assert es.types_kw == [False, True]
 
 
 # ---------------------------------------------------------------------------

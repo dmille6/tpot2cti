@@ -46,6 +46,7 @@ import threading
 import time
 import ipaddress
 import traceback
+import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -286,6 +287,153 @@ def _doc_timestamp(doc):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
+def fold_window_counts(by_day: dict) -> dict:
+    """``{(src_ip, sensor, day): n}`` -> ``{(src_ip, sensor): n}``.
+
+    TpotESClient.daily_event_counts buckets by UTC day; a Sighting is one
+    per (sensor, target), so a window that spans midnight sums its days."""
+    out: dict = {}
+    for key, n in (by_day or {}).items():
+        if not isinstance(key, tuple) or len(key) < 2 or not isinstance(n, int):
+            continue
+        k = (key[0], key[1])
+        out[k] = out.get(k, 0) + n
+    return out
+
+
+def sighting_count_scope(state, window_start: datetime, window_end: datetime) -> dict:
+    """Which events of [window_start, window_end) still go into Sighting
+    counts, decided BEFORE the counts query.
+
+      mode "forward":  the whole window is uncounted and at/after the counted
+                       frontier (every ordinary cycle, and a retry).
+      mode "none":     every part of the window is already counted (a
+                       re-run, a rewind inside published windows): no
+                       Sighting count is written.
+      mode "backfill": part of the window is counted (a rewind off a window
+                       boundary), or it lies below the frontier (a gap being
+                       backfilled): only ``parts`` are counted, from ES only,
+                       and floors come from OpenCTI as well as the ledger.
+      mode "reject":   an UNCLEAN attempt over another window is unresolved
+                       (the cursor was moved after an unclean publish). Its
+                       landed share cannot be told apart per window, so
+                       nothing is written: publish withheld, cursor kept,
+                       logged. Resolve by setting last_run back to that
+                       window_start.
+
+    The counted intervals hold only windows that published CLEANLY, kept
+    for ever, so pre-publish or crashed attempts are never subtracted and
+    no rewind is too old.
+    """
+    ws_iso = window_start.isoformat()
+    unclean = [w for w in state.unclean_sighting_windows() if w != ws_iso]
+    if unclean:
+        return {"mode": "reject", "parts": [],
+                "reason": f"unresolved unclean attempt(s) over window_start "
+                          f"{sorted(unclean)[:3]}; set last_run back to it"}
+    parts = state.uncounted_parts(window_start, window_end)
+    frontier = state.counted_frontier()
+    if not parts:
+        return {"mode": "none", "parts": [], "reason": "window already counted"}
+    whole = parts == [(window_start, window_end)] or (
+        len(parts) == 1 and parts[0][0] == window_start and parts[0][1] == window_end)
+    if whole and (frontier is None or window_start >= frontier):
+        return {"mode": "forward", "parts": parts, "reason": ""}
+    return {"mode": "backfill", "parts": parts,
+            "reason": "partly counted" if not whole else "below the counted frontier"}
+
+
+def fold_parts_counts(es, parts, **kwargs) -> dict:
+    """Window counts over several sub-ranges, folded to (src_ip, sensor)."""
+    out: dict = {}
+    for a, b in parts:
+        for k, n in fold_window_counts(es.daily_event_counts(a, b, **kwargs)).items():
+            out[k] = out.get(k, 0) + n
+    return out
+
+
+def sighting_plan_for_window(state, window_start: datetime, sighting_ids,
+                             lookup, *, platform_floors: bool = False) -> tuple:
+    """``(replay, stats, error)`` for the builder's ``sighting_replay``.
+
+    Per id, ``SightingReplay(base, last_seen)``:
+
+      * ``last_seen``: the floor source -- the latest last_seen tpot2cti ever
+        wrote for the id (sighting_last_sent) and, with ``platform_floors``
+        (backfill mode), the last_seen OpenCTI stores, which can be later
+        than anything in the ledger for objects older than this code.
+      * ``base``: events of THIS window OpenCTI already holds because an
+        earlier UNCLEAN attempt over the same window_start landed. ``lookup``
+        (OpenCTIClient.sighting_last_seen) tells: stored last_seen >= the
+        last_seen that attempt wrote means it landed (each write is floored
+        after every earlier one, so this is unambiguous). Landed: OpenCTI
+        holds its window_total; not landed: only its own ``base``. Lookup
+        unavailable: assume landed (may under-count one window; never
+        inflates).
+
+    ``error`` is set when backfill floors cannot be read: the caller then
+    writes nothing (a write that does not widen would REPLACE).
+    """
+    from tpot2cti.stix.builder import SightingReplay, _trunc_ms
+    stats = {"retried_sightings": 0, "landed": 0, "not_landed": 0,
+             "assumed_landed": 0, "ledger_floors": 0, "platform_floors": 0}
+    ids = [i for i in dict.fromkeys(sighting_ids or ()) if i]
+    if not ids:
+        return {}, stats, None
+    same = state.sightings_sent_for_window(ids, window_start)
+    last = state.max_last_sent(ids)
+    stats["retried_sightings"] = len(same)
+
+    stored = None
+    need = list(ids) if platform_floors else list(same)
+    if need and lookup is not None:
+        try:
+            stored = lookup(need)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"sighting lookup failed ({exc})")
+            stored = None
+    if platform_floors and stored is None:
+        return {}, stats, "OpenCTI last_seen lookup unavailable for a backfill"
+
+    def _dt(v):
+        if not v:
+            return None
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+    replay = {}
+    for sid in ids:
+        base = 0
+        floors = []
+        if sid in same:
+            window_total, prev_base, sent_ls = same[sid]
+            sent_dt = _dt(sent_ls)
+            if stored is None:
+                landed = True
+                stats["assumed_landed"] += 1
+            else:
+                st = _dt(stored.get(sid))
+                landed = (st is not None and sent_dt is not None
+                          and _trunc_ms(st) >= _trunc_ms(sent_dt))
+                stats["landed" if landed else "not_landed"] += 1
+            base = (window_total if (landed and isinstance(window_total, int))
+                    else int(prev_base or 0))
+            if sent_dt:
+                floors.append(sent_dt)
+        if _dt(last.get(sid)):
+            floors.append(_dt(last.get(sid)))
+            stats["ledger_floors"] += 1
+        if platform_floors and stored is not None and _dt(stored.get(sid)):
+            floors.append(_dt(stored.get(sid)))
+            stats["platform_floors"] += 1
+        if base or floors:
+            replay[sid] = SightingReplay(base=base, last_seen=max(floors) if floors else None)
+    return replay, stats, None
+
+
 def _compute_window(
     state: CycleState, cfg: Config, now: datetime
 ) -> tuple[datetime, datetime]:
@@ -498,6 +646,18 @@ def _finish_ics_stats(stats: dict, builder) -> dict:
     }
 
 
+class CycleLeaseHeld(RuntimeError):
+    """Another process holds the cycle lease: this cycle did nothing."""
+
+
+#: Cycle lease time-to-live; renewed on every state.heartbeat(). The longest
+#: cycle measured on v2 is 4,972 s, and heartbeats come at least once per
+#: publisher pass and chunk wait.
+CYCLE_LEASE_TTL_S = 3600.0
+#: This process's lease identity.
+_LEASE_HOLDER = f"{os.uname().nodename}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
 def run_cycle(
     cfg: Config,
     state: CycleState,
@@ -508,6 +668,47 @@ def run_cycle(
     now: Optional[datetime] = None,
     benign_filter: Optional[BenignScannerFilter] = None,
     credential_store=None,  # Optional[CredentialStore]
+    lease_holder: Optional[str] = None,
+) -> dict:
+    """Run ONE importer cycle under the single-writer cycle lease.
+
+    The Sighting ledger (floors, counted intervals, unclean attempts) is
+    read before and written after a publish; two processes running cycles
+    against one state.db would read the same floors and overwrite each
+    other's rows. The lease (state.cycle_lease, BEGIN IMMEDIATE) admits one;
+    the other raises CycleLeaseHeld without reading ES or writing anything.
+    The lease is renewed on every heartbeat, checked again before the
+    ledger write and before the cursor moves, and released at the end.
+    """
+    holder = lease_holder or _LEASE_HOLDER
+    if not state.acquire_lease(holder, CYCLE_LEASE_TTL_S):
+        logger.error("cycle lease held by another process; this cycle is skipped")
+        raise CycleLeaseHeld("cycle lease held by another process")
+    state.lease_holder, state.lease_ttl_s = holder, CYCLE_LEASE_TTL_S
+    try:
+        return _run_cycle_locked(cfg, state, es, builder_factory, publisher,
+                                 now=now, benign_filter=benign_filter,
+                                 credential_store=credential_store,
+                                 lease_holder=holder)
+    finally:
+        state.lease_holder = None
+        try:
+            state.release_lease(holder)
+        except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+            logger.warning(f"could not release the cycle lease: {e}")
+
+
+def _run_cycle_locked(
+    cfg: Config,
+    state: CycleState,
+    es: TpotESClient,
+    builder_factory,        # callable () -> STIXBuilder (fresh per cycle)
+    publisher: Publisher,
+    *,
+    now: Optional[datetime] = None,
+    benign_filter: Optional[BenignScannerFilter] = None,
+    credential_store=None,  # Optional[CredentialStore]
+    lease_holder: Optional[str] = None,
 ) -> dict:
     """Run ONE importer cycle and return a summary dict.
 
@@ -966,48 +1167,75 @@ def run_cycle(
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
     builder = builder_factory()
-    # Authoritative per-day counts for the Sightings this cycle will emit.
-    # OpenCTI REPLACES a sighting's count on upsert rather than summing it
-    # (measured: one went 22,119 -> 3,484 when a later, narrower cycle
-    # re-covered part of the same day), so writing this cycle's slice would
-    # overwrite a fuller number with a smaller one. The day's own total is
-    # idempotent under replace and only grows as the day fills.
+    # Sighting counts are DELTAS: the events of THIS window per (src_ip,
+    # sensor). OpenCTI ADDS a Sighting's count whenever the write widens the
+    # stored first_seen/last_seen window, and REPLACES it otherwise
+    # (opencti-graphql utils/upsert-utils.js; confirmed on the live 7.x
+    # platform 2026-10-03). Every cycle widens last_seen, so the day's running
+    # total this code used to send was summed once per cycle (a Sighting at
+    # 205,973,057 against 11.6M hive events). A window's events are counted
+    # by exactly one clean cycle because the cursor only advances on a clean
+    # publish; a retried window is handled by the sighting_sent ledger below.
+    # finalize_sighting_counts floors last_seen after window_start so every
+    # write widens, i.e. ADDS.
     #
     # Upper bound is window_end, not the clock, so the count never claims
     # events this connector has not yet imported.
     #
-    # Best-effort: on failure the builder falls back to per-cycle counts,
-    # which is the pre-existing behaviour. A cycle that publishes real
-    # intel with imperfect counts beats a cycle that publishes nothing.
-    #
-    # The COUNTS pattern is its own setting (TPOT2CTI_COUNTS_INDEX_PATTERN,
-    # default ES_INDEX_PATTERN) so DR-07 phase 2 can widen what is counted
-    # without the event read above re-ingesting suppressed documents.
-    try:
-        _day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        _count_kwargs: dict = {}
-        if cfg.cycle.sighting_grain == "sensor-ip-day":
-            # Same aggregation plus a terms sub-agg: the day's honeypot types
-            # per (src_ip, sensor, day), listed in the Sighting description.
-            _count_kwargs["types_out"] = builder.daily_event_types
-        builder.daily_event_counts = es.daily_event_counts(
-            _day_start, window_end,
-            index_pattern=cfg.es.effective_counts_index_pattern,
-            ignore_types=effective_ignore_types,
-            **_count_kwargs,
-        )
-        logger.info(
-            "[%s] authoritative daily counts: %d (src_ip, sensor, day) pair(s) "
-            "over [%s, %s)",
-            cycle_id, len(builder.daily_event_counts),
-            _day_start.isoformat(), window_end.isoformat(),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[%s] daily count aggregation failed (%s); sighting counts fall "
-            "back to this cycle's slice and may be overwritten by a later, "
-            "narrower cycle", cycle_id, exc,
-        )
+    # Best-effort: on failure the builder sums the per-session event counts
+    # of this window instead, which is the same quantity over parsed types
+    # only. The COUNTS pattern is its own setting
+    # (TPOT2CTI_COUNTS_INDEX_PATTERN, default ES_INDEX_PATTERN).
+    builder.window_start = window_start
+    # Which part of this window still goes into Sighting counts (only the
+    # part no clean cycle has counted; see sighting_count_scope).
+    sighting_scope = sighting_count_scope(state, window_start, window_end)
+    sighting_reject: Optional[str] = None
+    if sighting_scope["mode"] == "reject":
+        sighting_reject = sighting_scope["reason"]
+    elif sighting_scope["mode"] == "none":
+        builder.window_counts_strict = True          # every count is 0: no write
+    else:
+        try:
+            builder.window_event_counts = fold_parts_counts(
+                es, sighting_scope["parts"],
+                index_pattern=cfg.es.effective_counts_index_pattern,
+                ignore_types=effective_ignore_types,
+            )
+            logger.info(
+                "[%s] window event counts (%s): %d (src_ip, sensor) pair(s), %d "
+                "event(s) over %s", cycle_id, sighting_scope["mode"],
+                len(builder.window_event_counts),
+                sum(builder.window_event_counts.values()),
+                [(a.isoformat(), b.isoformat()) for a, b in sighting_scope["parts"]],
+            )
+        except Exception as exc:  # noqa: BLE001
+            if sighting_scope["mode"] == "forward":
+                logger.warning(
+                    "[%s] window count aggregation failed (%s); sighting counts "
+                    "fall back to the per-session sums of this window", cycle_id, exc)
+            else:
+                # A partly counted window cannot be split per session.
+                sighting_reject = f"backfill count aggregation failed ({exc})"
+        if sighting_scope["mode"] == "backfill":
+            builder.window_counts_strict = True      # ES counts only, no fallback
+    if cfg.cycle.sighting_grain == "sensor-ip-day":
+        # Description only: the day's honeypot types per (src_ip, sensor,
+        # day), listed at the top of the Sighting description. The count
+        # above does not come from this call.
+        try:
+            _day_start = window_start.replace(hour=0, minute=0, second=0,
+                                              microsecond=0)
+            es.daily_event_counts(
+                _day_start, window_end,
+                index_pattern=cfg.es.effective_counts_index_pattern,
+                ignore_types=effective_ignore_types,
+                types_out=builder.daily_event_types,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] daily type aggregation failed (%s); "
+                           "descriptions list this window's types only",
+                           cycle_id, exc)
     all_objects: list[dict] = []
     sessions_by_type: dict[str, int] = {}
     # Per-cycle set of attacker IPs that contributed at least one session
@@ -1264,6 +1492,38 @@ def run_cycle(
     #                   An unfiltered bundle could carry edges to withheld
     #                   Indicators, which OpenCTI never resolves.
     gate_block_publish = False
+    # Sighting counts first, and fail CLOSED: a Sighting that skipped this
+    # step can be a non-widening write, which OpenCTI turns into a REPLACE
+    # of the stored total by this window's delta.
+    sighting_replay_stats: dict = {"scope": sighting_scope["mode"]}
+    if sighting_reject:
+        # Logged, nothing written: no ledger rows, no publish, cursor kept.
+        gate_block_publish = True
+        sighting_replay_stats["rejected"] = sighting_reject
+        logger.error(
+            f"cycle {cycle_id}: sighting counts REJECTED ({sighting_reject}); "
+            f"publish withheld and cursor kept at {window_start.isoformat()}")
+    else:
+        try:
+            plan, plan_stats, plan_err = sighting_plan_for_window(
+                state, window_start,
+                [o.get("id") for o in all_objects if o.get("type") == "sighting"],
+                getattr(getattr(publisher, "client", None), "sighting_last_seen", None),
+                platform_floors=sighting_scope["mode"] == "backfill")
+            sighting_replay_stats.update(plan_stats)
+            if plan_err:
+                raise RuntimeError(plan_err)
+            builder.sighting_replay = plan
+            if sighting_scope["mode"] != "forward" or plan_stats["retried_sightings"]:
+                logger.warning("[%s] sighting ledger: %s", cycle_id,
+                               json.dumps(sighting_replay_stats, sort_keys=True))
+            all_objects = builder.finalize_sighting_counts(all_objects)
+        except Exception as e:  # noqa: BLE001
+            gate_block_publish = True
+            sighting_replay_stats["rejected"] = str(e)
+            logger.exception(
+                f"cycle {cycle_id}: sighting count finalization FAILED ({e}); "
+                f"publish withheld and cursor kept, the window will be retried")
     try:
         all_objects = builder.finalize_bundle(all_objects)
     except Exception as e:  # noqa: BLE001
@@ -1286,6 +1546,28 @@ def run_cycle(
         evidence_gate_stats = {"error": str(e)}
         logger.warning(f"cycle {cycle_id}: evidence gate counters unavailable: {e}")
 
+    # Ledger BEFORE publishing: if this attempt is not clean, the retry over
+    # the same window must know what it sent (sighting_replay_for_window).
+    # A failure here withholds the publish: an unrecorded attempt that lands
+    # would be added a second time by its retry.
+    sighting_stats = dict(getattr(builder, "sighting_count_stats", {}) or {})
+    sighting_stats.update(sighting_replay_stats or {})
+    if not gate_block_publish and lease_holder and not state.lease_held(lease_holder):
+        gate_block_publish = True
+        logger.error(f"cycle {cycle_id}: the cycle lease was lost; publish withheld")
+    if not gate_block_publish:
+        try:
+            state.record_sightings_sent(
+                window_start, window_end,
+                getattr(builder, "sighting_sent_records", {}) or {},
+                cycle_id=cycle_id)
+        except Exception as e:  # noqa: BLE001
+            gate_block_publish = True
+            logger.exception(
+                f"cycle {cycle_id}: could not record the sighting ledger ({e}); "
+                f"publish withheld and cursor kept")
+    logger.info("sighting_counts %s", json.dumps(sighting_stats, sort_keys=True))
+
     # ── Step 6: publish ───────────────────────────────────────────────
     sdos_by_type = _count_by_type(all_objects)
     publish_ok = True
@@ -1294,7 +1576,9 @@ def run_cycle(
     try:
         if gate_block_publish:
             raise RuntimeError(
-                "evidence gate cleanup failed under enforce; publish withheld")
+                "publish withheld (evidence gate cleanup under enforce, a "
+                "rejected or failed sighting count, a lost cycle lease, or "
+                "the sighting ledger could not be recorded)")
         publish_result = publisher.publish(
             all_objects, cycle_id=str(cycle_id)
         )
@@ -1316,6 +1600,22 @@ def run_cycle(
         logger.exception(f"cycle {cycle_id}: publisher.publish failed: {e}")
 
     # ── Step 7: persist state (only on a successful publish) ──────────
+    # The window's events are now in OpenCTI's Sighting counts: mark it
+    # counted BEFORE moving the cursor (a crash in between makes the retry
+    # count nothing twice), and only while this process still holds the
+    # cycle lease.
+    if publish_ok and lease_holder and not state.lease_held(lease_holder):
+        publish_ok = False
+        publish_errors.append("cycle lease lost before the cursor moved")
+        logger.error(f"cycle {cycle_id}: cycle lease lost; NOT advancing last_run")
+    if publish_ok:
+        try:
+            state.mark_window_counted(window_start, window_end)
+        except Exception as e:  # noqa: BLE001
+            publish_ok = False
+            publish_errors.append(f"could not mark the window counted: {e}")
+            logger.exception(f"cycle {cycle_id}: could not mark the window counted; "
+                             f"NOT advancing last_run")
     if publish_ok:
         state.set_last_run(window_end)
     else:
@@ -1406,6 +1706,9 @@ def run_cycle(
         # ICS: sessions by depth, the SNMP reflection drop, research
         # scanners kept, write/control sessions (also in /health as `ics`).
         "ics": ics_cycle,
+        # Sighting count deltas: emitted, last_seen floored to force an ADD,
+        # and retried-window adjustments (see finalize_sighting_counts).
+        "sightings": sighting_stats,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),

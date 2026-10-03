@@ -209,6 +209,52 @@ class OpenCTIClient:
             return set(ids)
         return found
 
+    def sighting_last_seen(self, stix_ids) -> Optional[dict]:
+        """``{requested id: stored last_seen ISO}`` for the Sightings OpenCTI
+        holds under any of ``stix_ids`` (standard id OR an alias in
+        x_opencti_stix_ids: the ``ids`` filter matches both). Ids with no
+        stored Sighting are absent.
+
+        Used only when a window is RETRIED (main.run_cycle): an earlier
+        attempt's Sighting landed iff the stored last_seen is at or after
+        the last_seen that attempt wrote, because every write is floored
+        strictly after everything stored before it.
+
+        Returns None on any error, and the caller then assumes the earlier
+        attempt landed (it may under-count one window; it never inflates).
+        """
+        ids = [i for i in dict.fromkeys(stix_ids) if i]
+        if not ids:
+            return {}
+        query = (
+            "query SightingLastSeen($ids:[Any!]!){ stixSightingRelationships("
+            "first:500, filters:{mode:and, filters:[{key:\"ids\", values:$ids, "
+            "operator:eq, mode:or}], filterGroups:[]}){ edges{ node{ "
+            "standard_id x_opencti_stix_ids last_seen } } } }"
+        )
+        out: dict = {}
+        wanted = set(ids)
+        try:
+            for i in range(0, len(ids), 200):
+                chunk = ids[i:i + 200]
+                resp = self._api.query(query, {"ids": chunk})
+                edges = (
+                    (((resp or {}).get("data") or {})
+                     .get("stixSightingRelationships") or {})
+                    .get("edges") or []
+                )
+                for e in edges:
+                    node = (e or {}).get("node") or {}
+                    names = {node.get("standard_id"), *(node.get("x_opencti_stix_ids") or [])}
+                    for sid in names & wanted:
+                        out[sid] = node.get("last_seen")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"sighting_last_seen failed ({type(exc).__name__}: {exc}); "
+                f"the caller assumes the earlier attempt landed.")
+            return None
+        return out
+
     def health_check(self) -> bool:
         """Cheap GraphQL ping used by the Phase 6 /health endpoint.
 

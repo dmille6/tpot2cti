@@ -185,6 +185,60 @@ CREATE TABLE IF NOT EXISTS immutable_emitted (
     first_emitted_at TEXT NOT NULL
 );
 
+-- Sighting send ledger (fix/sightings-scanners, 2026-10-03). OpenCTI ADDS a
+-- Sighting's count when a write widens its stored first_seen/last_seen
+-- window and REPLACES it otherwise. tpot2cti therefore sends each window's
+-- not-yet-counted events as a delta, with last_seen floored after everything
+-- it ever wrote for that id. See STIXBuilder.finalize_sighting_counts and
+-- main.sighting_plan_for_window.
+--
+-- sighting_counted: the time ranges whose events are IN OpenCTI's counts,
+--   i.e. windows that were published CLEANLY (merged intervals, kept for
+--   ever; a handful of rows). A rewind, a re-run or a gap backfill counts
+--   only what is not inside them. Pre-publish or crashed attempts are never
+--   in here.
+-- sighting_sent: per (Sighting, window) attempt, written BEFORE publishing,
+--   status 'sent'. Deleted when that window publishes cleanly; rows still
+--   there belong to an UNCLEAN attempt. The retry over the same
+--   window_start subtracts what that attempt landed; any other window while
+--   such rows exist is rejected (publish withheld) until resolved.
+-- sighting_last_sent: the latest last_seen ever written per Sighting (never
+--   pruned: one row per (sensor, target)), so every write is floored after it.
+-- cycle_lease: single-writer lease around run_cycle.
+CREATE TABLE IF NOT EXISTS sighting_counted (
+    start_ts  TEXT NOT NULL,
+    end_ts    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sighting_sent (
+    sighting_id   TEXT NOT NULL,
+    window_start  TEXT NOT NULL,
+    window_end    TEXT NOT NULL,
+    window_total  INTEGER,           -- this window's events, if this attempt landed
+    base          INTEGER NOT NULL DEFAULT 0,  -- of which OpenCTI already held
+    last_seen     TEXT,              -- the last_seen this attempt wrote
+    status        TEXT NOT NULL DEFAULT 'sent',
+    cycle_id      TEXT,
+    recorded_at   TEXT NOT NULL,
+    PRIMARY KEY (sighting_id, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sighting_sent_window
+    ON sighting_sent(window_start);
+
+CREATE TABLE IF NOT EXISTS sighting_last_sent (
+    sighting_id   TEXT PRIMARY KEY,
+    last_seen     TEXT NOT NULL,
+    recorded_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cycle_lease (
+    name         TEXT PRIMARY KEY,
+    holder       TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
 
@@ -293,6 +347,9 @@ class CycleState:
     _SQL_VAR_CHUNK = 500
 
     def __init__(self, db_path: str | Path = "/opt/connector/data/state.db"):
+        #: Set by main.run_cycle while it holds the cycle lease.
+        self.lease_holder: Optional[str] = None
+        self.lease_ttl_s: float = 3600.0
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -419,6 +476,13 @@ class CycleState:
         needed; the value is an ISO-8601 UTC timestamp.
         """
         self.set("last_heartbeat_ts", datetime.now(timezone.utc).isoformat())
+        # Renew the cycle lease (main.run_cycle) while a cycle holds it.
+        holder = getattr(self, "lease_holder", None)
+        if holder:
+            try:
+                self.renew_lease(holder, getattr(self, "lease_ttl_s", 3600.0))
+            except Exception as e:  # noqa: BLE001  pragma: no cover - defensive
+                logger.warning(f"cycle lease renewal failed: {e}")
 
     # ------------------------------------------------------------------
     # Publish ledger
@@ -1020,6 +1084,182 @@ class CycleState:
             n = c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
             c.execute("DELETE FROM immutable_emitted")
             return n
+
+    # ------------------------------------------------------------------
+    # Single-writer lease around run_cycle (table cycle_lease)
+    # ------------------------------------------------------------------
+
+    LEASE_NAME = "core-cycle"
+
+    def acquire_lease(self, holder: str, ttl_s: float, now: Optional[datetime] = None) -> bool:
+        """Take the cycle lease if it is free, expired, or already ours.
+        BEGIN IMMEDIATE makes the check-and-take atomic across processes."""
+        now = now or datetime.now(timezone.utc)
+        exp = (now + timedelta(seconds=ttl_s)).isoformat()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute("SELECT holder, expires_at FROM cycle_lease WHERE name=?",
+                                (self.LEASE_NAME,)).fetchone()
+                if row and row[0] != holder:
+                    cur_exp = _as_instant(row[1])
+                    if cur_exp is not None and cur_exp > now:
+                        c.execute("ROLLBACK")
+                        return False
+                c.execute("INSERT OR REPLACE INTO cycle_lease (name, holder, acquired_at, "
+                          "expires_at) VALUES (?,?,?,?)",
+                          (self.LEASE_NAME, holder, now.isoformat(), exp))
+                c.execute("COMMIT")
+                return True
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def renew_lease(self, holder: str, ttl_s: float, now: Optional[datetime] = None) -> bool:
+        """Extend our lease. False when another holder has it."""
+        now = now or datetime.now(timezone.utc)
+        with self._conn() as c:
+            cur = c.execute("UPDATE cycle_lease SET expires_at=? WHERE name=? AND holder=?",
+                            ((now + timedelta(seconds=ttl_s)).isoformat(),
+                             self.LEASE_NAME, holder))
+            return cur.rowcount == 1
+
+    def lease_held(self, holder: str, now: Optional[datetime] = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        with self._conn() as c:
+            row = c.execute("SELECT holder, expires_at FROM cycle_lease WHERE name=?",
+                            (self.LEASE_NAME,)).fetchone()
+        exp = _as_instant(row[1]) if row else None
+        return bool(row and row[0] == holder and exp is not None and exp > now)
+
+    def release_lease(self, holder: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM cycle_lease WHERE name=? AND holder=?",
+                      (self.LEASE_NAME, holder))
+
+    # ------------------------------------------------------------------
+    # Sighting send ledger (tables sighting_counted / _sent / _last_sent)
+    # ------------------------------------------------------------------
+
+    def counted_intervals(self) -> list[tuple[datetime, datetime]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT start_ts, end_ts FROM sighting_counted").fetchall()
+        out = [(_as_instant(a), _as_instant(b)) for a, b in rows]
+        return sorted((a, b) for a, b in out if a is not None and b is not None and a < b)
+
+    def counted_frontier(self) -> Optional[datetime]:
+        iv = self.counted_intervals()
+        return max(b for _, b in iv) if iv else None
+
+    def uncounted_parts(self, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+        """[start, end) minus every counted interval, as ordered sub-ranges."""
+        parts = [(_as_instant(start), _as_instant(end))]
+        for a, b in self.counted_intervals():
+            nxt = []
+            for x, y in parts:
+                if b <= x or a >= y:
+                    nxt.append((x, y))
+                    continue
+                if x < a:
+                    nxt.append((x, a))
+                if b < y:
+                    nxt.append((b, y))
+            parts = nxt
+        return [(x, y) for x, y in parts if x < y]
+
+    def mark_window_counted(self, start: datetime, end: datetime) -> None:
+        """Add [start, end) to the counted intervals (merged), and resolve
+        the 'sent' rows of attempts over this window_start. Call ONLY after a
+        clean publish, BEFORE advancing the cursor: if the process dies in
+        between, the retry counts nothing twice."""
+        iv = self.counted_intervals() + [(_as_instant(start), _as_instant(end))]
+        iv.sort()
+        merged: list[list[datetime]] = []
+        for a, b in iv:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("DELETE FROM sighting_counted")
+                c.executemany("INSERT INTO sighting_counted (start_ts, end_ts) VALUES (?,?)",
+                              [(a.isoformat(), b.isoformat()) for a, b in merged])
+                c.execute("DELETE FROM sighting_sent WHERE window_start = ?",
+                          (start.isoformat(),))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def unclean_sighting_windows(self) -> list[str]:
+        """window_start values of attempts that never published cleanly."""
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                "SELECT DISTINCT window_start FROM sighting_sent WHERE status='sent'")]
+
+    def sightings_sent_for_window(self, sighting_ids, window_start: datetime) -> dict:
+        """``{id: (window_total, base, last_seen)}`` of unclean attempts over
+        exactly this window_start."""
+        ids = [i for i in dict.fromkeys(sighting_ids or ()) if i]
+        out: dict = {}
+        with self._conn() as c:
+            for i in range(0, len(ids), self._SQL_VAR_CHUNK):
+                chunk = ids[i:i + self._SQL_VAR_CHUNK]
+                ph = ",".join("?" for _ in chunk)
+                for sid, wt, base, ls in c.execute(
+                        f"SELECT sighting_id, window_total, base, last_seen FROM sighting_sent "
+                        f"WHERE window_start = ? AND status='sent' AND sighting_id IN ({ph})",
+                        [window_start.isoformat(), *chunk]):
+                    out[sid] = (wt, base or 0, ls)
+        return out
+
+    def max_last_sent(self, sighting_ids) -> dict:
+        ids = [i for i in dict.fromkeys(sighting_ids or ()) if i]
+        out: dict = {}
+        with self._conn() as c:
+            for i in range(0, len(ids), self._SQL_VAR_CHUNK):
+                chunk = ids[i:i + self._SQL_VAR_CHUNK]
+                ph = ",".join("?" for _ in chunk)
+                out.update(c.execute(
+                    f"SELECT sighting_id, last_seen FROM sighting_last_sent "
+                    f"WHERE sighting_id IN ({ph})", chunk).fetchall())
+        return out
+
+    def record_sightings_sent(self, window_start: datetime, window_end: datetime,
+                              records: dict, cycle_id=None) -> None:
+        """Record this attempt's Sightings (``{id: (window_total, base,
+        last_seen)}``) BEFORE publishing, status 'sent', in one transaction,
+        and raise each id's latest-ever last_seen."""
+        if not records:
+            return
+        now = _utcnow_iso()
+        ws, we = window_start.isoformat(), window_end.isoformat()
+        rows = [(sid, ws, we, wt, int(base or 0), ls,
+                 None if cycle_id is None else str(cycle_id), now)
+                for sid, (wt, base, ls) in records.items()]
+        cur = self.max_last_sent([r[0] for r in rows])
+        upd = []
+        for sid, _ws, _we, _wt, _b, ls, _cid, _now in rows:
+            new_i = _as_instant(ls)
+            old_i = _as_instant(cur.get(sid))
+            if new_i is not None and (old_i is None or new_i > old_i):
+                upd.append((sid, ls, now))
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.executemany(
+                    "INSERT OR REPLACE INTO sighting_sent (sighting_id, window_start, "
+                    "window_end, window_total, base, last_seen, status, cycle_id, "
+                    "recorded_at) VALUES (?,?,?,?,?,?,'sent',?,?)", rows)
+                c.executemany(
+                    "INSERT OR REPLACE INTO sighting_last_sent "
+                    "(sighting_id, last_seen, recorded_at) VALUES (?,?,?)", upd)
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
 
     def get_max_state_bulk(
         self,

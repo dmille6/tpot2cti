@@ -386,6 +386,17 @@ def generate_sighting_id(sensor: str, bucket: str, discriminator: str = "") -> s
     return sdo_id("sighting", "sighting", sensor, bucket)
 
 
+def stable_sighting_id(sensor: str, target_ref: str, discriminator: str = "") -> str:
+    """THE Sighting id tpot2cti sends since 2026-10-03: one per (sensor,
+    target), no day. ``target_ref`` is tpot2cti's own id of the sighted
+    object (attacker_ip_indicator_id / attacker_ip_observable_id);
+    ``discriminator`` is "ipv4" for the observable side (IPv6 too), "" for
+    the Indicator side. The migration that attaches this id to existing
+    Sightings (ops v2-data-quality migrate_sighting_ids.py) imports this
+    function, so the two cannot drift."""
+    return generate_sighting_id(sensor, target_ref, discriminator)
+
+
 def generate_relationship_id(src_id: str, dst_id: str, rel_type: str) -> str:
     """Relationship SRO id. Seed: ``<src_id>:<dst_id>:<rel_type>``.
 

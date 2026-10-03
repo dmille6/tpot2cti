@@ -76,7 +76,7 @@ def test_an_untimed_edge_is_counted_not_silent(builder):
 def test_the_counter_reaches_the_cycle_summary():
     import inspect
     from tpot2cti import main
-    src = inspect.getsource(main.run_cycle)
+    src = inspect.getsource(main._run_cycle_locked)  # run_cycle is the lease wrapper
     assert "untimed_relationships" in src, (
         "untimed relationships are not reported — the regression would be "
         "invisible"

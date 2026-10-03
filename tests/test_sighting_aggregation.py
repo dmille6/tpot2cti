@@ -1,4 +1,4 @@
-"""Sightings aggregate per (sensor, target, UTC day) — not per session.
+"""Sightings aggregate per (sensor, target) — not per session, not per day.
 
 Seeding the Sighting id on ``session_id`` minted one Sighting per session
 (two, under the dual-sighting pattern). Measured on v2 cycle 92: **21,628
@@ -10,7 +10,7 @@ v1 learned the same lesson expensively: a microsecond-resolution
 ``first_seen`` in its sighting seed caused an id alias explosion that cost
 758 GB of history. It day-buckets now.
 
-The trap this file mostly guards is what day-bucketing does to ``_dedup``.
+The trap this file mostly guards is what bucketing does to ``_dedup``.
 Colliding ids are the POINT here, but ``_dedup`` answers a repeat id with
 None and only widens *relationships* — so without a sighting-aware merge
 the second and every later session of the day would be dropped outright,
@@ -69,13 +69,21 @@ def test_two_sessions_same_day_collapse_to_one_sighting(builder):
     )
 
 
-def test_sessions_on_different_days_stay_separate(builder):
-    """Aggregation must not swallow a genuinely different day."""
-    a = _emit(builder, _session(at=DAY, session_id="s-a"))
-    b = _emit(builder, _session(at=DAY + timedelta(days=1), session_id="s-b"))
+def test_sessions_on_different_days_fold_into_one_sighting(builder):
+    """One Sighting per (sensor, target), whatever the day (2026-10-03).
 
-    assert a is not None and b is not None
-    assert a["id"] != b["id"], "one Sighting per DAY, not one forever"
+    OpenCTI merged the old per-day ids onto one stored object anyway (its
+    relation deduplication matches (sighting_of, where_sighted) within +-30
+    days; one live Sighting carried 15 day ids). Two ids for one stored
+    object in one bundle are two writes in an order the workers do not
+    guarantee, which can turn an ADD into a REPLACE. So the id has no day,
+    and a window that spans midnight folds into one object."""
+    a = _emit(builder, _session(at=DAY, session_id="s-a"), count=3)
+    b = _emit(builder, _session(at=DAY + timedelta(days=1), session_id="s-b"), count=4)
+
+    assert a is not None and b is None, "the second day must fold, not mint"
+    assert a["count"] == 7
+    assert a["last_seen"] == (DAY + timedelta(days=1, minutes=5)).isoformat()
 
 
 def test_different_addresses_stay_separate(builder):
@@ -94,14 +102,14 @@ def test_different_sensors_stay_separate(builder):
     assert a["id"] != b["id"]
 
 
-def test_day_boundary_is_utc_not_local(builder):
-    """23:59Z and 00:01Z are different days even though they are 2 min apart."""
-    late = _emit(builder, _session(
-        at=datetime(2026, 8, 26, 23, 59, tzinfo=timezone.utc), session_id="s-a"))
-    early = _emit(builder, _session(
-        at=datetime(2026, 8, 27, 0, 1, tzinfo=timezone.utc), session_id="s-b"))
-    assert late is not None and early is not None
-    assert late["id"] != early["id"]
+def test_the_id_does_not_depend_on_the_day_or_session(builder):
+    """23:59Z and 00:01Z, different sessions: the SAME Sighting id."""
+    from tpot2cti.stix.builder import STIXBuilder
+    t = attacker_ip_indicator_id(IP_A)
+    late = _session(at=datetime(2026, 8, 26, 23, 59, tzinfo=timezone.utc), session_id="s-a")
+    early = _session(at=datetime(2026, 8, 27, 0, 1, tzinfo=timezone.utc), session_id="s-b")
+    assert STIXBuilder._sighting_id(t, "s1", late) == STIXBuilder._sighting_id(t, "s1", early)
+    assert STIXBuilder._sighting_id(t, "s1", late) != STIXBuilder._sighting_id(t, "s1", late, "ipv4")
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +149,8 @@ def test_window_spans_the_whole_day(builder):
     first = _session(at=DAY + timedelta(hours=6), session_id="s-a")
     kept = _emit(builder, first)
     _emit(builder, _session(at=DAY, session_id="s-b"))                   # earlier
-    # +14h, deliberately NOT +20h: DAY is 04:00Z, so +20h lands on the
-    # NEXT UTC day and would open its own bucket rather than fold.
+    # +14h. (Under the old per-day ids +20h opened a new bucket; since
+    # 2026-10-03 it would fold too: test_sessions_on_different_days_fold...)
     _emit(builder, _session(at=DAY + timedelta(hours=14), session_id="s-c"))  # later
 
     assert kept["first_seen"] == DAY.isoformat(), (
@@ -206,7 +214,7 @@ def test_description_list_is_bounded(builder):
         f"expected {builder._SIGHTING_DESC_MAX} lines + a remainder note, "
         f"got {len(lines)}"
     )
-    assert "(+7 further session(s) this day)" in kept["description"], (
+    assert "(+7 further session(s) in this window)" in kept["description"], (
         f"the omitted count must be stated, got: {kept['description']!r}"
     )
 
