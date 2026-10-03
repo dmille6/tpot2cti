@@ -768,10 +768,14 @@ def test_health_reports_ics(tmp_path):
 def test_rebaseline_is_recorded_not_overwritten():
     g = H.golden_original()
     assert g["generated_from"].startswith("origin/main 71e47ec")
-    rb = g["rebaselines"][-1]
-    assert "ConPot" in rb["reason"] and rb["unchanged_without"] == ["conpot.jsonl"]
-    assert H.golden()["cycle"] == rb["cycle"] != g["cycle"]
-    assert H.golden()["direct"] == g["direct"], "the direct bundle has no ConPot and must not move"
+    # The ICS entries are no longer the last: the 2026-10-03 sighting-count
+    # rebaseline follows them (and moves every Sighting, direct bundle too).
+    ics_rbs = [r for r in g["rebaselines"] if "ConPot" in r["reason"]]
+    rb = ics_rbs[-1]
+    assert rb["unchanged_without"] == ["conpot.jsonl"]
+    assert rb["cycle"] != g["cycle"]
+    assert rb["direct"] == g["direct"], "the ICS change did not move the direct bundle"
+    assert H.golden()["cycle"] == g["rebaselines"][-1]["cycle"]
 
 
 def test_everything_but_conpot_is_byte_identical_to_the_parent_commit(tmp_path):

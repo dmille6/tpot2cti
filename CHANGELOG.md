@@ -5,6 +5,39 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
 ## [Unreleased]
 
+### Sighting counts under OpenCTI's real upsert; score ceiling for scanners and CDN edges (2026-10-03)
+
+- **Sighting counts were inflated (v2: 6.72B total; one at 205,973,057
+  against 11.6M hive events).** OpenCTI 7.x does not replace a Sighting's
+  `count` on upsert: it ADDS when the write widens `first_seen`/`last_seen`
+  and REPLACES only when it does not (`utils/upsert-utils.js`; confirmed live
+  with throwaway objects). It also merges every Sighting of one
+  (sighting_of, where_sighted) pair within ±30 days, whatever its id. The
+  code sent each day's running total every cycle with a later `last_seen`,
+  so the running totals were summed.
+  - Counts are now the window's events (a delta), from ES over
+    `[window_start, window_end)`.
+  - `last_seen` is floored strictly after `window_start` and after the
+    latest `last_seen` ever written for the id, so every write is an ADD.
+  - Sighting ids are one per (sensor, target): no day (OpenCTI merged the
+    days anyway; one Sighting carried 15 day ids).
+  - A send ledger in `state.db` (`sighting_sent`, `sighting_last_sent`)
+    makes a retried window (unclean publish) and a cursor rewind subtract
+    what OpenCTI already holds; whether a retried attempt landed is read
+    from OpenCTI (`OpenCTIClient.sighting_last_seen`). The ledger is
+    written before publishing; if it cannot be, the publish is withheld.
+  - Both Sighting sides are kept (Indicator and observable), with the same
+    count each; a sum over all Sightings counts every event twice by design.
+  - Cycle summary `sightings`, log line `sighting_counts`.
+- **Score ceiling** (`tpot2cti/score_ceiling.py`, `TPOT2CTI_SCORE_CEILING`,
+  default 25): Indicators and IP observables labelled `scanner:*`, or inside
+  Cloudflare/Fastly edge ranges (`tpot2cti/data/edge_networks.yaml`), are
+  capped after the cross-cycle max(score) merge and recorded capped; edge
+  addresses gain `edge-network:<provider>`. Nothing is dropped. v2 had 66
+  scanner and 36 Cloudflare Indicators at score >= 50.
+- **Existing data** is corrected by separate, dry-run-first scripts outside
+  this repository (the counts are recomputed from the hive).
+
 ### ICS intelligence: ConPot parser fix, ICS evidence class, labels, SNMP refusals (2026-09-30)
 
 - **Parser defect fixed.** The ConPot parser took the protocol from

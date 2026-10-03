@@ -286,6 +286,108 @@ def _doc_timestamp(doc):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
+def fold_window_counts(by_day: dict) -> dict:
+    """``{(src_ip, sensor, day): n}`` -> ``{(src_ip, sensor): n}``.
+
+    TpotESClient.daily_event_counts buckets by UTC day; a Sighting is one
+    per (sensor, target), so a window that spans midnight sums its days."""
+    out: dict = {}
+    for key, n in (by_day or {}).items():
+        if not isinstance(key, tuple) or len(key) < 2 or not isinstance(n, int):
+            continue
+        k = (key[0], key[1])
+        out[k] = out.get(k, 0) + n
+    return out
+
+
+def sighting_replay_for_window(state, window_start: datetime,
+                               window_end: datetime, sighting_ids,
+                               lookup) -> tuple:
+    """``(replay, stats)`` for the builder's ``sighting_replay``, from the
+    sighting ledger (state.sighting_ledger_for) for the Sightings this
+    bundle is about to send.
+
+    Per id, ``SightingReplay(base, last_seen)``:
+
+      * ``last_seen``: the latest last_seen tpot2cti ever wrote for the id
+        (the floor that keeps every write an ADD).
+      * ``base``: events of THIS window OpenCTI already holds:
+          - a RETRY of this exact window (an earlier attempt over the same
+            window_start, publish not clean). ``lookup`` (the OpenCTI
+            client's sighting_last_seen) tells whether that attempt LANDED:
+            stored last_seen >= the last_seen it wrote, which is
+            unambiguous because each write is floored after every earlier
+            one. Landed: OpenCTI holds its window_total. Not landed: only
+            its own ``base``. Lookup unavailable or failed: assume landed
+            (may under-count one window; never inflates).
+          - plus, after a cursor REWIND, the window_total of every earlier
+            window lying wholly inside this one: the cursor moved past
+            those, so they were published cleanly.
+        A window that straddles this one's boundary cannot be split; it is
+        counted in ``stats["partial_overlap"]`` and logged.
+    """
+    from tpot2cti.stix.builder import SightingReplay, _trunc_ms
+    stats = {"retried_sightings": 0, "landed": 0, "not_landed": 0,
+             "assumed_landed": 0, "rewind_inside": 0, "partial_overlap": 0,
+             "ledger_floors": 0}
+    ledger = state.sighting_ledger_for(sighting_ids, window_start, window_end)
+    if not ledger:
+        return {}, stats
+    retried = [sid for sid, r in ledger.items() if r["same"] is not None]
+    stats["retried_sightings"] = len(retried)
+    stored = None
+    if retried and lookup is not None:
+        try:
+            stored = lookup(retried)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"sighting lookup failed ({exc}); assuming landed")
+            stored = None
+
+    def _dt(v):
+        if not v:
+            return None
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+    replay = {}
+    for sid, r in ledger.items():
+        base = 0
+        if r["same"] is not None:
+            window_total, prev_base, sent_ls = r["same"]
+            sent_dt = _dt(sent_ls)
+            if stored is None:
+                landed = True
+                stats["assumed_landed"] += 1
+            else:
+                st = _dt(stored.get(sid))
+                landed = (st is not None and sent_dt is not None
+                          and _trunc_ms(st) >= _trunc_ms(sent_dt))
+                stats["landed" if landed else "not_landed"] += 1
+            base += (window_total if (landed and isinstance(window_total, int))
+                     else int(prev_base or 0))
+        if r["inside_total"]:
+            base += int(r["inside_total"])
+            stats["rewind_inside"] += 1
+        if r["partial"]:
+            stats["partial_overlap"] += 1
+        floors = [d for d in (_dt(r["max_last_seen"]), _dt(r["inside_last_seen"]),
+                              _dt((r["same"] or (None, None, None))[2])) if d]
+        last = max(floors) if floors else None
+        if last is not None:
+            stats["ledger_floors"] += 1
+        replay[sid] = SightingReplay(base=base, last_seen=last)
+    if stats["partial_overlap"]:
+        logger.warning(
+            "sighting ledger: %d Sighting(s) have an earlier window straddling "
+            "this one's boundary (a cursor rewind off a window boundary); their "
+            "overlap cannot be subtracted and may be counted twice",
+            stats["partial_overlap"])
+    return replay, stats
+
+
 def _compute_window(
     state: CycleState, cfg: Config, now: datetime
 ) -> tuple[datetime, datetime]:
@@ -966,48 +1068,61 @@ def run_cycle(
 
     # ── Steps 2-4: correlate → build STIX ─────────────────────────────
     builder = builder_factory()
-    # Authoritative per-day counts for the Sightings this cycle will emit.
-    # OpenCTI REPLACES a sighting's count on upsert rather than summing it
-    # (measured: one went 22,119 -> 3,484 when a later, narrower cycle
-    # re-covered part of the same day), so writing this cycle's slice would
-    # overwrite a fuller number with a smaller one. The day's own total is
-    # idempotent under replace and only grows as the day fills.
+    # Sighting counts are DELTAS: the events of THIS window per (src_ip,
+    # sensor). OpenCTI ADDS a Sighting's count whenever the write widens the
+    # stored first_seen/last_seen window, and REPLACES it otherwise
+    # (opencti-graphql utils/upsert-utils.js; confirmed on the live 7.x
+    # platform 2026-10-03). Every cycle widens last_seen, so the day's running
+    # total this code used to send was summed once per cycle (a Sighting at
+    # 205,973,057 against 11.6M hive events). A window's events are counted
+    # by exactly one clean cycle because the cursor only advances on a clean
+    # publish; a retried window is handled by the sighting_sent ledger below.
+    # finalize_sighting_counts floors last_seen after window_start so every
+    # write widens, i.e. ADDS.
     #
     # Upper bound is window_end, not the clock, so the count never claims
     # events this connector has not yet imported.
     #
-    # Best-effort: on failure the builder falls back to per-cycle counts,
-    # which is the pre-existing behaviour. A cycle that publishes real
-    # intel with imperfect counts beats a cycle that publishes nothing.
-    #
-    # The COUNTS pattern is its own setting (TPOT2CTI_COUNTS_INDEX_PATTERN,
-    # default ES_INDEX_PATTERN) so DR-07 phase 2 can widen what is counted
-    # without the event read above re-ingesting suppressed documents.
+    # Best-effort: on failure the builder sums the per-session event counts
+    # of this window instead, which is the same quantity over parsed types
+    # only. The COUNTS pattern is its own setting
+    # (TPOT2CTI_COUNTS_INDEX_PATTERN, default ES_INDEX_PATTERN).
+    builder.window_start = window_start
     try:
-        _day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        _count_kwargs: dict = {}
-        if cfg.cycle.sighting_grain == "sensor-ip-day":
-            # Same aggregation plus a terms sub-agg: the day's honeypot types
-            # per (src_ip, sensor, day), listed in the Sighting description.
-            _count_kwargs["types_out"] = builder.daily_event_types
-        builder.daily_event_counts = es.daily_event_counts(
-            _day_start, window_end,
+        _by_day = es.daily_event_counts(
+            window_start, window_end,
             index_pattern=cfg.es.effective_counts_index_pattern,
             ignore_types=effective_ignore_types,
-            **_count_kwargs,
         )
+        builder.window_event_counts = fold_window_counts(_by_day)
         logger.info(
-            "[%s] authoritative daily counts: %d (src_ip, sensor, day) pair(s) "
-            "over [%s, %s)",
-            cycle_id, len(builder.daily_event_counts),
-            _day_start.isoformat(), window_end.isoformat(),
+            "[%s] window event counts: %d (src_ip, sensor) pair(s), %d "
+            "event(s) over [%s, %s)", cycle_id, len(builder.window_event_counts),
+            sum(builder.window_event_counts.values()),
+            window_start.isoformat(), window_end.isoformat(),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[%s] daily count aggregation failed (%s); sighting counts fall "
-            "back to this cycle's slice and may be overwritten by a later, "
-            "narrower cycle", cycle_id, exc,
+            "[%s] window count aggregation failed (%s); sighting counts fall "
+            "back to the per-session sums of this window", cycle_id, exc,
         )
+    if cfg.cycle.sighting_grain == "sensor-ip-day":
+        # Description only: the day's honeypot types per (src_ip, sensor,
+        # day), listed at the top of the Sighting description. The count
+        # above does not come from this call.
+        try:
+            _day_start = window_start.replace(hour=0, minute=0, second=0,
+                                              microsecond=0)
+            es.daily_event_counts(
+                _day_start, window_end,
+                index_pattern=cfg.es.effective_counts_index_pattern,
+                ignore_types=effective_ignore_types,
+                types_out=builder.daily_event_types,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] daily type aggregation failed (%s); "
+                           "descriptions list this window's types only",
+                           cycle_id, exc)
     all_objects: list[dict] = []
     sessions_by_type: dict[str, int] = {}
     # Per-cycle set of attacker IPs that contributed at least one session
@@ -1264,6 +1379,25 @@ def run_cycle(
     #                   An unfiltered bundle could carry edges to withheld
     #                   Indicators, which OpenCTI never resolves.
     gate_block_publish = False
+    # Sighting counts first, and fail CLOSED: a Sighting that skipped this
+    # step can be a non-widening write, which OpenCTI turns into a REPLACE
+    # of the stored total by this window's delta.
+    sighting_replay_stats: dict = {}
+    try:
+        builder.sighting_replay, sighting_replay_stats = sighting_replay_for_window(
+            state, window_start, window_end,
+            [o.get("id") for o in all_objects if o.get("type") == "sighting"],
+            getattr(getattr(publisher, "client", None), "sighting_last_seen", None))
+        if any(sighting_replay_stats.get(k) for k in
+               ("retried_sightings", "rewind_inside", "partial_overlap")):
+            logger.warning("[%s] sighting ledger: %s", cycle_id,
+                           json.dumps(sighting_replay_stats, sort_keys=True))
+        all_objects = builder.finalize_sighting_counts(all_objects)
+    except Exception as e:  # noqa: BLE001
+        gate_block_publish = True
+        logger.exception(
+            f"cycle {cycle_id}: sighting count finalization FAILED ({e}); "
+            f"publish withheld and cursor kept, the window will be retried")
     try:
         all_objects = builder.finalize_bundle(all_objects)
     except Exception as e:  # noqa: BLE001
@@ -1286,6 +1420,25 @@ def run_cycle(
         evidence_gate_stats = {"error": str(e)}
         logger.warning(f"cycle {cycle_id}: evidence gate counters unavailable: {e}")
 
+    # Ledger BEFORE publishing: if this attempt is not clean, the retry over
+    # the same window must know what it sent (sighting_replay_for_window).
+    # A failure here withholds the publish: an unrecorded attempt that lands
+    # would be added a second time by its retry.
+    sighting_stats = dict(getattr(builder, "sighting_count_stats", {}) or {})
+    sighting_stats.update(sighting_replay_stats or {})
+    if not gate_block_publish:
+        try:
+            state.record_sightings_sent(
+                window_start, window_end,
+                getattr(builder, "sighting_sent_records", {}) or {},
+                cycle_id=cycle_id)
+        except Exception as e:  # noqa: BLE001
+            gate_block_publish = True
+            logger.exception(
+                f"cycle {cycle_id}: could not record the sighting ledger ({e}); "
+                f"publish withheld and cursor kept")
+    logger.info("sighting_counts %s", json.dumps(sighting_stats, sort_keys=True))
+
     # ── Step 6: publish ───────────────────────────────────────────────
     sdos_by_type = _count_by_type(all_objects)
     publish_ok = True
@@ -1294,7 +1447,8 @@ def run_cycle(
     try:
         if gate_block_publish:
             raise RuntimeError(
-                "evidence gate cleanup failed under enforce; publish withheld")
+                "publish withheld (evidence gate cleanup under enforce, or the "
+                "sighting ledger could not be recorded)")
         publish_result = publisher.publish(
             all_objects, cycle_id=str(cycle_id)
         )
@@ -1406,6 +1560,9 @@ def run_cycle(
         # ICS: sessions by depth, the SNMP reflection drop, research
         # scanners kept, write/control sessions (also in /health as `ics`).
         "ics": ics_cycle,
+        # Sighting count deltas: emitted, last_seen floored to force an ADD,
+        # and retried-window adjustments (see finalize_sighting_counts).
+        "sightings": sighting_stats,
         "publish_ok": publish_ok,
         "publish_errors": publish_errors,
         "duration_seconds": round(duration_s, 3),

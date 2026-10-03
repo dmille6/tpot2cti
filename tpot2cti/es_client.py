@@ -473,19 +473,15 @@ class TpotESClient:
                            types_out=None):
         """(src_ip, sensor, YYYY-MM-DD) -> event count for [day_start, upper).
 
-        Exists because OpenCTI REPLACES a Sighting's `count` on upsert rather
-        than summing it. That was measured, not assumed: a day-bucketed
-        sighting went 22,119 -> 3,484 when a later but NARROWER cycle
-        re-covered part of the same day. So a per-cycle count does not merely
-        under-report the day, it overwrites a fuller number with a smaller
-        one -- and the volume cap makes that MORE frequent, because it
-        deliberately produces more, smaller windows per day.
-
-        Writing the day's own total instead is idempotent under replace: it
-        only grows as the day fills, so whichever cycle writes last is also
-        the one with the most complete number. ES is the source of truth for
-        "how many times did we see this address today"; OpenCTI is a
-        projection of it.
+        main.run_cycle calls it with ``day_start=window_start`` and folds the
+        days (main.fold_window_counts): the Sighting count is the WINDOW's
+        events, a delta. OpenCTI ADDS a Sighting's count when the write
+        widens its first_seen/last_seen window and REPLACES it otherwise
+        (confirmed on the live platform 2026-10-03); the day's running total
+        this method used to feed was therefore summed once per cycle. See
+        STIXBuilder.window_event_counts. With sighting_grain=sensor-ip-day a
+        second call from the UTC day start collects ``types_out`` for the
+        description only.
 
         `upper` is the cycle's window_end, NOT the wall clock, so the count
         never claims events this connector has not actually imported yet.

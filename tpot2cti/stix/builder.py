@@ -840,6 +840,45 @@ def _validity_days_for(score: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Sighting counts under OpenCTI's upsert (see STIXBuilder.window_event_counts)
+# ---------------------------------------------------------------------------
+
+#: OpenCTI stores and compares sighting timestamps at millisecond precision.
+_ONE_MS = timedelta(milliseconds=1)
+
+
+def _trunc_ms(dt: datetime) -> datetime:
+    """``dt`` truncated to the millisecond, as OpenCTI stores it."""
+    return dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
+
+
+def sighting_floor(after: datetime) -> datetime:
+    """The earliest last_seen OpenCTI will see as STRICTLY LATER than any
+    stored value <= ``after``: ``after`` truncated to the millisecond, plus
+    one millisecond. A stored last_seen equal to the truncated value is not
+    "after" it, and a non-widening write REPLACES the count."""
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)
+    return _trunc_ms(after.astimezone(timezone.utc)) + _ONE_MS
+
+
+@dataclass(frozen=True)
+class SightingReplay:
+    """What tpot2cti already wrote for one Sighting id (the sighting ledger,
+    main.sighting_replay_for_window).
+
+    ``base``: events of THIS window that OpenCTI already holds, because an
+    earlier attempt over the same window landed (a retry after an unclean
+    publish), or earlier windows inside this one were published (a cursor
+    rewind). Subtracted from this attempt's window total.
+    ``last_seen``: the latest last_seen ever written for this id; this
+    write's last_seen is floored strictly after it, so it always widens the
+    stored window, i.e. always ADDS, even when a rewind re-reads old data."""
+    base: int
+    last_seen: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
 # STIXBuilder
 # ---------------------------------------------------------------------------
 
@@ -930,22 +969,50 @@ class STIXBuilder:
         #: id -> distinct per-session description lines, bounded.
         self._sighting_descriptions: dict[str, list] = {}
 
-        #: (src_ip, sensor, YYYY-MM-DD) -> authoritative event count for that
-        #: whole day as known to ES, populated per-cycle by main.run_cycle.
-        #: Empty means the feature is off and per-cycle counts are used.
+        #: (src_ip, sensor) -> events ES holds for THIS CYCLE'S WINDOW
+        #: [window_start, window_end), populated per cycle by main.run_cycle.
+        #: Empty means the aggregation is off or failed, and the per-session
+        #: event counts are summed instead.
         #:
-        #: Needed because OpenCTI REPLACES a sighting's count on upsert rather
-        #: than summing it -- measured, not assumed: one day-bucketed sighting
-        #: went 22,119 -> 3,484 when a later, NARROWER cycle re-covered part of
-        #: the same day. A per-cycle count is therefore not just incomplete, it
-        #: actively overwrites a fuller one with a smaller one. Writing the
-        #: day's total instead is idempotent under replace and converges as the
-        #: day fills.
-        self.daily_event_counts: dict = {}
-        #: sighting ids whose count came from that map, so the merge below
-        #: takes MAX rather than SUM -- every session in a day carries the same
-        #: day total, and summing them would multiply it by the session count.
+        #: OpenCTI's sighting upsert (opencti-graphql utils/upsert-utils.js,
+        #: confirmed on the live 7.260609.0 platform 2026-10-03) is:
+        #:   * an incoming Sighting matches a stored one by id OR by the same
+        #:     (sighting_of, where_sighted) pair with first_seen and last_seen
+        #:     each within +-30 days (relations_deduplication), so our old
+        #:     per-day ids all landed on ONE object per (target, sensor);
+        #:   * if the incoming first_seen/last_seen WIDEN the stored window,
+        #:     count = stored + incoming (ADD); otherwise count = incoming
+        #:     (REPLACE).
+        #: Every cycle advances last_seen, so every write ADDS. Writing the
+        #: day's running total each cycle therefore summed the running totals
+        #: (one sighting reached 205,973,057 against 11.6M hive events). The
+        #: only count that is correct under ADD is the DELTA: the events of
+        #: this window, which no earlier clean cycle can have counted because
+        #: the cursor only advances on a clean publish.
+        self.window_event_counts: dict = {}
+        #: Start of this cycle's window (aware UTC). Every Sighting's
+        #: last_seen is floored STRICTLY after it in finalize_sighting_counts,
+        #: so the write always widens the stored window and is always an ADD,
+        #: never a REPLACE (a REPLACE of a delta would collapse the total).
+        #: None (tests, ad-hoc builders): no floor is applied.
+        self.window_start: Optional[datetime] = None
+        #: sighting id -> SightingReplay for a window that an earlier,
+        #: unclean attempt already sent (main.run_cycle fills it from the
+        #: sighting_sent ledger and the platform). Its count is subtracted
+        #: and its last_seen becomes a floor, so a retried window adds only
+        #: what OpenCTI does not already hold.
+        self.sighting_replay: dict = {}
+        #: Per-bundle counters for the cycle log and /health.
+        self.sighting_count_stats: dict = {
+            "emitted": 0, "floored_last_seen": 0, "replay_adjusted": 0,
+            "replay_dropped": 0}
+        #: sighting ids whose count came from window_event_counts, so the
+        #: merge below takes MAX rather than SUM -- every session of one
+        #: address on one sensor carries the same window total.
         self._authoritative_sightings: set = set()
+        #: Filled by finalize_sighting_counts: id -> (window_total, base,
+        #: last_seen) of every Sighting this bundle sends.
+        self.sighting_sent_records: dict = {}
 
         # ── DR-02: evidence gate, decoupled sightings, sighting grain ──────
         # All three default to today's behaviour; see docs/EVIDENCE_GATE.md.
@@ -1130,7 +1197,7 @@ class STIXBuilder:
             extra = len(bucket) - len(shown)
             text = "\n".join(shown)
             if extra:
-                text += f"\n(+{extra} further session(s) this day)"
+                text += f"\n(+{extra} further session(s) in this window)"
             kept["description"] = text
         if self._grain_types:
             self._fold_sighting_types(oid, kept, session, day_types)
@@ -1166,7 +1233,7 @@ class STIXBuilder:
         extra = len(lines) - len(shown)
         text = "\n".join([header, *shown])
         if extra:
-            text += f"\n(+{extra} further session(s) this day)"
+            text += f"\n(+{extra} further session(s) in this window)"
         kept["description"] = text
 
     def _widen_relationship_window(self, oid: str, dup: dict) -> None:
@@ -2868,17 +2935,17 @@ class STIXBuilder:
         if not (target_ref and sensor_hostname):
             return None
         sensor_id = generate_sensor_id(sensor_hostname)
-        # Prefer the day's authoritative total over this cycle's slice.
-        # See daily_event_counts: OpenCTI replaces rather than sums, so a
-        # partial count does not merely under-report, it clobbers.
+        # Prefer ES's count for this window over the per-session sum: it
+        # covers every non-ignored type, not just the parsed ones. It is a
+        # DELTA, which is what OpenCTI's ADD-on-upsert needs (see
+        # window_event_counts).
         _day = session.first_seen.strftime('%Y-%m-%d')
-        _auth = self.daily_event_counts.get(
-            (session.src_ip, sensor_hostname, _day))
+        _auth = self.window_event_counts.get((session.src_ip, sensor_hostname))
         if _auth is not None:
             count = _auth
         obj = {
             "type": "sighting",
-            # See _sighting_id: AGGREGATED per (sensor, target, UTC day).
+            # See _sighting_id: ONE per (sensor, target), no day.
             "id": self._sighting_id(target_ref, sensor_hostname, session,
                                     id_discriminator),
             "sighting_of_ref": target_ref,
@@ -2898,30 +2965,34 @@ class STIXBuilder:
 
     @staticmethod
     def _sighting_id(target_ref: str, sensor_hostname: str,
-                     session: AttackSession, id_discriminator: str = "") -> str:
-        """The Sighting id: one per (sensor, target, UTC day of first_seen).
+                     session: Optional[AttackSession] = None,
+                     id_discriminator: str = "") -> str:
+        """The Sighting id: ONE per (sensor, target). No day, no session.
 
-        This is TODAY'S GRAIN, documented in docs/EVIDENCE_GATE.md section 3:
         ``target`` is the IP Indicator (no discriminator) or the attacker's
         IP observable (discriminator ``ipv4``, used for IPv6 observables
-        too), so one address on one sensor on one UTC day has at most two
-        Sightings, whatever honeypot types it touched.
+        too), so one address on one sensor has at most two Sightings,
+        whatever honeypot types it touched. ``session`` is accepted for
+        call-site compatibility and ignored.
+
+        Why not per day any more (2026-10-03): OpenCTI does not keep one
+        object per id. Its relation deduplication matches a stored Sighting
+        on (sighting_of, where_sighted) with first_seen and last_seen within
+        +-30 days, so every day-bucketed id of one address and sensor landed
+        on the SAME object as another alias (live: one Sighting carried 15
+        day ids, 09-16 to 10-02). The day ids bought nothing but an alias
+        a day per object, and two ids for one object in one bundle (a window
+        spanning midnight) is two writes to one object in an order the
+        workers do not guarantee, which under REPLACE-unless-widened can
+        collapse the count. One id per (sensor, target) is exactly the
+        object OpenCTI keeps.
+
+        Still NOT per session: seeding on session_id minted 21,628 sightings
+        from 613 IPs in one 15-minute window (the 13.7h relationships pass).
         """
         return generate_sighting_id(
-            # AGGREGATED per (sensor, target, UTC day) — NOT per session.
-            # Seeding on session_id minted one sighting per session (two, with
-            # the dual pattern): measured 21,628 sightings from 613 IPs in ONE
-            # 15-minute window — 80% of every object emitted, and why the
-            # relationships pass ran 13.7h without completing. Day-bucketing
-            # makes every session from one address on one sensor on one day
-            # collapse to a single id, which the publisher's existing id-dedup
-            # then merges (count summed, first/last seen spanned).
-            #
-            # v1 learned this the expensive way: a microsecond-resolution
-            # first_seen in its sighting seed caused an alias explosion and
-            # 758 GB of history. It day-buckets now; so do we.
             sensor_hostname,
-            f"{target_ref}:{session.first_seen.strftime('%Y-%m-%d')}",
+            target_ref,
             id_discriminator,
         )
 
@@ -3126,6 +3197,70 @@ class STIXBuilder:
         self.gate_stats.site_calls["none"] += 1
         return []
 
+    def finalize_sighting_counts(self, objects: list[dict]) -> list[dict]:
+        """Make every Sighting in the bundle an ADD of events OpenCTI does
+        not hold yet (see window_event_counts for the platform semantics).
+
+        For each Sighting, in place:
+          1. **Replay.** If ``sighting_replay`` has its id (an earlier attempt
+             over this same window landed), subtract the events that attempt
+             already added. Nothing left: the Sighting is DROPPED -- sending
+             it would be a non-widening write, i.e. a REPLACE of the stored
+             total by a delta.
+          2. **Floor.** last_seen becomes at least sighting_floor(window_start)
+             and, on a replay, sighting_floor(the earlier attempt's last_seen).
+             Every stored last_seen is earlier than that (the cursor is
+             monotonic and events are read with ``@timestamp < window_end``),
+             so the write widens the stored window and OpenCTI ADDS. Without
+             it a millisecond tie, or a retried window with no new events,
+             would REPLACE.
+
+        Records what was sent in ``sighting_sent_records`` (id ->
+        (window_total, base, last_seen)) for main.run_cycle's ledger.
+        Returns ``objects`` itself unless a Sighting was dropped.
+        """
+        self.sighting_sent_records: dict = {}
+        floor_w = sighting_floor(self.window_start) if self.window_start else None
+        stats = self.sighting_count_stats
+        dropped = False
+        kept: list[dict] = []
+        for obj in objects:
+            if obj.get("type") != "sighting":
+                kept.append(obj)
+                continue
+            oid = obj.get("id")
+            floor = floor_w
+            replay = self.sighting_replay.get(oid)
+            window_total = obj.get("count") if isinstance(obj.get("count"), int) else None
+            base = 0
+            if replay is not None:
+                base = max(0, int(replay.base))
+                if base and window_total is not None:
+                    rest = window_total - base
+                    if rest <= 0:
+                        stats["replay_dropped"] += 1
+                        dropped = True
+                        continue
+                    obj["count"] = rest
+                    stats["replay_adjusted"] += 1
+                if replay.last_seen is not None:
+                    f2 = sighting_floor(replay.last_seen)
+                    floor = f2 if floor is None or f2 > floor else floor
+            if floor is not None:
+                ls = self._as_dt(obj.get("last_seen"))
+                if ls is None or _trunc_ms(ls) < floor:
+                    obj["last_seen"] = floor.isoformat(timespec="milliseconds")
+                    stats["floored_last_seen"] += 1
+                    fs = self._as_dt(obj.get("first_seen"))
+                    if fs is not None and fs > floor:  # pragma: no cover - defensive
+                        obj["first_seen"] = obj["last_seen"]
+            stats["emitted"] += 1
+            if oid:
+                self.sighting_sent_records[oid] = (
+                    window_total, base, obj.get("last_seen"))
+            kept.append(obj)
+        return kept if dropped else objects
+
     def finalize_bundle(self, objects: list[dict]) -> list[dict]:
         """Last builder step before publish (called by main.run_cycle).
 
@@ -3141,6 +3276,10 @@ class STIXBuilder:
 
         Returns ``objects`` itself when there is nothing to withhold, so
         ``off`` and ``shadow`` hand the publisher the very same list.
+
+        Sighting counts are finalized separately (finalize_sighting_counts,
+        called by main.run_cycle before this), so a failure here cannot
+        publish a Sighting whose write would REPLACE instead of ADD.
         """
         self._apply_ics_label_union(objects)
         stats = self.gate_stats

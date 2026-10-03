@@ -56,6 +56,41 @@
         "objects": 35,
         "bytes": 32028
       }
+    },
+    {
+      "when": "2026-10-03",
+      "parent": "origin/main 2d23cb7",
+      "reason": "Sighting counts under OpenCTI's real upsert (ADD when the write widens first_seen/last_seen, REPLACE otherwise; +-30-day pair merge). Sighting ids are one per (sensor, target), no day; counts are this window's events; last_seen is floored after window_start (the harness window is [now-1s, now), so every Sighting's last_seen becomes 2026-03-10T23:59:59.001); the folded-session suffix reads 'in this window'. In the direct bundle DIRECT_IP's 03-07 and 03-08 Sightings fold into one per side (35 -> 33 objects). Every NON-Sighting object is byte-identical to the parent: see minus_sightings, asserted by tests/test_sighting_upsert_counts.py.",
+      "unchanged_without": [
+        "conpot.jsonl"
+      ],
+      "cycle_without": {
+        "sha256": "3fbd9f997900898587d70f8fbae0337dea6b989e3fa49fb86bdd5fdbfb82a443",
+        "objects": 175,
+        "bytes": 162189
+      },
+      "minus_sightings": {
+        "cycle": {
+          "sha256": "f7374ea0a73ca859686869d5b57a374f22201c8e8a59df8fe01571a56557b178",
+          "objects": 144,
+          "bytes": 145921
+        },
+        "direct": {
+          "sha256": "7ce2caf8f39343b9c283765132afd815ee278d51bc9ab68f7cdf436d35cba195",
+          "objects": 25,
+          "bytes": 25294
+        }
+      },
+      "cycle": {
+        "sha256": "cced656979cad0c54ba11953f7700bbae7b784d97f0229fb2619e9968ff3720a",
+        "objects": 184,
+        "bytes": 170487
+      },
+      "direct": {
+        "sha256": "873b01926e47b0486b97de96ab9c0c6d6ce24f2fa96eb289022a52a4d74e9238",
+        "objects": 33,
+        "bytes": 30642
+      }
     }
   ]
 }

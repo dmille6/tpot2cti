@@ -185,6 +185,43 @@ CREATE TABLE IF NOT EXISTS immutable_emitted (
     first_emitted_at TEXT NOT NULL
 );
 
+-- Sighting send ledger (fix/sightings-scanners, 2026-10-03). OpenCTI ADDS a
+-- Sighting's count when a write widens its stored first_seen/last_seen
+-- window and REPLACES it otherwise. tpot2cti therefore sends each window's
+-- events as a delta, with last_seen floored after everything it ever wrote
+-- for that id. See STIXBuilder.finalize_sighting_counts and
+-- main.sighting_replay_for_window.
+--
+-- sighting_sent: one row per (Sighting, window) attempt, kept 48 h. A
+--   RETRIED window (publish not clean, cursor kept) subtracts what the
+--   earlier attempt landed; a REWOUND cursor subtracts the windows inside
+--   the new one that were already published.
+-- sighting_last_sent: the latest last_seen ever written per Sighting, kept
+--   60 days, so every write is floored after it.
+CREATE TABLE IF NOT EXISTS sighting_sent (
+    sighting_id   TEXT NOT NULL,
+    window_start  TEXT NOT NULL,
+    window_end    TEXT NOT NULL,
+    window_total  INTEGER,           -- this window's events, if this attempt landed
+    base          INTEGER NOT NULL DEFAULT 0,  -- of which OpenCTI already held
+    last_seen     TEXT,              -- the last_seen this attempt wrote
+    cycle_id      TEXT,
+    recorded_at   TEXT NOT NULL,
+    PRIMARY KEY (sighting_id, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sighting_sent_window_end
+    ON sighting_sent(window_end);
+
+CREATE TABLE IF NOT EXISTS sighting_last_sent (
+    sighting_id   TEXT PRIMARY KEY,
+    last_seen     TEXT NOT NULL,
+    recorded_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sighting_last_sent_recorded
+    ON sighting_last_sent(recorded_at);
+
 CREATE INDEX IF NOT EXISTS idx_object_max_state_score
     ON object_max_state(max_score);
 
@@ -1020,6 +1057,126 @@ class CycleState:
             n = c.execute("SELECT COUNT(*) FROM immutable_emitted").fetchone()[0]
             c.execute("DELETE FROM immutable_emitted")
             return n
+
+    # ------------------------------------------------------------------
+    # Sighting send ledger (see the sighting_sent / sighting_last_sent tables)
+    # ------------------------------------------------------------------
+
+    #: sighting_sent rows are kept this long past their window's end: long
+    #: enough for any retry and an ordinary cursor rewind.
+    SIGHTING_SENT_RETENTION = timedelta(hours=48)
+    #: sighting_last_sent rows untouched this long are dropped.
+    SIGHTING_LAST_SENT_RETENTION = timedelta(days=60)
+
+    def sighting_ledger_for(self, sighting_ids, window_start: datetime,
+                            window_end: datetime) -> dict:
+        """What was already written for these Sightings, relative to the
+        window [window_start, window_end). For each id that has any row:
+
+          ``{"max_last_seen": iso | None,
+             "same": (window_total, base, last_seen) | None,  # this window
+             "inside_total": int,       # windows wholly inside this one
+             "inside_last_seen": iso | None,
+             "partial": int}``          # windows straddling a boundary
+
+        Timestamps are compared as instants (tpot2cti.timestamps), never as
+        strings."""
+        ids = [i for i in dict.fromkeys(sighting_ids or ()) if i]
+        out: dict = {}
+        if not ids:
+            return out
+        ws, we = _as_instant(window_start), _as_instant(window_end)
+        if ws is None or we is None:
+            return out
+        with self._conn() as c:
+            for i in range(0, len(ids), self._SQL_VAR_CHUNK):
+                chunk = ids[i:i + self._SQL_VAR_CHUNK]
+                ph = ",".join("?" for _ in chunk)
+                for sid, ls in c.execute(
+                        f"SELECT sighting_id, last_seen FROM sighting_last_sent "
+                        f"WHERE sighting_id IN ({ph})", chunk):
+                    out.setdefault(sid, self._ledger_row())["max_last_seen"] = ls
+                # Superset filter in SQL (string order is only approximately
+                # chronological across precisions, hence the 1-day slack);
+                # the exact overlap test is done below on instants.
+                for sid, rws, rwe, wt, base, ls in c.execute(
+                        f"SELECT sighting_id, window_start, window_end, "
+                        f"window_total, base, last_seen FROM sighting_sent "
+                        f"WHERE sighting_id IN ({ph}) AND window_end >= ?",
+                        [*chunk, (ws - timedelta(days=1)).isoformat()]):
+                    r = out.setdefault(sid, self._ledger_row())
+                    a, b = _as_instant(rws), _as_instant(rwe)
+                    if a is None or b is None or ws is None or we is None:
+                        continue
+                    if a == ws:
+                        r["same"] = (wt, base or 0, ls)
+                    elif b <= ws or a >= we:
+                        continue                     # disjoint
+                    elif a > ws and b <= we:
+                        r["inside_total"] += int(wt or 0)
+                        li = _as_instant(ls)
+                        prev = _as_instant(r["inside_last_seen"])
+                        if li is not None and (prev is None or li > prev):
+                            r["inside_last_seen"] = ls
+                    else:
+                        r["partial"] += 1
+        return out
+
+    @staticmethod
+    def _ledger_row() -> dict:
+        return {"max_last_seen": None, "same": None, "inside_total": 0,
+                "inside_last_seen": None, "partial": 0}
+
+    def record_sightings_sent(self, window_start: datetime, window_end: datetime,
+                              records: dict, cycle_id=None) -> None:
+        """Record this attempt's Sightings (``{id: (window_total, base,
+        last_seen)}``) BEFORE publishing, in one transaction, and prune rows
+        past retention."""
+        now = _utcnow_iso()
+        ws, we = window_start.isoformat(), window_end.isoformat()
+        rows = [(sid, ws, we, wt, int(base or 0), ls,
+                 None if cycle_id is None else str(cycle_id), now)
+                for sid, (wt, base, ls) in (records or {}).items()]
+        cut_sent = (window_start - self.SIGHTING_SENT_RETENTION).isoformat()
+        cut_last = (datetime.now(timezone.utc)
+                    - self.SIGHTING_LAST_SENT_RETENTION).isoformat()
+        with self._conn() as c:
+            c.execute("BEGIN")
+            try:
+                if rows:
+                    c.executemany(
+                        "INSERT OR REPLACE INTO sighting_sent (sighting_id, "
+                        "window_start, window_end, window_total, base, last_seen, "
+                        "cycle_id, recorded_at) VALUES (?,?,?,?,?,?,?,?)", rows)
+                    # max(last_seen) per id: compared as instants in Python,
+                    # because the stored strings may carry different
+                    # precisions (".001+00:00" vs "+00:00").
+                    ids = [r[0] for r in rows]
+                    cur: dict = {}
+                    for i in range(0, len(ids), self._SQL_VAR_CHUNK):
+                        chunk = ids[i:i + self._SQL_VAR_CHUNK]
+                        ph = ",".join("?" for _ in chunk)
+                        cur.update(c.execute(
+                            f"SELECT sighting_id, last_seen FROM sighting_last_sent "
+                            f"WHERE sighting_id IN ({ph})", chunk).fetchall())
+                    upd = []
+                    for sid, _ws, _we, _wt, _b, ls, _cid, _now in rows:
+                        new_i = _as_instant(ls)
+                        if new_i is None:
+                            continue
+                        old_i = _as_instant(cur.get(sid))
+                        if old_i is None or new_i > old_i:
+                            upd.append((sid, ls, now))
+                            cur[sid] = ls
+                    c.executemany(
+                        "INSERT OR REPLACE INTO sighting_last_sent "
+                        "(sighting_id, last_seen, recorded_at) VALUES (?,?,?)", upd)
+                c.execute("DELETE FROM sighting_sent WHERE window_end < ?", (cut_sent,))
+                c.execute("DELETE FROM sighting_last_sent WHERE recorded_at < ?", (cut_last,))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
 
     def get_max_state_bulk(
         self,
