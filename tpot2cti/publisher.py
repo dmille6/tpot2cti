@@ -237,6 +237,7 @@ class Publisher:
         indexing_delay_seconds: Optional[int] = None,
         redactor: Optional["SensorRedactor"] = None,
         helper=None,
+        score_ceiling=None,
     ) -> None:
         self.client = client
         self.state = state
@@ -258,6 +259,14 @@ class Publisher:
             from tpot2cti.redact import from_env as _redactor_from_env
             redactor = _redactor_from_env()
         self.redactor = redactor or None
+        # Score ceiling for research scanners and CDN edges, applied AFTER
+        # the cross-cycle max(score) merge so it holds across cycles (see
+        # tpot2cti/score_ceiling.py). Default ON, like the redactor: pass
+        # score_ceiling=False to opt out.
+        if score_ceiling is None:
+            from tpot2cti.score_ceiling import from_env as _ceiling_from_env
+            score_ceiling = _ceiling_from_env()
+        self.score_ceiling = score_ceiling or None
         # Per-instance override of the class-level default; lets main()
         # thread cfg.cycle.indexing_delay_seconds through without touching
         # the class attr (which tests reset to 0).
@@ -317,6 +326,8 @@ class Publisher:
                     dict(sorted(self.redactor.counts.items())),
                 )
 
+        if self.score_ceiling is not None:
+            self.score_ceiling.begin()
         # --- Step 0: cross-cycle state merge ----------------------------
         # Per the V0 finding on pycti UPSERT overwriting scalar fields + the 2026-05-21 live-find: pycti's UPSERT
         # overwrites scalar fields on Indicators/SCOs across cycles. To
@@ -358,6 +369,12 @@ class Publisher:
                         obj["labels"] = merged_labels
                     if "x_opencti_labels" in obj:
                         obj["x_opencti_labels"] = merged_labels
+                # Ceiling AFTER the merge (scanners, CDN edges): the merge
+                # just restored any higher persisted score and unioned the
+                # persisted labels, so this is the last word, and the capped
+                # value is what object_max_state records.
+                if self.score_ceiling is not None:
+                    self.score_ceiling.apply(obj)
                 # Stage the new persisted state with the merged values.
                 # The score we record is the max(current, persisted).
                 final_score = obj.get("x_opencti_score")
@@ -376,9 +393,22 @@ class Publisher:
                     f"overwrite + 2026-05-21 P0f-overwrite bug)"
                 )
 
+
         # --- Step 1: label-union dedup (LESSONS §6) ----------------------
         before = len(objects)
         deduped = self._dedup_label_union(objects)
+        # Ceiling again on the deduplicated objects: the dedup unions labels
+        # across variants of one id but keeps the LAST variant's score, so a
+        # variant without the scanner label could otherwise carry its score
+        # past a label it now has. Idempotent; this pass is the last word.
+        if self.score_ceiling is not None:
+            for obj in deduped:
+                self.score_ceiling.apply(obj)
+            if self.score_ceiling.counts:
+                logger.info(
+                    "[%s] score ceiling %d applied: %s", cycle_id,
+                    self.score_ceiling.ceiling,
+                    dict(sorted(self.score_ceiling.counts.items())))
         after = len(deduped)
         if before > 0:
             reduction_pct = 100.0 * (before - after) / before
