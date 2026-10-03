@@ -1,0 +1,70 @@
+# tpot2cti — CDN / cloud-edge networks (score ceiling, tpot2cti/score_ceiling.py)
+#
+# An address in one of these ranges is a CDN EDGE relaying somebody else's
+# request (Workers, proxied origins, WARP egress). It is kept as an
+# observable with its Sighting, labelled `edge-network:<provider>`, and its
+# Indicator/observable score is capped at TPOT2CTI_SCORE_CEILING (default
+# 25), so nothing score-gated acts on it. Nothing is dropped.
+#
+# Rules (the same as benign_scanners.yaml):
+#   - ONLY ranges the provider itself publishes as its edge. Never a cloud
+#     provider's tenant space (AWS, GCP, Azure, OVH, DigitalOcean): attackers
+#     rent VMs there, and capping them would hide exactly the traffic this
+#     project exists to collect.
+#   - Copy the list verbatim from the URL below and record the date.
+#   - Strict: a malformed entry stops startup (ScoreCeilingError).
+#
+# Measured before adding (v2, 2026-10-03): 36 live Indicators with score
+# >= 50 inside Cloudflare's ranges (23 FATT, 11 Suricata, 1 H0neytr4p,
+# 1 Galah); 0 inside Fastly's.
+
+providers:
+  cloudflare:
+    # https://www.cloudflare.com/ips-v4/ and /ips-v6/, read 2026-10-03
+    cidrs:
+      - 173.245.48.0/20
+      - 103.21.244.0/22
+      - 103.22.200.0/22
+      - 103.31.4.0/22
+      - 141.101.64.0/18
+      - 108.162.192.0/18
+      - 190.93.240.0/20
+      - 188.114.96.0/20
+      - 197.234.240.0/22
+      - 198.41.128.0/17
+      - 162.158.0.0/15
+      - 104.16.0.0/13
+      - 104.24.0.0/14
+      - 172.64.0.0/13
+      - 131.0.72.0/22
+      - 2400:cb00::/32
+      - 2606:4700::/32
+      - 2803:f800::/32
+      - 2405:b500::/32
+      - 2405:8100::/32
+      - 2a06:98c0::/29
+      - 2c0f:f248::/32
+  fastly:
+    # https://api.fastly.com/public-ip-list, read 2026-10-03
+    cidrs:
+      - 23.235.32.0/20
+      - 43.249.72.0/22
+      - 103.244.50.0/24
+      - 103.245.222.0/23
+      - 103.245.224.0/24
+      - 104.156.80.0/20
+      - 140.248.64.0/18
+      - 140.248.128.0/17
+      - 146.75.0.0/17
+      - 151.101.0.0/16
+      - 157.52.64.0/18
+      - 167.82.0.0/17
+      - 167.82.128.0/20
+      - 167.82.160.0/20
+      - 167.82.224.0/20
+      - 172.111.64.0/18
+      - 185.31.16.0/22
+      - 199.27.72.0/21
+      - 199.232.0.0/16
+      - 2a04:4e40::/32
+      - 2a04:4e42::/32
