@@ -102,12 +102,33 @@ summed the running totals (one Sighting reached 205,973,057 against 11.6M
 events). Now every write widens (the floor) and carries only events no clean
 cycle has counted (the cursor advances only on a clean publish).
 
-**Retries and rewinds.** `state.db` keeps a send ledger (`sighting_sent`, 48 h;
-`sighting_last_sent`, 60 days). A window retried after an unclean publish
-subtracts what the earlier attempt landed (OpenCTI's stored `last_seen` says
-whether it did); a cursor rewind to an earlier window boundary subtracts the
-published windows inside the new one. A rewind to a point that is not a window
-boundary, or beyond 48 h, cannot be split and is logged as `partial_overlap`.
+**Retries, rewinds, backfills (state.db ledger).**
+- `sighting_counted` holds the time ranges of windows that published
+  **cleanly** (kept for ever, merged). A cycle counts only the parts of its
+  window outside them (`main.sighting_count_scope`): a re-run or a rewind
+  inside published windows writes no count; a rewind off a window boundary
+  counts only the uncounted tail; a skipped window read later (below the
+  counted frontier) is counted, with `last_seen` floored after what OpenCTI
+  stores (read back by id), so it still adds. If that read-back fails,
+  nothing is written.
+- `sighting_sent` rows are written before publishing (`status='sent'`) and
+  deleted when the window publishes cleanly. A retry over the same
+  `window_start` subtracts what the unclean attempt landed (OpenCTI's
+  stored `last_seen` says whether it did). While such rows exist, a cycle
+  over **any other** window is **rejected**: logged at ERROR, publish
+  withheld, cursor kept, nothing written. Set `last_run` back to the logged
+  `window_start` to resolve it.
+- `sighting_last_sent` keeps the latest `last_seen` ever written per id.
+- `cycle_lease`: `run_cycle` holds a single-writer lease (renewed on every
+  heartbeat, checked before the ledger write and before the cursor moves).
+  A second process raises `CycleLeaseHeld` and touches nothing.
+
+**Before the first cycle of this code**, every existing Sighting needs the
+new stable id (`stix_ids.stable_sighting_id`) as an alias: OpenCTI's ±30-day
+match fails for objects whose `first_seen` is older than 30 days, and the
+first new write would otherwise mint a second Sighting. The ops migration
+(`migrate_sighting_ids.py`) does that with the core stopped.
+
 Counters: `sightings` in the cycle summary and the `sighting_counts` log line.
 
 **`sensor-ip-day`.** The ids, counts and windows stay the same (DR-02

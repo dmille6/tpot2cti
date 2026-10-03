@@ -73,6 +73,7 @@ from tpot2cti.stix_ids import (
     generate_sensor_id,
     generate_session_note_id,
     generate_sighting_id,
+    stable_sighting_id,
     generate_url_id,
     generate_vulnerability_id,
     sensor_infra_name,
@@ -996,6 +997,11 @@ class STIXBuilder:
         #: never a REPLACE (a REPLACE of a delta would collapse the total).
         #: None (tests, ad-hoc builders): no floor is applied.
         self.window_start: Optional[datetime] = None
+        #: True when only part of the window is still uncounted (a rewind or
+        #: a backfill, main.sighting_count_scope): counts come from
+        #: window_event_counts ONLY, a missing address counts 0, and a
+        #: Sighting with nothing left to count is not sent.
+        self.window_counts_strict: bool = False
         #: sighting id -> SightingReplay for a window that an earlier,
         #: unclean attempt already sent (main.run_cycle fills it from the
         #: sighting_sent ledger and the platform). Its count is subtracted
@@ -1005,7 +1011,7 @@ class STIXBuilder:
         #: Per-bundle counters for the cycle log and /health.
         self.sighting_count_stats: dict = {
             "emitted": 0, "floored_last_seen": 0, "replay_adjusted": 0,
-            "replay_dropped": 0}
+            "replay_dropped": 0, "already_counted_dropped": 0}
         #: sighting ids whose count came from window_event_counts, so the
         #: merge below takes MAX rather than SUM -- every session of one
         #: address on one sensor carries the same window total.
@@ -2941,6 +2947,8 @@ class STIXBuilder:
         # window_event_counts).
         _day = session.first_seen.strftime('%Y-%m-%d')
         _auth = self.window_event_counts.get((session.src_ip, sensor_hostname))
+        if _auth is None and self.window_counts_strict:
+            _auth = 0
         if _auth is not None:
             count = _auth
         obj = {
@@ -2990,11 +2998,7 @@ class STIXBuilder:
         Still NOT per session: seeding on session_id minted 21,628 sightings
         from 613 IPs in one 15-minute window (the 13.7h relationships pass).
         """
-        return generate_sighting_id(
-            sensor_hostname,
-            target_ref,
-            id_discriminator,
-        )
+        return stable_sighting_id(sensor_hostname, target_ref, id_discriminator)
 
     def build_dual_sighting(
         self,
@@ -3233,6 +3237,11 @@ class STIXBuilder:
             replay = self.sighting_replay.get(oid)
             window_total = obj.get("count") if isinstance(obj.get("count"), int) else None
             base = 0
+            if window_total is not None and window_total <= 0:
+                # Nothing of this window is left to count (strict mode).
+                stats["already_counted_dropped"] += 1
+                dropped = True
+                continue
             if replay is not None:
                 base = max(0, int(replay.base))
                 if base and window_total is not None:

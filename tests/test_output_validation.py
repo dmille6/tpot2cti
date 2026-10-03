@@ -271,7 +271,7 @@ def test_rejection_counters_are_surfaced_in_the_cycle_summary():
     counter nothing reports is the silent-drop defect with extra steps."""
     import inspect
     from tpot2cti import main
-    src = inspect.getsource(main.run_cycle)
+    src = inspect.getsource(main._run_cycle_locked)  # run_cycle is the lease wrapper
     assert '"rejected_urls": builder.rejected_urls' in src, (
         "rejected_urls is not in the cycle summary dict"
     )

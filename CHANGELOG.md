@@ -21,11 +21,16 @@ follows [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
     latest `last_seen` ever written for the id, so every write is an ADD.
   - Sighting ids are one per (sensor, target): no day (OpenCTI merged the
     days anyway; one Sighting carried 15 day ids).
-  - A send ledger in `state.db` (`sighting_sent`, `sighting_last_sent`)
-    makes a retried window (unclean publish) and a cursor rewind subtract
-    what OpenCTI already holds; whether a retried attempt landed is read
-    from OpenCTI (`OpenCTIClient.sighting_last_seen`). The ledger is
-    written before publishing; if it cannot be, the publish is withheld.
+  - A ledger in `state.db`: `sighting_counted` (cleanly published time
+    ranges, for ever) so re-runs, rewinds (any age, any boundary) and gap
+    backfills count only what is not yet counted; `sighting_sent` (pre-publish
+    rows of unclean attempts) so a retry subtracts what landed, read back
+    with `OpenCTIClient.sighting_last_seen`; any other window while such rows
+    exist is rejected (logged, nothing written); `sighting_last_sent` floors.
+  - A single-writer `cycle_lease` around `run_cycle`.
+  - `stix_ids.stable_sighting_id`: existing Sightings must get it as an
+    alias BEFORE the first cycle of this code (ops migration), or objects
+    older than 30 days get a second Sighting.
   - Both Sighting sides are kept (Indicator and observable), with the same
     count each; a sum over all Sightings counts every event twice by design.
   - Cycle summary `sightings`, log line `sighting_counts`.
