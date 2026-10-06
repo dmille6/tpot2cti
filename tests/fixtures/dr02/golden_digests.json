@@ -91,6 +91,40 @@
         "objects": 33,
         "bytes": 30642
       }
+    },
+    {
+      "when": "2026-10-06",
+      "reason": "2026-10-06 attacker-IP indicators carry revoked=false (OpenCTI decay manager disabled; re-sightings un-revoke). Diff verified: only indicator.revoked None->False in both bundles.",
+      "cycle": {
+        "sha256": "3880437d3e8327aae8b1473bf12b66e701391581c7e7a3ff521fe62775e4636c",
+        "objects": 184,
+        "bytes": 170829
+      },
+      "direct": {
+        "sha256": "dbd927aae74ae8d2a8d26f3f6cb468dad65191533d171a446e2fc15fe4f93366",
+        "objects": 33,
+        "bytes": 30714
+      },
+      "unchanged_without": [
+        "conpot.jsonl"
+      ],
+      "cycle_without": {
+        "sha256": "7cc04bcf273314088468ce84ba5cf1364248be0c7877e161a85ba940b3177177",
+        "objects": 175,
+        "bytes": 162513
+      },
+      "minus_sightings": {
+        "cycle": {
+          "sha256": "16cb356cab3312242087f33834e337ceb05445b9c7ea9bcb3530d7c036e4b563",
+          "objects": 144,
+          "bytes": 146263
+        },
+        "direct": {
+          "sha256": "2f3947deb5ec72f5e06dc0146b2390e6e246b566d0ed63fafd78a23da6f518c2",
+          "objects": 25,
+          "bytes": 25366
+        }
+      }
     }
   ]
 }

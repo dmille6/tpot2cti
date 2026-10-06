@@ -2610,6 +2610,10 @@ class STIXBuilder:
                        else f"[ipv4-addr:value = '{ip}']",
             "valid_from": first_seen.isoformat(),
             "valid_until": valid_until.isoformat(),
+            # A re-sighting must bring a revoked indicator back: with OpenCTI's
+            # decay manager off (2026-10-06), our valid_until governs the
+            # lifecycle and an upsert carries revoked=false explicitly.
+            "revoked": False,
             "indicator_types": ["malicious-activity"],
             "labels": sorted(set(session_labels_for(session, with_sensor=False)
                                  if session is not None else parser_labels_for(event_type))),
