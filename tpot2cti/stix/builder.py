@@ -2219,6 +2219,13 @@ class STIXBuilder:
         from build_ipv4, which describes the attacker themselves."""
         if not ip or not _IPV4_RE.match(ip):
             return None
+        # Only public addresses are infrastructure: bots name router and LAN
+        # addresses (192.168.1.1, 10.0.0.1) and those are nobody's C2.
+        try:
+            if not ipaddress.IPv4Address(ip).is_global:
+                return None
+        except ValueError:
+            return None
         obj = {"type": "ipv4-addr", "id": generate_ipv4_id(ip), "value": ip}
         if session is not None:
             obj["x_opencti_description"] = (
@@ -3567,7 +3574,12 @@ class STIXBuilder:
                     ):
                         out.append(rel)
 
-        # URLs (download sources + URLs in commands)
+        # URLs (download sources + URLs in commands), each linked to its host.
+        # Before 2026-10-06 the host went only through _emit_domain, which
+        # rejects IPv4 literals: every http://IP/... payload host was dropped and
+        # domain hosts were emitted with no edge. Same handling as the protocol
+        # path in _build_protocol_session.
+        _hosts_done = set()
         for url in session.urls:
             url_id = self._emit_url(url, out=out, session=session)
             if url_id:
@@ -3576,10 +3588,29 @@ class STIXBuilder:
                     description=f"URL referenced by {session.src_ip}",
                 ):
                     out.append(rel)
+            try:
+                _host = urlparse(url).hostname
+            except ValueError:
+                _host = None
+            if not _host:
+                continue
+            _host_id = (
+                self._emit_referenced_ipv4(_host, out=out, session=session)
+                if _IPV4_RE.match(_host)
+                else self._emit_domain(_host, out=out, session=session)
+            )
+            _hosts_done.add(_host)
+            if url_id and _host_id:
+                if rel := self.build_relationship(
+                    url_id, "related-to", _host_id,
+                    description="Payload URL hosted on this endpoint",
+                ):
+                    out.append(rel)
 
-        # Domains derived from URLs
+        # Domains derived from URLs not already emitted above
         for fqdn in session.domains:
-            self._emit_domain(fqdn, out=out, session=session)
+            if fqdn not in _hosts_done:
+                self._emit_domain(fqdn, out=out, session=session)
 
         # Dual sighting (Indicator + Observable) — see build_dual_sighting
         # docstring for the OpenCTI UX rationale, _site_sightings for DR-02.
