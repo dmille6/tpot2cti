@@ -5,6 +5,7 @@ See docs/parsers/cowrie.md for protocol/ES-field/STIX/substance notes.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from typing import Iterable, Optional
@@ -71,8 +72,18 @@ _CLIENT_VERSION_EVENTID = "cowrie.client.version"
 # earlier docstring claimed.
 _CLIENT_KEX_EVENTID = "cowrie.client.kex"
 
-# Regex for URL extraction from command text (wget/curl/etc.)
-_URL_RE = re.compile(r'\bhttps?://[^\s\'"<>|]+', re.IGNORECASE)
+def _is_ipv4_literal(host: str) -> bool:
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        return False
+
+
+# Regex for URL extraction from command text (wget/curl/etc.). Stops at the
+# shell separators ; , ) and backslash like the builder's _CMD_URL_RE: before
+# 2026-10-06 "wget http://h/a;chmod +x a" produced the URL "http://h/a;chmod".
+_URL_RE = re.compile(r'\bhttps?://[^\s\'"<>|;,)\\]+', re.IGNORECASE)
 
 # Planted SSH public-key extraction.
 #
@@ -230,6 +241,7 @@ class CowrieParser(BaseParser):
                 session.commands.append(str(cmd))
                 # Extract URLs from commands (wget/curl targets)
                 for m in _URL_RE.findall(str(cmd)):
+                    m = m.rstrip(".,;)")
                     if m not in session.urls:
                         session.urls.append(m)
 
@@ -276,11 +288,13 @@ class CowrieParser(BaseParser):
                                   for k in session.auth_pubkeys):
                     session.auth_pubkeys.append(auth_key)
 
-        # Derive domains from URLs
+        # Derive domains from URLs. Hostnames only: an IPv4 literal is not a
+        # domain (valid_domain rejects it, so it used to vanish). The builder
+        # emits URL hosts itself, IPs included, with a URL -> host edge.
         for url in session.urls:
             try:
                 host = urlparse(url).hostname
-                if host and host not in session.domains:
+                if host and host not in session.domains and not _is_ipv4_literal(host):
                     session.domains.append(host)
             except Exception:
                 continue
