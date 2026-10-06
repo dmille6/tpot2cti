@@ -2226,6 +2226,12 @@ class STIXBuilder:
                 return None
         except ValueError:
             return None
+        # Our own sensor addresses are not attacker infrastructure. The publish
+        # step does not drop SCO values, so this must be refused here.
+        reason = self._own_host_reason(ip)
+        if reason is not None:
+            self._count_own_refusal("referenced-ipv4", reason)
+            return None
         obj = {"type": "ipv4-addr", "id": generate_ipv4_id(ip), "value": ip}
         if session is not None:
             obj["x_opencti_description"] = (
